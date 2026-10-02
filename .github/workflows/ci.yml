@@ -71,3 +71,16 @@ jobs:
           rm -rf /tmp/store
           ../lex-sys/target/release/lex-sys vcs publish --std --store /tmp/store src/pg.ls > /dev/null
           diff -r /tmp/store .lex-sys-vcs
+
+      # `pg.pool` is a package of its own, published beside `pg` and requiring the two names it uses
+      # (`size`, `kind`) from `pg`'s store; the same rule: the checked-in store is the store of the source.
+      - name: The published store is the store of src/pool.ls
+        working-directory: pg
+        run: |
+          # published beside the checked-in one: the store records the path of the store it requires
+          # relative to itself, so a copy elsewhere would differ in that one line
+          rm -rf .lex-sys-vcs-pool-check
+          lex=../lex-sys/target/release/lex-sys
+          $lex vcs lock --store .lex-sys-vcs -o /tmp/pg-for-pool.lock size kind > /dev/null
+          $lex vcs publish --std --store .lex-sys-vcs-pool-check --requires /tmp/pg-for-pool.lock:.lex-sys-vcs src/pool.ls > /dev/null
+          diff -r .lex-sys-vcs-pool-check .lex-sys-vcs-pool

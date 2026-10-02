@@ -1,0 +1,17 @@
+{
+  "store": "../.lex-sys-vcs",
+  "lock": {
+    "entries": {
+      "kind": {
+        "sig_id": "2d92897a2ff5fd30c982d61895a1e9af80bc89cd6c7535da5cf93310fad1460f",
+        "stage_id": "a27f5715d33cc5e73a83abc79888a5e9ea0977830937442bdeceab6895bb6985",
+        "source_hash": "f0c40ed32e07d9a2285c1b448fea2c087d80f9928154e4df975b3394a61ce015"
+      },
+      "size": {
+        "sig_id": "e0e63daf6d481fa91d5955ebfa99d9e990d03a554215b07d5fcb8eb8b85aefa4",
+        "stage_id": "b3560be638550866accad7e22f671ceebaacfc7f13a2886ac9d69a6c1f8f3f24",
+        "source_hash": "f0c40ed32e07d9a2285c1b448fea2c087d80f9928154e4df975b3394a61ce015"
+      }
+    }
+  }
+}

@@ -14,9 +14,10 @@ without reflection is [`docs/design.md`](docs/design.md) §6.
 > (the default of every PostgreSQL since 14), simple queries, extended queries with parameters,
 > `describe`, prepared statements, and a generator of typed query functions (`tools/pgen.ls`, [below](#typed-queries-pgen)); checked against
 > PostgreSQL 16 and the stock `psql` client. **Not yet:** MD5 login
-> (answered with status 5), TLS, a non-blocking connection, binary result formats, `COPY`. Every
-> helper here waits for the server. [`docs/design.md`](docs/design.md) §4-§5 says why, and in what
-> order it is fixed.
+> (answered with status 5), TLS, binary result formats, `COPY`. The helpers of layer 3 wait for the
+> server; **`pg.pool`** ([below](#a-pool-that-does-not-wait)) is the connection that does not, and
+> [`docs/nonblocking.md`](docs/nonblocking.md) has what it measured. [`docs/design.md`](docs/design.md)
+> §4-§5 says why the blocking ones are what they are.
 
 ## Quick start
 
@@ -159,6 +160,30 @@ types.
 A parameter that may be NULL is marked in the annotation: `-- name: add_user name age? nickname?` makes
 `add_user(heap, conn, name, age, age_given, nickname, nickname_given)`, and a parameter whose `_given` is false is
 sent as NULL (an empty string and `0` are values, not NULL). [`docs/design.md`](docs/design.md) §8 has the reasoning.
+
+## A pool that does not wait
+
+`src/pool.ls` (module `pg.pool`) holds a few logged-in, non-blocking connections and pipelines requests over
+them, so that a loop with other work (an HTTP server) does not stop while PostgreSQL answers. The loop owns the
+poller; the pool only asks to be told when its connections are ready:
+
+```
+var pl = pool.empty(heap, 4, 64, 131072, 131072);          // 4 connections, 64 requests deep each, slab sizes
+(pl, slot) = pool.add(heap, pl, conn);                     // logged in and prepared with `pg.login`, `queries.prepare_all`
+pool.start(pl, poller, first_token);                       // watch them, under tokens from first_token
+...
+pool.submit(pl, tag, queries.get_user_start(heap, id));    // queue; 0, or -1 full, -3 none live
+pool.flush(pl, poller);                                    // once per turn: one write per connection
+...                                                        // on a poller event for a token `pool.owns`:
+pool.pump(pl, poller, token, readiness);
+while (tag = pool.next_done(pl)) >= 0 { ... pool.reply(pl), pool.status(pl) ... }
+```
+
+The reply is what `pg.run_named` returns, so every accessor `pgen` wrote works on it. A connection the server
+closes, or that sends something that is not the protocol, answers every request still on it with a `status` that is
+not 0, in its place in the order. `examples/` has no program for it: `lexsys-web`'s `users_pg` is the user, with
+`lex-sys`'s `http.server` (`hold`/`answer`). The package is a store of its own,
+`.lex-sys-vcs-pool`, requiring `size` and `kind` from `.lex-sys-vcs`.
 
 ## Using it from your program
 
