@@ -388,13 +388,16 @@ class Generator(unittest.TestCase):
             "add_post ERROR 23503",
             "add_post affected 1",
             "post first post by ann",
+            "user 4: eve age=NULL active nickname=nick",
+            "user 5: fay age=0 active nickname=",
+            "user 6: gus age=NULL active nickname=NULL",
             'tricky [say "hi" \\ back] [two',
             "lines]",
             ""]))
         # what the generated functions wrote, as the reference client reads it: the table is still
         # there, the hostile name was data, and the rename took
-        out, st = sql("select id, name, age, active from gen_users order by id")
-        self.assertEqual(out, "1|ann|30|t\n2|cy||f\n3|renamed|41|t\n")
+        out, st = sql("select id, name, age, active, coalesce(nickname, '<null>') from gen_users order by id")
+        self.assertEqual(out, "1|ann|30|t|zed\n2|cy||f|<null>\n3|renamed|41|t|<null>\n4|eve||t|nick\n5|fay|0|t|\n6|gus||t|<null>\n")
         out, st = sql("select user_id, title from gen_posts")
         self.assertEqual(out, "1|first post\n")
 
@@ -432,6 +435,12 @@ class Generator(unittest.TestCase):
         # no parameter names given: p1, p2, ...
         out, err, st = self.generated("-- name: pair\nselect $1::int + $2::int as s")
         self.assertIn("p1: int, p2: int", out)
+        # `?`: an optional parameter is followed by its flag, and is NULL when the flag is false
+        out, err, st = self.generated("-- name: maybe a? b c?\nselect $1::int + $2::int + $3::int as s")
+        self.assertEqual(st, 0, err)
+        self.assertIn(", a: int, a_given: bool, b: int, c: int, c_given: bool)", out)
+        self.assertIn("    if a_given {\n        ps = pg.param_int(heap, ps, a);\n    } else {\n        ps = pg.param_null(heap, ps);\n    }\n", out)
+        self.assertIn("    ps = pg.param_int(heap, ps, b);\n", out)
 
     def test_nullability_is_the_catalogue_and_a_join_forgets_it(self):
         out, err, st = self.generated(
@@ -464,6 +473,8 @@ class Generator(unittest.TestCase):
             ("no statement", "-- name: q\n", "no statement"),
             ("no queries at all", "select 1", "no queries"),
             ("two statements", "-- name: q\nselect 1 as a; select 2 as b", "42601"),
+            ("an optional parameter's flag taken by an earlier parameter", "-- name: q a_given a?\nselect $1::int + $2::int as s", "_given"),
+            ("an optional parameter's flag taken by a later parameter", "-- name: q a? a_given\nselect $1::int + $2::int as s", "_given"),
             ("a column and a query with one name", "-- name: q_a\nselect 1 as x\n-- name: q\nselect 1 as a", "same function name"),
         ]
         for what, queries, reason in cases:

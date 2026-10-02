@@ -286,3 +286,34 @@ pub fn tricky_two_is_null[&m](m: &m [byte], row: int) -> [] bool {
     let (from, to) = pg.value(m, row, 1);
     return from < 0;
 }
+
+// add_user_partial: the whole reply, and a status (0 ok); `pg.failure(reply)` is the server's error, if any
+pub fn add_user_partial[&h, &c, &a1, &a3](heap: &!h Heap, conn: &!c Conn, name: &a1 [byte], age: int, age_given: bool, nickname: &a3 [byte], nickname_given: bool) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    var ps = pg.params(heap);
+    ps = pg.param(heap, ps, name);
+    if age_given {
+        ps = pg.param_int(heap, ps, age);
+    } else {
+        ps = pg.param_null(heap, ps);
+    }
+    if nickname_given {
+        ps = pg.param(heap, ps, nickname);
+    } else {
+        ps = pg.param_null(heap, ps);
+    }
+    var reply = buffer.empty(heap, 1);
+    var status = 0;
+    borrow ps as &pr in {
+        let (r, s) = pg.extended(heap, conn, "insert into gen_users (name, age, nickname) values ($1, $2, $3) returning id", pr);
+        buffer.drop(heap, reply);
+        reply = r;
+        status = s;
+    }
+    pg.drop_params(heap, ps);
+    return (reply, status);
+}
+
+pub fn add_user_partial_id[&m](m: &m [byte], row: int) -> [] int {
+    let (from, to) = pg.value(m, row, 0);
+    return pg.int_text(m, from, to);
+}

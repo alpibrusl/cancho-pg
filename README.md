@@ -147,8 +147,12 @@ so (a column *named* `joined` is not a join). Expressions -- `count(*)` -- are c
 Refused, with the query's name and a reason, and **nothing written** if any query is: a statement the server
 rejects (its SQLSTATE), a name used twice, a result column that is not a plain identifier (alias it), two
 functions that would share a name, parameter names that are the wrong number, repeated, or `heap`/`conn`, and a
-statement with a control character in it. Not yet: NULL parameters, dynamic filters, a result type per query
-(`:one`/`:many`), and `float`/`numeric` as lex types. [`docs/design.md`](docs/design.md) §8 has the reasoning.
+statement with a control character in it. Not yet: dynamic filters, a result type per query (`:one`/`:many`), and `float`/`numeric` as lex
+types.
+
+A parameter that may be NULL is marked in the annotation: `-- name: add_user name age? nickname?` makes
+`add_user(heap, conn, name, age, age_given, nickname, nickname_given)`, and a parameter whose `_given` is false is
+sent as NULL (an empty string and `0` are values, not NULL). [`docs/design.md`](docs/design.md) §8 has the reasoning.
 
 ## Using it from your program
 

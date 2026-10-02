@@ -215,8 +215,11 @@ that reply. The reply is the server's whole answer in one buffer, rows are visit
   conservative in the right direction -- an extra `_is_null` is harmless, a missing one is a wrong answer --
   and it is matched as a word: the first version looked for `join` anywhere and found it in a column named
   `joined` (the test now has that column).
-* **No NULL parameters.** A `$n` is a value. Optional parameters want an annotation (`age?`) and a second
-  encoder; not built because no query asked.
+* **NULL parameters are marked, and cost a flag.** `age?` in the annotation adds an `age_given: bool` after the
+  parameter, and the generated function sends `param_null` when it is false. A `$n` that is not marked cannot be
+  NULL, so a caller cannot forget; the flag rather than an `Option` because lex-sys has no generics. The
+  first service on the generator (`lexsys-web`'s users on PostgreSQL) asked for it: four of the five columns of
+  an `INSERT` are optional.
 * **Refuse, write nothing.** Output is accumulated and written only if every query passed, so a half-generated
   module never exists, and a refusal names the query and the reason (the server's SQLSTATE for SQL it rejects).
   Names are checked for collisions across *all* generated functions: a column `a` of query `q` and a query
@@ -233,6 +236,5 @@ parameter description ran before the check for an `ErrorResponse`; the order is 
 test asserts the SQLSTATE. (4) A mutation run caught a unit test that looped forever rather than failing (a row
 visited twice); that is a pass for the mutation and a reminder that the runner has no timeout.
 
-**Not built.** Table-driven CRUD from `lexsys-schema` nodes (§6 C), migrations, dynamic filters (§6 A), NULL and
-array parameters, prepared statements (every call parses again; a `Parse` once and `Bind` many is the first thing a
+**Not built.** Table-driven CRUD from `lexsys-schema` nodes (§6 C), migrations, dynamic filters (§6 A), array parameters, prepared statements (every call parses again; a `Parse` once and `Bind` many is the first thing a
 benchmark will ask for), and generating `lexsys-schema` nodes from result rows.

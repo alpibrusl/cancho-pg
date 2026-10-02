@@ -13,7 +13,8 @@ import pg;
 //
 //     -- name: user_by_id id
 //
-// (the query's name, then optionally a name for each `$n`) followed by one statement. For each,
+// (the query's name, then optionally a name for each `$n`; `age?` makes `$n` optional: the function
+// then also takes `age_given: bool` and sends NULL when it is false) followed by one statement. For each,
 // `pgen` sends the statement to the server's *describe* -- the server parses and plans it and
 // answers with the type of every `$n` and of every result column, without running it -- and writes
 // a lex-sys module on standard output: one function that runs the query with typed parameters, and
@@ -280,8 +281,9 @@ fn emit_runner[&h, &n, &d, &r, &l](heap: &!h Heap, out: buffer.Buffer, name: &n 
     k = 1;
     while k <= count {
         let kind = oid_kind(pg.param_oid(m, tpos, k));
+        let pname = bytes.field(pnames, 10, k);
         o = buffer.append(heap, o, ", ");
-        o = buffer.append(heap, o, bytes.field(pnames, 10, k));
+        o = buffer.append(heap, o, optional_base(pname));
         if kind == 1 {
             o = buffer.append(heap, o, ": int");
         } else if kind == 2 {
@@ -291,13 +293,28 @@ fn emit_runner[&h, &n, &d, &r, &l](heap: &!h Heap, out: buffer.Buffer, name: &n 
             o = buffer.push_nat(heap, o, k);
             o = buffer.append(heap, o, " [byte]");
         }
+        if is_optional(pname) {
+            o = buffer.append(heap, o, ", ");
+            o = buffer.append(heap, o, optional_base(pname));
+            o = buffer.append(heap, o, "_given: bool");
+        }
         k = k + 1;
     }
     o = buffer.append(heap, o, ") -> [heap, conn_read, conn_write] (buffer.Buffer, int) {\n    var ps = pg.params(heap);\n");
     k = 1;
     while k <= count {
         let kind = oid_kind(pg.param_oid(m, tpos, k));
-        o = buffer.append(heap, o, "    ps = ");
+        let pname = bytes.field(pnames, 10, k);
+        let base = optional_base(pname);
+        var indent = "    ";
+        if is_optional(pname) {
+            o = buffer.append(heap, o, "    if ");
+            o = buffer.append(heap, o, base);
+            o = buffer.append(heap, o, "_given {\n");
+            indent = "        ";
+        }
+        o = buffer.append(heap, o, indent);
+        o = buffer.append(heap, o, "ps = ");
         if kind == 1 {
             o = buffer.append(heap, o, "pg.param_int");
         } else if kind == 2 {
@@ -306,8 +323,11 @@ fn emit_runner[&h, &n, &d, &r, &l](heap: &!h Heap, out: buffer.Buffer, name: &n 
             o = buffer.append(heap, o, "pg.param");
         }
         o = buffer.append(heap, o, "(heap, ps, ");
-        o = buffer.append(heap, o, bytes.field(pnames, 10, k));
+        o = buffer.append(heap, o, base);
         o = buffer.append(heap, o, ");\n");
+        if is_optional(pname) {
+            o = buffer.append(heap, o, "    } else {\n        ps = pg.param_null(heap, ps);\n    }\n");
+        }
         k = k + 1;
     }
     o = buffer.append(heap, o, "    var reply = buffer.empty(heap, 1);\n    var status = 0;\n    borrow ps as &pr in {\n        let (r, s) = pg.extended(heap, conn, ");
@@ -362,6 +382,18 @@ fn find_kind[&m](reply: &m [byte], want: int) -> [] int {
     return 0 - 1;
 }
 
+// `age?` is an optional parameter named `age`; anything else is its own name.
+fn is_optional[&t](word: &t [byte]) -> [] bool {
+    return len(word) > 1 && int_of(word[len(word) - 1]) == 63;
+}
+
+fn optional_base[&t](word: &t [byte]) -> [] &t [byte] {
+    if is_optional(word) {
+        return word[0..len(word) - 1];
+    }
+    return word;
+}
+
 // The names to give the parameters, one per line: the ones the annotation lists, or `p1`, `p2`, ...
 // Answers the names and a nonzero code (after a message) if they are not usable.
 fn parameter_names[&h, &i, &n, &d](heap: &!h Heap, io: &!i Io, name: &n [byte], given: &d [byte], count: int) -> [heap, err_write] (buffer.Buffer, int) {
@@ -383,10 +415,23 @@ fn parameter_names[&h, &i, &n, &d](heap: &!h Heap, io: &!i Io, name: &n [byte], 
         }
         borrow one as &oneref in {
             let word = buffer.bytes(oneref);
-            let (nt, fresh) = claim(heap, taken, word);
+            let base = optional_base(word);
+            let (nt, fresh) = claim(heap, taken, base);
             taken = nt;
-            if !ident_ok(word) || !fresh {
-                code = complain(io, name, "a parameter name is lower-case letters, digits and underscores, and is not repeated, `heap` or `conn`");
+            var clear = fresh;
+            if len(base) != len(word) {
+                // an optional parameter also takes a `<name>_given` flag: that name must be free too
+                var flag = buffer.append(heap, buffer.empty(heap, 32), base);
+                flag = buffer.append(heap, flag, "_given");
+                borrow flag as &fr in {
+                    let (nt2, fresh2) = claim(heap, taken, buffer.bytes(fr));
+                    taken = nt2;
+                    clear = clear && fresh2;
+                }
+                buffer.drop(heap, flag);
+            }
+            if !ident_ok(base) || !clear {
+                code = complain(io, name, "a parameter name is lower-case letters, digits and underscores, and is not repeated, `heap`, `conn` or another parameter's `_given`");
             } else {
                 names = buffer.append(heap, names, word);
                 names = buffer.push(heap, names, byte_of(10));

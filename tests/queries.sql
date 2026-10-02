@@ -30,3 +30,6 @@ select balance, joined, (age + 1) as next_age from gen_users where id = $1
 -- name: tricky
 select 'say "hi" \ back' as quoted, 'two
 lines' as two
+
+-- name: add_user_partial name age? nickname?
+insert into gen_users (name, age, nickname) values ($1, $2, $3) returning id
