@@ -1,8 +1,10 @@
 # A connection that does not block the loop
 
-> **Status: design, not built.** Written after measuring what the blocking driver costs and what the cheapest
-> alternative buys, and with the conclusion that the case for building this is **not throughput**. Every number is
-> from `lexsys-web`'s `docs/benchmarks.md` ("On PostgreSQL"), one machine; claims that were not measured say so.
+> **Status: built (`src/pool.ls`, package `pg.pool`), measured, and the design's own criteria checked in
+> section 9.** Sections 1-8 are the design as written before it was built, with the places where a
+> measurement afterwards showed the text to be wrong **corrected in place** (marked *Corrected*). The case
+> for building it was said to be "not throughput", and the first measurement of the finished thing
+> disagreed: see section 9.1.
 
 ## 1. The question
 
@@ -26,11 +28,18 @@ protocol is 24,717 a second, from `pgbench`):
 
 Three things follow, and they are not the ones the first estimate in design.md section 4 expected.
 
-1. **A read is within a few percent of PostgreSQL's own ceiling with three copies and no new code.** The idle
+1. **A read is within a few percent of what `pgbench` reaches, with three copies and no new code.** The idle
    ~19 microseconds of every 67 in the single-connection service -- PostgreSQL's core waiting while the loop parses
    the next request and renders the answer -- are exactly what a second blocking copy fills. A non-blocking
    connection that pipelined its queries would fill the same gap from inside one process, and cannot do better than
    the ceiling PostgreSQL has. *Throughput on reads is therefore not an argument for building it.*
+
+   > **Corrected (section 9.1).** This was wrong, and the mistake is worth naming: 24,717 a second is what
+   > `pgbench` reaches, which sends one query and waits for its answer, so it measures PostgreSQL *plus a round
+   > trip per query*, not PostgreSQL. One connection pipelining the same lookup reaches 64,000-66,000 a second
+   > inside this service (and 88,000-96,000 from a bare C client using libpq's pipeline mode). The ceiling of
+   > PostgreSQL's CPU on a primary-key lookup is a good deal higher than the number used as one here, and a read
+   > **is** an argument for a non-blocking connection.
 2. **A write wants several connections, and pipelining does not give them.** Concurrent connections let PostgreSQL
    commit several inserts per `fsync` (group commit). One connection pipelining a hundred `Bind`/`Execute`/`Sync`
    sequences still commits them one `Sync` at a time, in order. So the write case is the case for a **pool**: more
@@ -211,3 +220,99 @@ benchmark.
   request goes on a second connection; whether to send it, and when, is not decided.
 * **Where `pool` lives.** In `pg` or beside it. It needs `std.conns` and the `Poller`, which `pg` does not import today;
   the sans-io layers are better kept free of both.
+
+## 9. What was built, and what it measured
+
+`pg.pool` (`src/pool.ls`): a `Pool` owns logged-in, non-blocking connections in a `conns.Table`; `submit` queues an
+encoded request (`pg.bind_named`) on the connection with the fewest in flight, `flush` sends what a loop turn queued
+(one write per connection), `pump` does the I/O the poller reported, `next_done` hands back each answered request's tag
+with `reply` (what `pg.run_named` would have returned) and `status`. Logging in and preparing statements stay the
+caller's (the blocking helpers, before `add`), so the pool needs nothing from `pg` but `size` and `kind`. Sizes are
+fixed when the pool is made. `pgen` writes a `<name>_start` per query, the encoded request without a connection.
+
+`http.server` got what section 4.1 said it needed (`lex-sys` PR 182, `docs/http-server.md` section 10): `hold` and
+`answer` with generation-checked tickets, the server's poller, `first_token`, and the application's events
+(`foreign`). The service is `lexsys-web`'s `examples/users_pg`, with a ninth argument (the number of connections)
+that switches its loop from "wait for the database" to "hold the request, queue the query, go on".
+
+### 9.1 The six criteria of section 6
+
+One machine (4 cores, a Firecracker VM), server on core 0, PostgreSQL on core 1, the load generator on cores 2 and 3,
+as in `lexsys-web`'s `docs/benchmarks.md`. Requests a second, the same session for every row.
+
+| | criterion | result | |
+|---|---|---|---|
+| 1 | every end-to-end test of `users_pg` passes unchanged; the blocking and the pooled service answer the same | **35 of 35** against the pool (the 29 of the blocking service, Schemathesis included, and 6 new); the same 24-request sequence gets byte-identical answers, headers included, from both | met |
+| 2 | while one request's query waits, `/health` from the same process answers in under 5 ms, 100 times | a query held behind a table lock for a second: `/health` x100 **median 0.14 ms, maximum 0.76 ms**; the blocking service, the same lock: **maximum 645 ms** | met |
+| 3 | one process, one connection, at least 22,000 `GET one user` | **63,980 / 65,894 / 64,262** (three runs, median of three rounds each); blocking, one copy: 15,638; three copies: 25,180 | met, by 2.9x |
+| 4 | a pool of four reaches at least what four copies did (about 6,300 creates a second) over at least ten runs, spread reported | pool of four: **median 8,091** (6,836-10,776); four blocking copies in the same session: **median 5,818** (4,528-8,329) | met on the median; the ranges overlap |
+| 5 | killing PostgreSQL's backends mid-flight answers every waiting request 503, loses none, duplicates none, and the routes that need no database keep working | six waiting requests, all backends but two ended: **six 503s**, `/health` 200 afterwards, a database route 503 (no reconnecting yet) | met |
+| 6 | the `http.server` additions under about 150 lines, the pool under about 500 | `http.server`: **167 lines added** to `server.ls` (97 of code, the rest comments), 6 removed; `pool.ls`: **557 lines, 415 of code** | met counting code; **over counting every line** (167 and 557) |
+
+Criterion 6 did not say whether comments count. On code lines both are inside the budget; on raw lines both are over,
+the pool by 57, and the held-connection rules touch five existing functions of `http.server` as well as adding new
+ones (the diff is `git diff bbeb75f 0a2a43c -- packages/http-server/server.ls` in `lex-sys`).
+
+More numbers, for the record (median of three 5-second rounds; pool in one process, pinned the same way):
+
+| | GET one user | GET a page of 20 | create (median of 10 runs) |
+|---|---:|---:|---:|
+| blocking, 1 copy | 15,638 | 4,524 | 2,317 (3 runs) |
+| blocking, 3 copies | 25,180 | 6,361 | 7,065 (3 runs) |
+| blocking, 4 copies | | | 5,818 (4,528-8,329) |
+| pool, 1 connection | 63,980-65,894 | 7,894-8,409 | 3,818 (3,190-5,306) |
+| pool, 2 connections | 58,681 | 8,169 | 5,266 (4,659-7,555) |
+| pool, 4 connections | 45,056 | 7,420 | 8,091 (6,836-10,776) |
+
+Reads go **down** as connections are added (65,000 to 45,000 from one to four): PostgreSQL's backends share the one
+core it is pinned to, and four of them switch where one pipelines. Writes go up for the reason section 2 gave
+(group commit). A pool wants one connection for a read-heavy service and several for a write-heavy one; the size is
+an argument of `users_pg`, not a constant. Creates are noisy (the three-run medians of 5,351 and 5,882 for one and two
+connections, from the first measurement, sit above the ten-run ranges here); look at the ranges.
+
+### 9.2 The client, against others
+
+One connection, the same prepared primary-key lookup, client pinned to core 0 and PostgreSQL to core 1 (this
+session; `tests/pool_drive.ls` `row` mode against the clients below, 200,000 lookups, three runs):
+
+| client | one query at a time | pipelined |
+|---|---:|---:|
+| `pg` + `pg.pool` | **~20,400** | **~39,000-42,000** at 64 in flight (47,000-59,000 at 256, two builds) |
+| libpq 16 (C): `PQexecPrepared`, pipeline mode | 19,400-20,100 | **88,600-95,600** (16-64 in flight) |
+| asyncpg 0.31, prepared | 11,700 | does not pipeline on one connection |
+| psycopg 3.3 (libpq 18): prepared, pipeline mode | 12,000 | 18,900 (limited by Python, not libpq) |
+
+Sequentially the client is level with libpq and 1.7x asyncpg and psycopg. **Pipelined it is about 2.3x slower than
+libpq, and why is not established.** What was ruled out: Nagle (setting `TCP_NODELAY` changed nothing), one write per
+request (the pool used to `sendto` once per request, 50,005 times for 50,000 queries under `strace`; it now sends
+once per loop turn, 2,025, and the rate moved from about 39,000 to about 42,000), and the client's own CPU (it is
+busy about 22% of the time). What was seen: PostgreSQL's backend is at 97% CPU under this client and about 59% under
+libpq's, so its work per query is higher when our requests are the ones it serves. The same pool inside the HTTP
+service reaches 64,000-66,000, so the bare driver's loop is a pessimistic shape and the number above is not the
+service's. Not investigated further: whether the difference is in the bytes (an extra `Describe` on libpq's side), in
+how requests are batched on the wire, or in the cost of waking a blocked client.
+
+### 9.3 What it does not do, and what is known to be wrong or open
+
+* **A slow query holds up what is queued behind it on its own connection.** Pipelining is in order. In a test, with two
+  connections and the first request sleeping 0.4 s, the requests queued behind it on its connection waited and the ones
+  on the other did not. More connections, or a smaller `depth`, bound it; nothing routes around it.
+* **No reconnecting (`revive`) and no deadline.** After the database restarts, routes that need it answer 503 until the
+  service is restarted; a request the database never answers is held until its connection fails. Both were listed in
+  section 4.2 as later and are still later.
+* **A reply larger than the input slab** (`in_cap`, 128 KiB in `users_pg`) fails its connection (status 8) rather than
+  growing; the slab sizes are fixed when the pool is made. A page of 100 users is about 9 KiB.
+* **Cancellation** (section 8) is not done: a client that disconnects while its query is pending leaves the query
+  running, and its answer is dropped by the generation check.
+* **TLS** to PostgreSQL is still not there, for the blocking helpers or the pool.
+
+### 9.4 How the tests were checked
+
+`tests/e2e.py`: 11 tests against PostgreSQL (order, depth back-pressure, a slow request holding up only its own
+connection, the server's error as an answer, an idle loop that sleeps, backends killed mid-flight, a request larger
+than the socket's buffers) and 7 against a mock that answers in pieces of one byte, late, two replies in one write,
+never, hangs up part way, sends garbage, or sends a reply larger than the slab. Eleven single-edit mutations of
+`pool.ls` were each run against them. **The first set left four standing**: two lines of the write path that only a
+request larger than the kernel's buffers reaches, the compaction of the output queue, and the accounting of replies
+that arrive together with the hang-up. Tests were written for each (a mock that does not read for a second, 3 MB
+requests, a driver that takes answers only once the poller has been quiet) and all eleven are caught.
