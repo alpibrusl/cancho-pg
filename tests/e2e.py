@@ -401,6 +401,34 @@ class Generator(unittest.TestCase):
         out, st = sql("select user_id, title from gen_posts")
         self.assertEqual(out, "1|first post\n")
 
+    def test_a_query_that_was_not_prepared_is_the_servers_26000_not_a_hang(self):
+        self.setUpClass()
+        p = subprocess.run([GEN_USE, HOST, PORT, USER, DB, "-", "2", "unprepared"], capture_output=True, text=True, timeout=60)
+        self.assertEqual((p.stdout, p.returncode), ("count_users ERROR 26000\n", 0), p.stderr)
+
+    def test_prepare_all_refuses_when_the_schema_no_longer_fits_the_queries(self):
+        # The module was generated against a schema where `active` exists, and only the *first* query uses
+        # it. Prepared on a database where it does not, the server refuses that one, `prepare_all` reports
+        # it -- and must not let the successful prepares after it hide the refusal -- and nothing is run.
+        self.setUpClass()
+        out, st = sql("alter table gen_users rename column active to alive")
+        self.assertEqual(st, 0, out)
+        try:
+            p = subprocess.run([GEN_USE, HOST, PORT, USER, DB, "-", "2"], capture_output=True, text=True, timeout=60)
+            self.assertEqual((p.stdout, p.returncode), ("", 7), p.stderr)
+        finally:
+            sql("alter table gen_users rename column alive to active")
+
+    def test_each_connection_prepares_its_own_statements(self):
+        # statement names are per connection: two programs at once, each preparing every name, do not collide
+        self.setUpClass()
+        procs = [subprocess.Popen([GEN_USE, HOST, PORT, USER, DB, "-", "2"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                 for _ in range(3)]
+        outs = [pr.communicate(timeout=60) for pr in procs]
+        for pr, (out, err) in zip(procs, outs):
+            self.assertEqual(pr.returncode, 0, out + err)
+            self.assertTrue(out.startswith("count "), out)
+
     def generated(self, queries, check=True):
         import tempfile
         with tempfile.TemporaryDirectory() as d:

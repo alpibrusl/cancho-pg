@@ -613,3 +613,71 @@ fn test_a_column_that_is_a_table_column_says_which[&h](heap: &!h Heap) -> [heap]
     buffer.drop(heap, r);
     return 0;
 }
+
+// ------------------------------------------------------- prepared statements
+
+fn be32_at[&b](g: &b [byte], at: int) -> [] int {
+    return int_of(g[at]) * 16777216 + int_of(g[at + 1]) * 65536 + int_of(g[at + 2]) * 256 + int_of(g[at + 3]);
+}
+
+// Parse, then Sync: 'P' length "name\0" "sql\0" 0 parameter types.
+fn test_parse_named_message[&h](heap: &!h Heap) -> [heap] int {
+    let m = pg.parse_named(heap, "s1", "select 1");
+    borrow m as &mr in {
+        let g = buffer.bytes(mr);
+        test.assert_eq(len(g), 1 + 18 + 5);
+        test.assert_eq(int_of(g[0]), 80);
+        test.assert_eq(be32_at(g, 1), 4 + 3 + 9 + 2);
+        expect_bytes(g[5..8], "s1\0");
+        expect_bytes(g[8..17], "select 1\0");
+        test.assert_eq(int_of(g[17]) + int_of(g[18]), 0);
+        // Sync
+        test.assert_eq(int_of(g[19]), 83);
+        test.assert_eq(be32_at(g, 20), 4);
+    }
+    buffer.drop(heap, m);
+    // a name of a different length moves everything after it, and the lengths follow
+    let m2 = pg.parse_named(heap, "a_longer_name", "x");
+    borrow m2 as &m2r in {
+        let g = buffer.bytes(m2r);
+        test.assert_eq(be32_at(g, 1), 4 + 14 + 2 + 2);
+        test.assert_eq(len(g), 1 + (4 + 14 + 2 + 2) + 5);
+    }
+    buffer.drop(heap, m2);
+    return 0;
+}
+
+// Bind the named statement, Execute, Sync: no Parse, no Describe.
+fn test_bind_named_message[&h](heap: &!h Heap) -> [heap] int {
+    var ps = pg.params(heap);
+    ps = pg.param(heap, ps, "7");
+    ps = pg.param_null(heap, ps);
+    borrow ps as &pr in {
+        let m = pg.bind_named(heap, "s1", pr);
+        borrow m as &mr in {
+            let g = buffer.bytes(mr);
+            // Bind: portal "" , statement "s1", 0 format codes, 2 parameters ("7" and NULL), 0 result codes
+            test.assert_eq(int_of(g[0]), 66);
+            let body = 1 + 3 + 2 + 2 + (4 + 1) + 4 + 2;
+            test.assert_eq(be32_at(g, 1), 4 + body);
+            test.assert_eq(int_of(g[5]), 0);
+            expect_bytes(g[6..9], "s1\0");
+            test.assert_eq(int_of(g[9]) + int_of(g[10]), 0);
+            test.assert_eq(int_of(g[11]) * 256 + int_of(g[12]), 2);
+            test.assert_eq(be32_at(g, 13), 1);
+            expect_bytes(g[17..18], "7");
+            test.assert_eq(be32_at(g, 18), 4294967295);
+            // Execute: portal "", no row limit
+            let e = 1 + 4 + body;
+            test.assert_eq(int_of(g[e]), 69);
+            test.assert_eq(be32_at(g, e + 1), 9);
+            test.assert_eq(be32_at(g, e + 6), 0);
+            // Sync, and nothing else: no Parse and no Describe
+            test.assert_eq(int_of(g[e + 10]), 83);
+            test.assert_eq(len(g), e + 10 + 5);
+        }
+        buffer.drop(heap, m);
+    }
+    pg.drop_params(heap, ps);
+    return 0;
+}

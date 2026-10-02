@@ -10,9 +10,9 @@ It is a *driver*: it moves SQL and rows. What sits on top of it (typed queries g
 `.sql` files, migrations, table-driven CRUD) and why that is the right shape for a language
 without reflection is [`docs/design.md`](docs/design.md) §6.
 
-> **Status: slices 1-3 built** -- startup, trust, cleartext-password and **SCRAM-SHA-256** login
+> **Status: slices 1-4 built** -- startup, trust, cleartext-password and **SCRAM-SHA-256** login
 > (the default of every PostgreSQL since 14), simple queries, extended queries with parameters,
-> `describe`, and a generator of typed query functions (`tools/pgen.ls`, [below](#typed-queries-pgen)); checked against
+> `describe`, prepared statements, and a generator of typed query functions (`tools/pgen.ls`, [below](#typed-queries-pgen)); checked against
 > PostgreSQL 16 and the stock `psql` client. **Not yet:** MD5 login
 > (answered with status 5), TLS, a non-blocking connection, binary result formats, `COPY`. Every
 > helper here waits for the server. [`docs/design.md`](docs/design.md) §4-§5 says why, and in what
@@ -117,9 +117,15 @@ $ ./pgen 127.0.0.1 5432 postgres postgres - queries.sql > queries.ls          # 
 $ lex-sys build --std app.ls queries.ls src/pg.ls -o app
 ```
 
-and the generated functions are what the program calls (`tests/gen_use.ls` is a complete one):
+and the generated functions are what the program calls (`tests/gen_use.ls` is a complete one). The module also
+has `prepare_all`: call it **once, after login**, and it parses every query on that connection under the
+query's name; each query then runs by name, so PostgreSQL parses and plans it once instead of on every call
+(about half the server's time on a one-row lookup, [`docs/design.md`](docs/design.md) section 4). It answers
+the reply of the first refusal -- the schema no longer fits a query -- and a status, and nothing is to be run
+unless both are clean. A query run without it is the server's own `26000`, not a hang.
 
 ```
+let (refused, status) = queries.prepare_all(heap, conn);       // once, after pg.login
 let (reply, status) = queries.user_by_id(heap, conn, 7);       // (id: int) -- the type came from the server
 borrow reply as &rr in {
     let m = buffer.bytes(rr);
@@ -210,6 +216,7 @@ a NULL is `(-1, -1)` while an empty string is a real, empty range.
 | `params(heap)`, `param(heap, ps, value)`, `param_null(heap, ps)`, `drop_params(heap, ps)` | a parameter list |
 | `execute(heap, sql, &ps)` | Parse, Bind, Describe, Execute, Sync: `$1`, `$2`, ... bound as data |
 | `describe(heap, sql)` | the types of a statement's parameters and columns, without running it |
+| `parse_named(heap, name, sql)`, `bind_named(heap, name, &ps)` | Parse a statement under a name, once; then Bind and Execute it by name (no Parse, no Describe) |
 
 | Decode (a reply is every message up to `ReadyForQuery`, in one buffer) | |
 |---|---|
@@ -226,6 +233,8 @@ a NULL is `(-1, -1)` while an empty string is a real, empty range.
 | `send(conn, bytes)`, `receive(heap, conn)` | write all of it; read up to `ReadyForQuery` |
 | `login(heap, conn, user, secret, database, nonce)` | startup, whatever authentication the server asks (trust, cleartext, SCRAM-SHA-256), up to `ReadyForQuery`. `nonce`: at least 18 unpredictable bytes written as printable characters without a comma -- `examples/psql.ls` reads 18 bytes from `/dev/urandom` and base64-encodes them; an empty one makes a SCRAM server be refused |
 | `simple(heap, conn, sql)`, `extended(heap, conn, sql, &ps)`, `describing(heap, conn, sql)` | send and receive |
+| `prepare(heap, conn, name, sql)`, `run_named(heap, conn, name, &ps)` | prepare a statement on this connection; run it by name (see below) |
+| `prepare_after(heap, conn, reply, status, name, sql)` | `prepare`, but only if the step before it went well: a chain of these prepares everything and stops at the first refusal |
 
 | SCRAM-SHA-256 and the primitives it is made of (pure; each is also useful alone) | |
 |---|---|
@@ -249,9 +258,9 @@ of the end-to-end tests. Channel binding (`SCRAM-SHA-256-PLUS`) needs TLS, which
 ## Tests
 
 ```
-lex-sys test tests/pg_test.ls src/pg.ls --std                     # 18 unit tests, no server
+lex-sys test tests/pg_test.ls src/pg.ls --std                     # 20 unit tests, no server
 eval "$(sh tests/postgres.sh)"                                    # a throwaway postgres:16 with a role of each login kind
-python3 tests/e2e.py                                              # 25 tests against it (and a mock server)
+python3 tests/e2e.py                                              # 28 tests against it (and a mock server)
 ```
 
 The unit tests encode and decode with no server, from replies built here from the protocol's documented

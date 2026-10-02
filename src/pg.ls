@@ -163,6 +163,39 @@ pub fn execute[&h, &s, &p](heap: &!h Heap, sql: &s [byte], ps: &p Params) -> [he
     return header(heap, m, 83, 0);
 }
 
+// Prepared statements: Parse once, under a name, and Bind and Execute it many times. PostgreSQL
+// then parses and plans the SQL once per connection instead of once per call -- a one-row lookup
+// costs it about half as much (docs/design.md section 4). A name is at most 63 bytes (the server's
+// limit), unique on the connection, and the statement lives until the connection ends.
+
+// Parse `sql` as the statement `name` (no parameter types: the server infers them), then Sync.
+// The answer is a ParseComplete and a ReadyForQuery, or an ErrorResponse.
+pub fn parse_named[&h, &n, &s](heap: &!h Heap, name: &n [byte], sql: &s [byte]) -> [heap] buffer.Buffer {
+    var m = header(heap, buffer.empty(heap, 64 + len(sql)), 80, len(name) + 1 + len(sql) + 1 + 2);
+    m = put_cstr(heap, m, name);
+    m = put_cstr(heap, m, sql);
+    m = put_be16(heap, m, 0);
+    return header(heap, m, 83, 0);
+}
+
+// Bind the prepared statement `name` to the parameters `ps` (text in, text out), Execute it without
+// a row limit, Sync. No Describe: the caller knows the columns of a statement it prepared, so the
+// answer is only DataRows, a CommandComplete and a ReadyForQuery (or an ErrorResponse, which for a
+// name that was never prepared is SQLSTATE 26000).
+pub fn bind_named[&h, &n, &p](heap: &!h Heap, name: &n [byte], ps: &p Params) -> [heap] buffer.Buffer {
+    var m = header(heap, buffer.empty(heap, 64 + len(name) + buffer.size(ps.packed)), 66, 1 + len(name) + 1 + 2 + 2 + buffer.size(ps.packed) + 2);
+    m = put_cstr(heap, m, "");
+    m = put_cstr(heap, m, name);
+    m = put_be16(heap, m, 0);
+    m = put_be16(heap, m, ps.count);
+    m = buffer.append(heap, m, buffer.bytes(ps.packed));
+    m = put_be16(heap, m, 0);
+    m = header(heap, m, 69, 1 + 4);
+    m = buffer.push(heap, m, byte_of(0));
+    m = put_be32(heap, m, 0);
+    return header(heap, m, 83, 0);
+}
+
 // ---------------------------------------------------------------------
 // Decoding
 // ---------------------------------------------------------------------
@@ -1252,6 +1285,53 @@ pub fn describing[&h, &c, &s](heap: &!h Heap, conn: &!c Conn, sql: &s [byte]) ->
 // Run one extended-protocol query with parameters and read everything up to ReadyForQuery.
 pub fn extended[&h, &c, &s, &p](heap: &!h Heap, conn: &!c Conn, sql: &s [byte], ps: &p Params) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
     let q = execute(heap, sql, ps);
+    var ok = false;
+    borrow q as &qb in {
+        ok = send(conn, buffer.bytes(qb));
+    }
+    buffer.drop(heap, q);
+    if !ok {
+        return (buffer.empty(heap, 8), 6);
+    }
+    return receive(heap, conn);
+}
+
+// Prepare `sql` under `name` on this connection. Answers the reply (a ParseComplete and a
+// ReadyForQuery; `failure(reply) >= 0` if the server refused the SQL) and a status.
+pub fn prepare[&h, &c, &n, &s](heap: &!h Heap, conn: &!c Conn, name: &n [byte], sql: &s [byte]) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    let q = parse_named(heap, name, sql);
+    var ok = false;
+    borrow q as &qb in {
+        ok = send(conn, buffer.bytes(qb));
+    }
+    buffer.drop(heap, q);
+    if !ok {
+        return (buffer.empty(heap, 8), 6);
+    }
+    return receive(heap, conn);
+}
+
+// `prepare`, but only if the step before it went well: given that step's reply and status, answers
+// them unchanged if it failed (a nonzero status or an ErrorResponse) and otherwise drops the reply
+// and prepares. A chain of these prepares everything and stops at the first refusal, which is what
+// `pgen` writes as `prepare_all`.
+pub fn prepare_after[&h, &c, &n, &s](heap: &!h Heap, conn: &!c Conn, reply: buffer.Buffer, status: int, name: &n [byte], sql: &s [byte]) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    var failed = status != 0;
+    borrow reply as &rr in {
+        if failure(buffer.bytes(rr)) >= 0 {
+            failed = true;
+        }
+    }
+    if failed {
+        return (reply, status);
+    }
+    buffer.drop(heap, reply);
+    return prepare(heap, conn, name, sql);
+}
+
+// Run the statement prepared as `name`, with parameters `ps`: send and receive.
+pub fn run_named[&h, &c, &n, &p](heap: &!h Heap, conn: &!c Conn, name: &n [byte], ps: &p Params) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    let q = bind_named(heap, name, ps);
     var ok = false;
     borrow q as &qb in {
         ok = send(conn, buffer.bytes(qb));

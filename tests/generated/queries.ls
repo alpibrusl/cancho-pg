@@ -2,7 +2,7 @@
 //
 // Each query is a function that runs it (`<name>`: the whole reply and a status, 0 for ok) and one
 // accessor per result column (`<name>_<column>`, read from a row as `pg.first_row`/`pg.next_row` give
-// it; `_is_null` where the column can be NULL).
+// it; `_is_null` where the column can be NULL). Call `prepare_all` once after login, before the first query.
 edition 5;
 
 module queries;
@@ -17,7 +17,7 @@ pub fn user_by_id[&h, &c](heap: &!h Heap, conn: &!c Conn, id: int) -> [heap, con
     var reply = buffer.empty(heap, 1);
     var status = 0;
     borrow ps as &pr in {
-        let (r, s) = pg.extended(heap, conn, "select id, name, age, active, nickname from gen_users where id = $1", pr);
+        let (r, s) = pg.run_named(heap, conn, "user_by_id", pr);
         buffer.drop(heap, reply);
         reply = r;
         status = s;
@@ -66,7 +66,7 @@ pub fn users_older_than[&h, &c](heap: &!h Heap, conn: &!c Conn, min_age: int) ->
     var reply = buffer.empty(heap, 1);
     var status = 0;
     borrow ps as &pr in {
-        let (r, s) = pg.extended(heap, conn, "select id, name from gen_users where age > $1 order by id", pr);
+        let (r, s) = pg.run_named(heap, conn, "users_older_than", pr);
         buffer.drop(heap, reply);
         reply = r;
         status = s;
@@ -92,7 +92,7 @@ pub fn add_user[&h, &c, &a1](heap: &!h Heap, conn: &!c Conn, name: &a1 [byte], a
     var reply = buffer.empty(heap, 1);
     var status = 0;
     borrow ps as &pr in {
-        let (r, s) = pg.extended(heap, conn, "insert into gen_users (name, age) values ($1, $2) returning id", pr);
+        let (r, s) = pg.run_named(heap, conn, "add_user", pr);
         buffer.drop(heap, reply);
         reply = r;
         status = s;
@@ -114,7 +114,7 @@ pub fn rename_user[&h, &c, &a2](heap: &!h Heap, conn: &!c Conn, id: int, name: &
     var reply = buffer.empty(heap, 1);
     var status = 0;
     borrow ps as &pr in {
-        let (r, s) = pg.extended(heap, conn, "update gen_users set name = $2 where id = $1", pr);
+        let (r, s) = pg.run_named(heap, conn, "rename_user", pr);
         buffer.drop(heap, reply);
         reply = r;
         status = s;
@@ -129,7 +129,7 @@ pub fn posts_with_authors[&h, &c](heap: &!h Heap, conn: &!c Conn) -> [heap, conn
     var reply = buffer.empty(heap, 1);
     var status = 0;
     borrow ps as &pr in {
-        let (r, s) = pg.extended(heap, conn, "select p.title, u.name as author from gen_posts p left join gen_users u on u.id = p.user_id order by p.id", pr);
+        let (r, s) = pg.run_named(heap, conn, "posts_with_authors", pr);
         buffer.drop(heap, reply);
         reply = r;
         status = s;
@@ -162,7 +162,7 @@ pub fn count_users[&h, &c](heap: &!h Heap, conn: &!c Conn) -> [heap, conn_read, 
     var reply = buffer.empty(heap, 1);
     var status = 0;
     borrow ps as &pr in {
-        let (r, s) = pg.extended(heap, conn, "select count(*) as n from gen_users", pr);
+        let (r, s) = pg.run_named(heap, conn, "count_users", pr);
         buffer.drop(heap, reply);
         reply = r;
         status = s;
@@ -188,7 +188,7 @@ pub fn find_by_nickname[&h, &c, &a1](heap: &!h Heap, conn: &!c Conn, nickname: &
     var reply = buffer.empty(heap, 1);
     var status = 0;
     borrow ps as &pr in {
-        let (r, s) = pg.extended(heap, conn, "select id from gen_users where nickname = $1", pr);
+        let (r, s) = pg.run_named(heap, conn, "find_by_nickname", pr);
         buffer.drop(heap, reply);
         reply = r;
         status = s;
@@ -210,7 +210,7 @@ pub fn add_post[&h, &c, &a2](heap: &!h Heap, conn: &!c Conn, user_id: int, title
     var reply = buffer.empty(heap, 1);
     var status = 0;
     borrow ps as &pr in {
-        let (r, s) = pg.extended(heap, conn, "insert into gen_posts (user_id, title) values ($1, $2)", pr);
+        let (r, s) = pg.run_named(heap, conn, "add_post", pr);
         buffer.drop(heap, reply);
         reply = r;
         status = s;
@@ -226,7 +226,7 @@ pub fn user_details[&h, &c](heap: &!h Heap, conn: &!c Conn, id: int) -> [heap, c
     var reply = buffer.empty(heap, 1);
     var status = 0;
     borrow ps as &pr in {
-        let (r, s) = pg.extended(heap, conn, "select balance, joined, (age + 1) as next_age from gen_users where id = $1", pr);
+        let (r, s) = pg.run_named(heap, conn, "user_details", pr);
         buffer.drop(heap, reply);
         reply = r;
         status = s;
@@ -260,7 +260,7 @@ pub fn tricky[&h, &c](heap: &!h Heap, conn: &!c Conn) -> [heap, conn_read, conn_
     var reply = buffer.empty(heap, 1);
     var status = 0;
     borrow ps as &pr in {
-        let (r, s) = pg.extended(heap, conn, "select 'say \"hi\" \\ back' as quoted, 'two\nlines' as two", pr);
+        let (r, s) = pg.run_named(heap, conn, "tricky", pr);
         buffer.drop(heap, reply);
         reply = r;
         status = s;
@@ -304,7 +304,7 @@ pub fn add_user_partial[&h, &c, &a1, &a3](heap: &!h Heap, conn: &!c Conn, name: 
     var reply = buffer.empty(heap, 1);
     var status = 0;
     borrow ps as &pr in {
-        let (r, s) = pg.extended(heap, conn, "insert into gen_users (name, age, nickname) values ($1, $2, $3) returning id", pr);
+        let (r, s) = pg.run_named(heap, conn, "add_user_partial", pr);
         buffer.drop(heap, reply);
         reply = r;
         status = s;
@@ -316,4 +316,46 @@ pub fn add_user_partial[&h, &c, &a1, &a3](heap: &!h Heap, conn: &!c Conn, name: 
 pub fn add_user_partial_id[&m](m: &m [byte], row: int) -> [] int {
     let (from, to) = pg.value(m, row, 0);
     return pg.int_text(m, from, to);
+}
+
+// Parse every query above on this connection, once, after login: PostgreSQL then parses and plans each
+// one once instead of on every call. Answers the reply of the first refusal (`pg.failure` says what the
+// server objected to) or an empty one, and a status; the queries are not to be run unless both are clean.
+pub fn prepare_all[&h, &c](heap: &!h Heap, conn: &!c Conn) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    var reply = buffer.empty(heap, 1);
+    var status = 0;
+    let (r0, s0) = pg.prepare_after(heap, conn, reply, status, "user_by_id", "select id, name, age, active, nickname from gen_users where id = $1");
+    reply = r0;
+    status = s0;
+    let (r1, s1) = pg.prepare_after(heap, conn, reply, status, "users_older_than", "select id, name from gen_users where age > $1 order by id");
+    reply = r1;
+    status = s1;
+    let (r2, s2) = pg.prepare_after(heap, conn, reply, status, "add_user", "insert into gen_users (name, age) values ($1, $2) returning id");
+    reply = r2;
+    status = s2;
+    let (r3, s3) = pg.prepare_after(heap, conn, reply, status, "rename_user", "update gen_users set name = $2 where id = $1");
+    reply = r3;
+    status = s3;
+    let (r4, s4) = pg.prepare_after(heap, conn, reply, status, "posts_with_authors", "select p.title, u.name as author from gen_posts p left join gen_users u on u.id = p.user_id order by p.id");
+    reply = r4;
+    status = s4;
+    let (r5, s5) = pg.prepare_after(heap, conn, reply, status, "count_users", "select count(*) as n from gen_users");
+    reply = r5;
+    status = s5;
+    let (r6, s6) = pg.prepare_after(heap, conn, reply, status, "find_by_nickname", "select id from gen_users where nickname = $1");
+    reply = r6;
+    status = s6;
+    let (r7, s7) = pg.prepare_after(heap, conn, reply, status, "add_post", "insert into gen_posts (user_id, title) values ($1, $2)");
+    reply = r7;
+    status = s7;
+    let (r8, s8) = pg.prepare_after(heap, conn, reply, status, "user_details", "select balance, joined, (age + 1) as next_age from gen_users where id = $1");
+    reply = r8;
+    status = s8;
+    let (r9, s9) = pg.prepare_after(heap, conn, reply, status, "tricky", "select 'say \"hi\" \\ back' as quoted, 'two\nlines' as two");
+    reply = r9;
+    status = s9;
+    let (r10, s10) = pg.prepare_after(heap, conn, reply, status, "add_user_partial", "insert into gen_users (name, age, nickname) values ($1, $2, $3) returning id");
+    reply = r10;
+    status = s10;
+    return (reply, status);
 }

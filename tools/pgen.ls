@@ -262,7 +262,8 @@ fn complain_server[&i, &n, &m](io: &!i Io, name: &n [byte], reply: &m [byte], at
 }
 
 // The function that runs the query: typed parameters in, the server's whole reply and a status out.
-fn emit_runner[&h, &n, &d, &r, &l](heap: &!h Heap, out: buffer.Buffer, name: &n [byte], pnames: &d [byte], m: &r [byte], tpos: int, sql_literal: &l [byte]) -> [heap] buffer.Buffer {
+// It runs the statement `prepare_all` prepared under the query's name.
+fn emit_runner[&h, &n, &d, &r](heap: &!h Heap, out: buffer.Buffer, name: &n [byte], pnames: &d [byte], m: &r [byte], tpos: int) -> [heap] buffer.Buffer {
     let count = pg.param_count(m, tpos);
     var o = buffer.append(heap, out, "\n// ");
     o = buffer.append(heap, o, name);
@@ -330,9 +331,9 @@ fn emit_runner[&h, &n, &d, &r, &l](heap: &!h Heap, out: buffer.Buffer, name: &n 
         }
         k = k + 1;
     }
-    o = buffer.append(heap, o, "    var reply = buffer.empty(heap, 1);\n    var status = 0;\n    borrow ps as &pr in {\n        let (r, s) = pg.extended(heap, conn, ");
-    o = buffer.append(heap, o, sql_literal);
-    o = buffer.append(heap, o, ", pr);\n        buffer.drop(heap, reply);\n        reply = r;\n        status = s;\n    }\n    pg.drop_params(heap, ps);\n    return (reply, status);\n}\n");
+    o = buffer.append(heap, o, "    var reply = buffer.empty(heap, 1);\n    var status = 0;\n    borrow ps as &pr in {\n        let (r, s) = pg.run_named(heap, conn, \"");
+    o = buffer.append(heap, o, name);
+    o = buffer.append(heap, o, "\", pr);\n        buffer.drop(heap, reply);\n        reply = r;\n        status = s;\n    }\n    pg.drop_params(heap, ps);\n    return (reply, status);\n}\n");
     return o;
 }
 
@@ -446,15 +447,16 @@ fn parameter_names[&h, &i, &n, &d](heap: &!h Heap, io: &!i Io, name: &n [byte], 
 
 // One query: describe it, append its runner and accessors to `out`. Answers the output, the names
 // taken so far, and 0 -- or a nonzero code after a message on standard error.
-fn generate[&h, &c, &i, &n, &d, &s](heap: &!h Heap, conn: &!c Conn, io: &!i Io, out: buffer.Buffer, seen: buffer.Buffer, name: &n [byte], given: &d [byte], sql: &s [byte]) -> [heap, conn_read, conn_write, err_write] (buffer.Buffer, buffer.Buffer, int) {
+fn generate[&h, &c, &i, &n, &d, &s](heap: &!h Heap, conn: &!c Conn, io: &!i Io, out: buffer.Buffer, seen: buffer.Buffer, prep: buffer.Buffer, index: int, name: &n [byte], given: &d [byte], sql: &s [byte]) -> [heap, conn_read, conn_write, err_write] (buffer.Buffer, buffer.Buffer, buffer.Buffer, int) {
     if !ident_ok(name) {
         complain(io, name, "a query name is lower-case letters, digits and underscores, not starting with a digit");
-        return (out, seen, 1);
+        return (out, seen, prep, 1);
     }
     let joins = contains_word(heap, sql, "join");
     let (reply, status) = pg.describing(heap, conn, sql);
     var o = out;
     var sn = seen;
+    var pp = prep;
     var code = 0;
     borrow reply as &rr in {
         let m = buffer.bytes(rr);
@@ -483,9 +485,23 @@ fn generate[&h, &c, &i, &n, &d, &s](heap: &!h Heap, conn: &!c Conn, io: &!i Io, 
             }
             if code == 0 {
                 borrow pnames as &pr in {
+                    o = emit_runner(heap, o, name, buffer.bytes(pr), m, tpos);
+                    // the step of `prepare_all` that parses this query, under its name
+                    pp = buffer.append(heap, pp, "    let (r");
+                    pp = buffer.push_nat(heap, pp, index);
+                    pp = buffer.append(heap, pp, ", s");
+                    pp = buffer.push_nat(heap, pp, index);
+                    pp = buffer.append(heap, pp, ") = pg.prepare_after(heap, conn, reply, status, \"");
+                    pp = buffer.append(heap, pp, name);
+                    pp = buffer.append(heap, pp, "\", ");
                     borrow sql_literal as &lr in {
-                        o = emit_runner(heap, o, name, buffer.bytes(pr), m, tpos, buffer.bytes(lr));
+                        pp = buffer.append(heap, pp, buffer.bytes(lr));
                     }
+                    pp = buffer.append(heap, pp, ");\n    reply = r");
+                    pp = buffer.push_nat(heap, pp, index);
+                    pp = buffer.append(heap, pp, ";\n    status = s");
+                    pp = buffer.push_nat(heap, pp, index);
+                    pp = buffer.append(heap, pp, ";\n");
                 }
             }
             buffer.drop(heap, sql_literal);
@@ -539,7 +555,7 @@ fn generate[&h, &c, &i, &n, &d, &s](heap: &!h Heap, conn: &!c Conn, io: &!i Io, 
         }
     }
     buffer.drop(heap, reply);
-    return (o, sn, code);
+    return (o, sn, pp, code);
 }
 
 // The line of `text` that starts at `at`: where it ends (at its newline, or the end of the text).
@@ -602,7 +618,7 @@ fn generate_all[&h, &c, &i, &t, &f](heap: &!h Heap, conn: &!c Conn, io: &!i Io, 
     out = buffer.append(heap, out, file);
     out = buffer.append(heap, out, " against ");
     out = buffer.append(heap, out, database);
-    out = buffer.append(heap, out, ". Do not edit: change the SQL and run pgen again.\n//\n// Each query is a function that runs it (`<name>`: the whole reply and a status, 0 for ok) and one\n// accessor per result column (`<name>_<column>`, read from a row as `pg.first_row`/`pg.next_row` give\n// it; `_is_null` where the column can be NULL).\nedition 5;\n\nmodule ");
+    out = buffer.append(heap, out, ". Do not edit: change the SQL and run pgen again.\n//\n// Each query is a function that runs it (`<name>`: the whole reply and a status, 0 for ok) and one\n// accessor per result column (`<name>_<column>`, read from a row as `pg.first_row`/`pg.next_row` give\n// it; `_is_null` where the column can be NULL). Call `prepare_all` once after login, before the first query.\nedition 5;\n\nmodule ");
     out = buffer.append(heap, out, stem(file));
     out = buffer.append(heap, out, ";\n\nimport std.buffer;\nimport pg;\n");
     var seen = buffer.push(heap, buffer.empty(heap, 256), byte_of(10));
@@ -610,6 +626,7 @@ fn generate_all[&h, &c, &i, &t, &f](heap: &!h Heap, conn: &!c Conn, io: &!i Io, 
     if !ident_ok(stem(file)) {
         code = complain(io, file, "the file name, without its extension, becomes the module name: lower-case letters, digits and underscores");
     }
+    var prep = buffer.empty(heap, 512);
     var queries = 0;
     var h = next_header(text, 0);
     while h >= 0 && code == 0 {
@@ -630,9 +647,10 @@ fn generate_all[&h, &c, &i, &t, &f](heap: &!h Heap, conn: &!c Conn, io: &!i Io, 
             if len(sql) == 0 {
                 code = complain(io, header[nf..nt], "no statement after the name");
             } else {
-                let (o, s, c) = generate(heap, conn, io, out, seen, header[nf..nt], rest, sql);
+                let (o, s, pr, c) = generate(heap, conn, io, out, seen, prep, queries, header[nf..nt], rest, sql);
                 out = o;
                 seen = s;
+                prep = pr;
                 code = c;
                 queries = queries + 1;
             }
@@ -642,6 +660,14 @@ fn generate_all[&h, &c, &i, &t, &f](heap: &!h Heap, conn: &!c Conn, io: &!i Io, 
     if code == 0 && queries == 0 {
         code = complain(io, file, "no `-- name:` line, so no queries");
     }
+    if code == 0 {
+        out = buffer.append(heap, out, "\n// Parse every query above on this connection, once, after login: PostgreSQL then parses and plans each\n// one once instead of on every call. Answers the reply of the first refusal (`pg.failure` says what the\n// server objected to) or an empty one, and a status; the queries are not to be run unless both are clean.\npub fn prepare_all[&h, &c](heap: &!h Heap, conn: &!c Conn) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {\n    var reply = buffer.empty(heap, 1);\n    var status = 0;\n");
+        borrow prep as &pr in {
+            out = buffer.append(heap, out, buffer.bytes(pr));
+        }
+        out = buffer.append(heap, out, "    return (reply, status);\n}\n");
+    }
+    buffer.drop(heap, prep);
     buffer.drop(heap, seen);
     return (out, code);
 }
