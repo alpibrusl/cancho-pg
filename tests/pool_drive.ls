@@ -19,7 +19,7 @@ import pg.pool;
 // Modes: `plain` (all `dbl`), `slow0` (request 0 is `slow`, the rest `dbl`: with two lanes the
 // others come back first), `slowall` (all `slow`: kill the server's backends meanwhile), `err`
 // (request 1 is a statement that does not exist), `big` (each asks the server for the length of a text
-// parameter of the given size, which is what the answer holds), `lazy` (all `dbl`, but the answers are only
+// parameter of the given size, which is what the answer holds), `row` (a primary-key lookup of user 500 in `users`, the query of `users_pg`: needs that table; the answers are counted, not printed), `lazy` (all `dbl`, but the answers are only
 // taken once the poller has been quiet, so a connection can fail with replies nobody has taken yet). Ends with `finished <answers> <loops>`: how
 // many answers and how many times the loop woke, which a loop that is not waiting would run up.
 // It gives up, and says so with `finished`, after the given silence (6000 ms if none).
@@ -55,7 +55,7 @@ fn fresh_nonce[&h, &f](heap: &!h Heap, fs: &f Fs("")) -> [heap, fs_read("")] buf
 }
 
 // Log in and prepare the statements the driver uses.
-fn ready_for_use[&h, &c, &f, &u, &d](heap: &!h Heap, conn: &!c Conn, fs: &f Fs(""), user: &u [byte], database: &d [byte]) -> [heap, conn_read, conn_write, fs_read("")] int {
+fn ready_for_use[&h, &c, &f, &u, &d](heap: &!h Heap, conn: &!c Conn, fs: &f Fs(""), user: &u [byte], database: &d [byte], row: bool) -> [heap, conn_read, conn_write, fs_read("")] int {
     let nonce = fresh_nonce(heap, fs);
     var status = 1;
     borrow nonce as &nb in {
@@ -79,7 +79,12 @@ fn ready_for_use[&h, &c, &f, &u, &d](heap: &!h Heap, conn: &!c Conn, fs: &f Fs("
     }
     let (r3, s3) = pg.prepare(heap, conn, "len", "select length($1::text)::text");
     buffer.drop(heap, r3);
-    return s3;
+    if s3 != 0 || !row {
+        return s3;
+    }
+    let (r4, s4) = pg.prepare(heap, conn, "row", "select id, name, email, age, role, tags from users where id = $1");
+    buffer.drop(heap, r4);
+    return s4;
 }
 
 fn request[&h](heap: &!h Heap, name: &static [byte], n: int, nbytes: int) -> [heap] buffer.Buffer {
@@ -108,7 +113,7 @@ fn request[&h](heap: &!h Heap, name: &static [byte], n: int, nbytes: int) -> [he
 }
 
 // Submit as many of the requests from `next` on as the pool takes. Answers the next to submit.
-fn submit_some[&h, &q, &p](heap: &!h Heap, pl: &!q pool.Pool, poller: &!p Poller, next: int, count: int, mode: int, nbytes: int) -> [heap, conn_write, poll] int {
+fn submit_some[&h, &q](heap: &!h Heap, pl: &!q pool.Pool, next: int, count: int, mode: int, nbytes: int) -> [heap] int {
     var n = next;
     var going = true;
     while going && n < count {
@@ -122,13 +127,18 @@ fn submit_some[&h, &q, &p](heap: &!h Heap, pl: &!q pool.Pool, poller: &!p Poller
         if mode == 3 && n == 1 {
             name = "nothing_was_prepared_under_this_name";
         }
+        var asked = n;
         if mode == 4 {
             name = "len";
         }
-        let m = request(heap, name, n, nbytes);
+        if mode == 6 {
+            name = "row";
+            asked = 500;
+        }
+        let m = request(heap, name, asked, nbytes);
         var r = 0 - 9;
         borrow m as &mb in {
-            r = pool.submit(pl, poller, n, buffer.bytes(mb));
+            r = pool.submit(pl, n, buffer.bytes(mb));
         }
         buffer.drop(heap, m);
         if r == 0 {
@@ -165,7 +175,8 @@ fn show[&i, &q](io: &!i Io, pl: &q pool.Pool, tag: int) -> [io_write] int {
 }
 
 fn run[&h, &i, &q, &p](heap: &!h Heap, io: &!i Io, pl: &!q pool.Pool, poller: &!p Poller, count: int, mode: int, budget_ms: int, nbytes: int) -> [heap, conn_read, conn_write, io_write, poll] int {
-    var next = submit_some(heap, pl, poller, 0, count, mode, nbytes);
+    var next = submit_some(heap, pl, 0, count, mode, nbytes);
+    pool.flush(pl, poller);
     var answered = 0;
     var wakes = 0;
     var events = box_slice(heap, 64, 0);
@@ -197,14 +208,17 @@ fn run[&h, &i, &q, &p](heap: &!h Heap, io: &!i Io, pl: &!q pool.Pool, poller: &!
         if mode != 5 || ready == 0 {
             var tag = pool.next_done(pl);
             while tag >= 0 {
-                show(io, pl, tag);
+                if mode != 6 {
+                    show(io, pl, tag);
+                }
                 answered = answered + 1;
                 tag = pool.next_done(pl);
             }
         }
         if next < count {
-            next = submit_some(heap, pl, poller, next, count, mode, nbytes);
+            next = submit_some(heap, pl, next, count, mode, nbytes);
         }
+        pool.flush(pl, poller);
     }
     unbox_slice(heap, events);
     io.write_all(io, "finished ");
@@ -230,6 +244,9 @@ fn mode_of[&t](text: &t [byte]) -> [] int {
     }
     if text[0] == byte_of(108) {
         return 5;
+    }
+    if text[0] == byte_of(114) {
+        return 6;
     }
     return 0;
 }
@@ -276,7 +293,7 @@ fn main(world: World) -> [] int {
                                                 var conn = c;
                                                 var s = 1;
                                                 borrow mut conn as &!ch in {
-                                                    s = ready_for_use(h, ch, z, arg(g, 3), arg(g, 4));
+                                                    s = ready_for_use(h, ch, z, arg(g, 3), arg(g, 4), mode_of(arg(g, 7)) == 6);
                                                 }
                                                 if s == 0 {
                                                     let (grown, slot) = pool.add(h, pl, conn);

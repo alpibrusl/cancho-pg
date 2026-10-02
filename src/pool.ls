@@ -6,7 +6,7 @@ module pg.pool;
 //
 // A `Pool` owns a few logged-in, non-blocking connections and pipelines requests over them:
 // `submit` queues one encoded request (`pg.bind_named`: Bind, Execute, Sync) and returns at
-// once, `pump` does the I/O the poller said was ready, and `next_done` hands back the tag of
+// once, `flush` sends what was queued, `pump` does the I/O the poller said was ready, and `next_done` hands back the tag of
 // each request whose answer has arrived, in the order each connection answers, with
 // `reply` the bytes `pg.run_named` would have returned. Nothing here waits for the server:
 // the application's loop owns the poller, registers the pool's connections in it with `start`,
@@ -16,7 +16,8 @@ module pg.pool;
 //     (pool, slot) = pool.add(heap, pool, conn);               // logged in, statements prepared
 //     pool.start(pool, poller, first_token);                   // watch them all, under tokens from here
 //     ...
-//     pool.submit(pool, poller, tag, request);                  // 0, or why not
+//     pool.submit(pool, tag, request);                          // 0, or why not
+//     pool.flush(pool, poller);                                 // once per turn: one write per connection
 //     pool.pump(pool, poller, token, readiness);                // for a token `owns`
 //     while pool.next_done(pool) >= 0 { ... pool.reply(pool), pool.status(pool) ... }
 //
@@ -285,7 +286,7 @@ fn frame[&c](core: &!c Core, k: int) -> [] int {
 
 // Send what is queued on `k` until the kernel will take no more; watch for writing while some
 // is left, and for reading alone when none is.
-fn flush[&t, &c, &p](tab: &!t conns.Table, core: &!c Core, poller: &!p Poller, k: int) -> [conn_write, poll] int {
+fn flush_lane[&t, &c, &p](tab: &!t conns.Table, core: &!c Core, poller: &!p Poller, k: int) -> [conn_write, poll] int {
     let st = contents(core.st);
     let q = contents(core.outq);
     let p = stride() * k;
@@ -331,15 +332,15 @@ fn flush[&t, &c, &p](tab: &!t conns.Table, core: &!c Core, poller: &!p Poller, k
 // ---------------------------------------------------------------------
 
 // Queue `request` (an encoded Bind/Execute/Sync, `pg.bind_named`) on the live connection with
-// the fewest requests in flight and send what the kernel will take; `tag` comes back from
-// `next_done` with its answer. Answers 0, or -1 if every connection is full (as deep as `depth`,
+// the fewest requests in flight; nothing is sent until `flush`, so that what a loop turn queues goes
+// out in one write per connection, not one per request. `tag` comes back from `next_done` with its answer. Answers 0, or -1 if every connection is full (as deep as `depth`,
 // or without room to queue it: say 503, or keep it for later), -2 if the request is larger than
 // `out_cap` (it could never be queued), -3 if no connection is live.
-pub fn submit[&q, &p, &m](pool: &!q Pool, poller: &!p Poller, tag: int, request: &m [byte]) -> [conn_write, poll] int {
-    return submit_in(pool.tab, pool.core, poller, tag, request);
+pub fn submit[&q, &m](pool: &!q Pool, tag: int, request: &m [byte]) -> [] int {
+    return submit_in(pool.core, tag, request);
 }
 
-fn submit_in[&t, &c, &p, &m](tab: &!t conns.Table, core: &!c Core, poller: &!p Poller, tag: int, request: &m [byte]) -> [conn_write, poll] int {
+fn submit_in[&c, &m](core: &!c Core, tag: int, request: &m [byte]) -> [] int {
     if len(request) > core.out_cap {
         return 0 - 2;
     }
@@ -386,7 +387,26 @@ fn submit_in[&t, &c, &p, &m](tab: &!t conns.Table, core: &!c Core, poller: &!p P
     st[p + 3] = st[p + 3] + len(request);
     contents(core.tags)[best * core.depth + (st[p + 8] + st[p + 5]) % core.depth] = tag;
     st[p + 5] = st[p + 5] + 1;
-    flush(tab, core, poller, best);
+    return 0;
+}
+
+// Send what `submit` queued, on every connection that has some: one write each if the kernel takes it
+// all, otherwise the rest goes as the poller reports the socket writable. Call it once per turn of the
+// loop, after the turn's `submit`s.
+pub fn flush[&q, &p](pool: &!q Pool, poller: &!p Poller) -> [conn_write, poll] int {
+    return flush_all(pool.tab, pool.core, poller);
+}
+
+fn flush_all[&t, &c, &p](tab: &!t conns.Table, core: &!c Core, poller: &!p Poller) -> [conn_write, poll] int {
+    let st = contents(core.st);
+    var k = 0;
+    while k < core.lanes {
+        let p = stride() * k;
+        if st[p + 6] == 1 && st[p + 4] < st[p + 3] {
+            flush_lane(tab, core, poller, k);
+        }
+        k = k + 1;
+    }
     return 0;
 }
 
@@ -412,7 +432,7 @@ fn pump_in[&t, &c, &p](tab: &!t conns.Table, core: &!c Core, poller: &!p Poller,
         return 0;
     }
     if readiness % 4 >= 2 {
-        flush(tab, core, poller, k);
+        flush_lane(tab, core, poller, k);
     }
     if readiness % 2 == 1 && st[p + 6] == 1 {
         let base = k * core.in_cap;
