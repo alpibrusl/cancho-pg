@@ -75,7 +75,7 @@ QUERIES = [
     "select null::int, null::text, 'x'",
     "select ''::text, 'a', ''::text",
     "select 'h\u00e9llo w\u00f6rld \u2603 \U0001F600'",
-    "select 2147483647::int, -2147483648::int, 9223372036854775807::bigint, -9223372036854775808::bigint",
+    "select 2147483647::int, (-2147483648)::int, 9223372036854775807::bigint, (-9223372036854775808)::bigint",
     "select 1.5::float8, 1e100::float8, 'NaN'::float8, 'Infinity'::float8, 0.1::float4",
     "select 12345678901234567890.123456789::numeric, 0::numeric, -0.000001::numeric",
     "select true, false, null::bool",
@@ -101,12 +101,19 @@ QUERIES = [
 ]
 
 
+NO_ROWS = {"select * from generate_series(1, 0)"}
+
+
 class Differential(unittest.TestCase):
     def test_same_rows_as_psql(self):
         for sql in QUERIES:
             want = psql(sql)
             got, status = ours(sql)
             self.assertEqual(status, 0, sql)
+            # a query that fails on both sides prints nothing on both and would agree vacuously
+            self.assertNotIn("ERROR ", got, sql[:80])
+            if sql not in NO_ROWS:
+                self.assertNotEqual(want, "", "the reference printed nothing: " + sql[:80])
             self.assertEqual(rows_of(got), want, sql[:80])
 
 
