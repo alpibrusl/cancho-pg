@@ -334,6 +334,185 @@ pub fn ready[&b](m: &b [byte]) -> [] bool {
     return false;
 }
 
+// The table oid and the column number (attnum) of column `i` of a RowDescription, when the column
+// is a plain reference to a table's column; `0` for both when it is an expression. These are what
+// let a generator ask the catalogue whether the column can be NULL. `-1` if there is no such column.
+pub fn column_table[&b](m: &b [byte], at: int, i: int) -> [] int {
+    let p = column_at(m, at, i);
+    if p < 0 {
+        return 0 - 1;
+    }
+    var q = p;
+    while int_of(m[q]) != 0 {
+        q = q + 1;
+    }
+    return be32(m, q + 1);
+}
+
+pub fn column_attnum[&b](m: &b [byte], at: int, i: int) -> [] int {
+    let p = column_at(m, at, i);
+    if p < 0 {
+        return 0 - 1;
+    }
+    var q = p;
+    while int_of(m[q]) != 0 {
+        q = q + 1;
+    }
+    return be16(m, q + 5);
+}
+
+// The first DataRow of a reply, as an offset for `value`, or -1.
+pub fn first_row[&b](m: &b [byte]) -> [] int {
+    return next_row(m, 0 - 1);
+}
+
+// The first DataRow after the one at `at` (`at` of -1 starts at the beginning), or -1: the loop
+// `var at = first_row(m); while at >= 0 { ...; at = next_row(m, at); }` visits each row once.
+pub fn next_row[&b](m: &b [byte], at: int) -> [] int {
+    var p = 0;
+    if at >= 0 {
+        if size(m, at) < 1 {
+            return 0 - 1;
+        }
+        p = at + size(m, at);
+    }
+    while size(m, p) > 0 {
+        if kind(m, p) == 68 {
+            return p;
+        }
+        p = p + size(m, p);
+    }
+    return 0 - 1;
+}
+
+// The offset of the first ErrorResponse in a reply, or -1 if the statement succeeded.
+pub fn failure[&b](m: &b [byte]) -> [] int {
+    var p = 0;
+    while size(m, p) > 0 {
+        if kind(m, p) == 69 {
+            return p;
+        }
+        p = p + size(m, p);
+    }
+    return 0 - 1;
+}
+
+// The row count in the last command tag ("INSERT 0 1" is 1, "SELECT 3" is 3, "UPDATE 0" is 0), or -1
+// if the reply has no tag or it carries no count ("CREATE TABLE").
+pub fn affected[&b](m: &b [byte]) -> [] int {
+    var p = 0;
+    var last = 0 - 1;
+    while size(m, p) > 0 {
+        if kind(m, p) == 67 {
+            last = p;
+        }
+        p = p + size(m, p);
+    }
+    if last < 0 {
+        return 0 - 1;
+    }
+    let (from, to) = tag(m, last);
+    var q = to;
+    while q > from && int_of(m[q - 1]) != 32 {
+        q = q - 1;
+    }
+    if q == from || q == to {
+        return 0 - 1;
+    }
+    var k = q;
+    while k < to {
+        if int_of(m[k]) < 48 || int_of(m[k]) > 57 {
+            return 0 - 1;
+        }
+        k = k + 1;
+    }
+    return int_text(m, q, to);
+}
+
+// A decimal integer in text form (what the server sends for int2, int4, int8 and oid): an
+// optional minus and digits. Accumulated downwards, so -9223372036854775808 is exact.
+pub fn int_text[&b](m: &b [byte], from: int, to: int) -> [] int {
+    var i = from;
+    var negative = false;
+    if i < to && int_of(m[i]) == 45 {
+        negative = true;
+        i = i + 1;
+    }
+    var n = 0;
+    while i < to {
+        let d = int_of(m[i]) - 48;
+        if d < 0 || d > 9 {
+            return 0;
+        }
+        n = n * 10 - d;
+        i = i + 1;
+    }
+    if negative {
+        return n;
+    }
+    return 0 - n;
+}
+
+// A boolean in text form: `t` is true, anything else (the server sends `f`) is false.
+pub fn bool_text[&b](m: &b [byte], from: int, to: int) -> [] bool {
+    return to - from == 1 && int_of(m[from]) == 116;
+}
+
+// `n` written in decimal after what `b` already holds. Works downwards from `n`, so the most
+// negative integer needs no special case.
+fn put_int[&h](heap: &!h Heap, b: buffer.Buffer, n: int) -> [heap] buffer.Buffer {
+    var out = b;
+    var rest = n;
+    if n < 0 {
+        out = buffer.push(heap, out, byte_of(45));
+    } else {
+        rest = 0 - n;
+    }
+    // `rest` is now zero or negative; collect its digits least significant first
+    var digits = box_slice(heap, 20, byte_of(0));
+    var count = 0;
+    borrow mut digits as &!dw in {
+        let d = contents(dw);
+        if rest == 0 {
+            d[0] = byte_of(48);
+            count = 1;
+        }
+        while rest != 0 {
+            d[count] = byte_of(48 - rest % 10);
+            rest = rest / 10;
+            count = count + 1;
+        }
+    }
+    borrow digits as &dr in {
+        var k = count;
+        while k > 0 {
+            out = buffer.push(heap, out, contents(dr)[k - 1]);
+            k = k - 1;
+        }
+    }
+    unbox_slice(heap, digits);
+    return out;
+}
+
+// A text-format integer parameter (for `int2`, `int4`, `int8`, `oid`), written in decimal.
+pub fn param_int[&h](heap: &!h Heap, p: Params, value: int) -> [heap] Params {
+    let text = put_int(heap, buffer.empty(heap, 24), value);
+    var out = p;
+    borrow text as &tr in {
+        out = param(heap, out, buffer.bytes(tr));
+    }
+    buffer.drop(heap, text);
+    return out;
+}
+
+// A boolean parameter: `t` or `f`.
+pub fn param_bool[&h](heap: &!h Heap, p: Params, value: bool) -> [heap] Params {
+    if value {
+        return param(heap, p, "t");
+    }
+    return param(heap, p, "f");
+}
+
 // ---------------------------------------------------------------------
 // Authentication: base64, HMAC-SHA-256, PBKDF2, SCRAM-SHA-256
 // ---------------------------------------------------------------------

@@ -21,7 +21,7 @@ import subprocess
 import sys
 import unittest
 
-ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOST = os.environ.get("PGHOST", "127.0.0.1")
 PORT = os.environ.get("PGPORT", "5432")
 USER = os.environ.get("PGUSER", "postgres")
@@ -30,10 +30,12 @@ BIN = os.environ.get("BIN")
 
 
 DESCRIBE = None
+PGEN = None
+GEN_USE = None
 
 
 def build():
-    global BIN, DESCRIBE
+    global BIN, DESCRIBE, PGEN, GEN_USE
     lex = os.environ.get("LEX_SYS", "lex-sys")
     os.makedirs(os.path.join(ROOT, "build"), exist_ok=True)
     def one(name):
@@ -43,6 +45,13 @@ def build():
         return out
     BIN = BIN or one("psql")
     DESCRIBE = one("describe")
+    lex_files = lambda out, main, *more: subprocess.run(
+        [lex, "build", "--std", main, *more, os.path.join(ROOT, "src", "pg.ls"), "-o", out], check=True)
+    PGEN = os.path.join(ROOT, "build", "pgen")
+    lex_files(PGEN, os.path.join(ROOT, "tools", "pgen.ls"))
+    # the program that uses the *checked-in* generated module, so a stale one is a failure
+    GEN_USE = os.path.join(ROOT, "build", "gen_use")
+    lex_files(GEN_USE, os.path.join(ROOT, "tests", "gen_use.ls"), os.path.join(ROOT, "tests", "generated", "queries.ls"))
 
 
 def describe(sql, user=USER, db=DB):
@@ -318,6 +327,165 @@ class Connections(unittest.TestCase):
             self.assertGreaterEqual(len(nonce), 24, nonce)
             nonces.append(nonce)
         self.assertNotEqual(nonces[0], nonces[1])
+
+
+def sql(text, db=DB, user=USER):
+    """Run SQL through the reference client; (stdout, exit status)."""
+    p = subprocess.run(["psql", "-At", "-v", "ON_ERROR_STOP=1", "-F", "|", "-c", text],
+                       env={**os.environ, "PGHOST": HOST, "PGPORT": PORT, "PGUSER": user, "PGDATABASE": db},
+                       capture_output=True, text=True, timeout=60)
+    return p.stdout, p.returncode
+
+
+def pgen(queries_path, db=DB):
+    """(stdout, stderr, exit status) of the generator."""
+    p = subprocess.run([PGEN, HOST, PORT, USER, db, "-", queries_path], capture_output=True, text=True, timeout=60)
+    return p.stdout, p.stderr, p.returncode
+
+
+class Generator(unittest.TestCase):
+    """`tools/pgen.ls`: typed queries from SQL, by asking the server to describe each statement."""
+
+    QUERIES = os.path.join(ROOT, "tests", "queries.sql")
+    GENERATED = os.path.join(ROOT, "tests", "generated", "queries.ls")
+
+    @classmethod
+    def setUpClass(cls):
+        p = subprocess.run(["psql", "-q", "-v", "ON_ERROR_STOP=1", "-f", os.path.join(ROOT, "tests", "schema.sql")],
+                           env={**os.environ, "PGHOST": HOST, "PGPORT": PORT, "PGUSER": USER, "PGDATABASE": DB},
+                           capture_output=True, text=True)
+        assert p.returncode == 0, p.stderr
+        out, st = sql("insert into gen_users (name, age, active, balance, nickname) values "
+                      "('ann', 30, true, 1234, 'zed'), ('cy', null, false, 0, null) returning id")
+        assert st == 0, out
+
+    def test_the_checked_in_module_is_what_the_generator_writes(self):
+        out, err, st = pgen(os.path.join("tests", "queries.sql"))
+        self.assertEqual(st, 0, err)
+        with open(self.GENERATED) as f:
+            self.assertEqual(out, f.read(), "tests/generated/queries.ls is stale: regenerate it with pgen")
+
+    def test_generated_functions_run_and_read_back(self):
+        # a fresh seed each time: the scenario inserts and renames
+        self.setUpClass()
+        p = subprocess.run([GEN_USE, HOST, PORT, USER, DB, "-", "2"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout, "\n".join([
+            "count 2",
+            "user 1: ann age=30 active nickname=zed",
+            "user 2: cy age=NULL inactive nickname=NULL",
+            "user 99999: no row",
+            "added 3 affected 1",
+            "user 3: dee'; drop table gen_users; -- age=41 active nickname=NULL",
+            "renamed affected 1",
+            "user 3: renamed age=41 active nickname=NULL",
+            "older 1 ann",
+            "older 3 renamed",
+            "nickname zed: 1",
+            "nickname nobody: none",
+            "details balance=1234 joined=2024-05-06 07:08:09+00 next_age=31",
+            "details next_age=NULL",
+            "add_post ERROR 23503",
+            "add_post affected 1",
+            "post first post by ann",
+            'tricky [say "hi" \\ back] [two',
+            "lines]",
+            ""]))
+        # what the generated functions wrote, as the reference client reads it: the table is still
+        # there, the hostile name was data, and the rename took
+        out, st = sql("select id, name, age, active from gen_users order by id")
+        self.assertEqual(out, "1|ann|30|t\n2|cy||f\n3|renamed|41|t\n")
+        out, st = sql("select user_id, title from gen_posts")
+        self.assertEqual(out, "1|first post\n")
+
+    def generated(self, queries, check=True):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            q = os.path.join(d, "t.sql")
+            with open(q, "w") as f:
+                f.write(queries)
+            out, err, st = pgen(q)
+            if st == 0 and check:
+                m = os.path.join(d, "t.ls")
+                with open(m, "w") as f:
+                    f.write(out)
+                lex = os.environ.get("LEX_SYS", "lex-sys")
+                c = subprocess.run([lex, "check", "--std", m, os.path.join(ROOT, "src", "pg.ls")],
+                                   capture_output=True, text=True)
+                # a module with no `main` is complete: that is the one thing a check may say
+                self.assertEqual(c.stdout + c.stderr.replace(m, "t.ls").replace(os.path.join(ROOT, "src", "pg.ls"), "pg.ls"),
+                                 "t.ls: error: no `main` function\n", "the generated module does not compile:\n" + out)
+            return out, err, st
+
+    def test_types_come_from_the_server(self):
+        out, err, st = self.generated(
+            "-- name: kinds a b c d e f g\n"
+            "select $1::bool as flag, $2::int2 as small, $3::int8 as big, $4::oid as o, $5::uuid as u, "
+            "$6::timestamptz as t, $7::numeric as n")
+        self.assertEqual(st, 0, err)
+        self.assertIn("a: bool, b: int, c: int, d: int, e: &a5 [byte], f: &a6 [byte], g: &a7 [byte])", out.replace("conn: &!c Conn, ", ""))
+        self.assertIn("pub fn kinds_flag[&m](m: &m [byte], row: int) -> [] bool", out)
+        for name in ("small", "big", "o"):
+            self.assertIn(f"pub fn kinds_{name}[&m](m: &m [byte], row: int) -> [] int", out)
+        for name in ("u", "t", "n"):
+            self.assertIn(f"pub fn kinds_{name}[&m](m: &m [byte], row: int) -> [] (int, int)", out)
+        # no parameter names given: p1, p2, ...
+        out, err, st = self.generated("-- name: pair\nselect $1::int + $2::int as s")
+        self.assertIn("p1: int, p2: int", out)
+
+    def test_nullability_is_the_catalogue_and_a_join_forgets_it(self):
+        out, err, st = self.generated(
+            "-- name: plain\nselect id, name, age from gen_users\n"
+            "-- name: joined\nselect u.id, p.title from gen_users u left join gen_posts p on p.user_id = u.id\n"
+            "-- name: a_column_named_joined\nselect id as joined_at, balance as joined from gen_users\n")
+        self.assertEqual(st, 0, err)
+        # NOT NULL columns: no `_is_null`; a nullable one has it
+        self.assertNotIn("plain_id_is_null", out)
+        self.assertNotIn("plain_name_is_null", out)
+        self.assertIn("plain_age_is_null", out)
+        # an outer join can make a NOT NULL column NULL, and the server does not say: all nullable
+        self.assertIn("joined_id_is_null", out)
+        self.assertIn("joined_title_is_null", out)
+        # ... but `joined` as a name is not a join
+        self.assertNotIn("a_column_named_joined_joined_is_null", out)
+
+    def test_what_is_refused_is_refused_with_a_reason_and_nothing_is_written(self):
+        cases = [
+            ("syntax error from the server", "-- name: q\nselect from from", "42601"),
+            ("a table that does not exist", "-- name: q\nselect * from no_such_table_here", "42P01"),
+            ("a name used twice", "-- name: q\nselect 1 as a\n-- name: q\nselect 2 as b", "used twice"),
+            ("a column that is not an identifier", "-- name: q\nselect 1", "plain identifier"),
+            ("a column that needs quotes", '-- name: q\nselect 1 as "Bad Name"', "plain identifier"),
+            ("two columns with one name", "-- name: q\nselect 1 as a, 2 as a", "same function name"),
+            ("a name that is not an identifier", "-- name: Bad-Name\nselect 1 as a", "lower-case letters"),
+            ("too few parameter names", "-- name: q a\nselect $1::int + $2::int as s", "different number"),
+            ("a parameter named like the connection", "-- name: q conn\nselect $1::int as s", "`conn`"),
+            ("a parameter name twice", "-- name: q x x\nselect $1::int + $2::int as s", "not repeated"),
+            ("no statement", "-- name: q\n", "no statement"),
+            ("no queries at all", "select 1", "no queries"),
+            ("two statements", "-- name: q\nselect 1 as a; select 2 as b", "42601"),
+            ("a column and a query with one name", "-- name: q_a\nselect 1 as x\n-- name: q\nselect 1 as a", "same function name"),
+        ]
+        for what, queries, reason in cases:
+            out, err, st = self.generated(queries, check=False)
+            self.assertNotEqual(st, 0, what)
+            self.assertEqual(out, "", what + ": a refused file must write nothing")
+            self.assertIn(reason, err, what)
+        # one bad query among good ones: still nothing
+        out, err, st = self.generated("-- name: ok\nselect 1 as a\n-- name: bad\nselect * from no_such_table_here", check=False)
+        self.assertNotEqual(st, 0)
+        self.assertEqual(out, "")
+
+    def test_a_file_that_cannot_be_read_or_a_database_that_is_not_there(self):
+        out, err, st = pgen("/no/such/queries.sql")
+        self.assertEqual((out, st), ("", 1))
+        self.assertIn("cannot read", err)
+        out, err, st = pgen(os.path.join(ROOT, "tests", "..", "tests", "queries.sql"))
+        self.assertEqual((out, st), ("", 1), "a `..` path is refused, not a trap")
+        self.assertIn("`..`", err)
+        out, err, st = pgen(self.QUERIES, db="no_such_database_here")
+        self.assertEqual((out, st), ("", 1))
+        self.assertIn("3D000", err)
 
 
 class ImpostorServer(unittest.TestCase):

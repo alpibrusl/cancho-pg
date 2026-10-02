@@ -50,7 +50,7 @@ jobs:
 
       - name: Formatting
         working-directory: pg
-        run: ../lex-sys/target/release/lex-sys fmt --check src tests examples
+        run: ../lex-sys/target/release/lex-sys fmt --check src tests tools examples
 
       # The real server and the stock psql client as the reference: every query must print
       # the same rows, errors and tags must be the server's, parameters must stay data; and

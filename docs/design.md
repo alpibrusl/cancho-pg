@@ -1,8 +1,8 @@
 # lexsys-pg: a PostgreSQL client in lex-sys
 
-> **Status: slices 1-2 built** -- the v3 wire protocol (startup, trust, cleartext-password and
+> **Status: slices 1-3 built** -- the v3 wire protocol (startup, trust, cleartext-password and
 > SCRAM-SHA-256 login, simple and extended queries with parameters, describe), checked against
-> a real PostgreSQL 16 and the stock `psql` client. Not built: MD5 login, TLS, a non-blocking
+> a real PostgreSQL 16 and the stock `psql` client, and the typed-query generator `tools/pgen.ls` (§8). Not built: MD5 login, TLS, a non-blocking
 > connection, binary result formats, `COPY`. §5 says what comes after, in
 > order, and §6 answers *what sits on top of a driver in a language without reflection*.
 
@@ -32,7 +32,7 @@ It is a *driver*. It does not know what a table is.
    `describing`.
 
 Layers 1 and 2 are pure: they are tested with no server, from canned bytes laid out per the
-protocol documentation and the RFC vectors (`tests/pg_test.ls`, 13 tests). Layer 3 is the only place that waits.
+protocol documentation and the RFC vectors (`tests/pg_test.ls`, 18 tests). Layer 3 is the only place that waits.
 
 ## 3. How it was checked
 
@@ -106,7 +106,7 @@ protocol documentation and the RFC vectors (`tests/pg_test.ls`, 13 tests). Layer
 2. **SCRAM-SHA-256 (built).** HMAC, PBKDF2 and base64 are here, as public functions beside the
    rest of `pg` (they belong in `lex-sys`'s `std` if they prove out; see §7), with the RFC 4231,
    RFC 4648 and RFC 7677 vectors as unit tests, a real server, and an impostor.
-3. **Migrations and a typed-query generator** (§6): SQL files in, plain lex functions out.
+3. **A typed-query generator (built, §8)**: SQL files in, plain lex functions out. **Migrations and table-driven CRUD** (§6 C) are next.
 4. **A users service on PostgreSQL** in `lexsys-web`, its end-to-end tests and Schemathesis
    unchanged, benchmarked against FastAPI with SQLAlchemy and asyncpg -- the comparison that says
    what the driver and the blocking model cost.
@@ -188,3 +188,51 @@ builder (A) until an endpoint needs it.
    test (SCRAM) and an asker.
 3. **The package's name.** `pg` is short and accurate; the generator and CRUD layer will be a
    separate repository (`lexsys-orm` is the name used so far, though "ORM" overstates it).
+
+## 8. The generator, as built
+
+`tools/pgen.ls` is §6's option B: `pgen <conn> queries.sql > queries.ls`. It is a lex-sys program on this
+driver (a file read, a connection, `describe`), so there is no second language.
+
+**What a query becomes.** A `-- name: user_by_id id` line, then one statement. The server describes the
+statement (`pg.describing`: parsed and planned, never run), and the generator writes a function that takes the
+`$n` as typed parameters and answers `(reply, status)`, and one accessor per result column that reads a row of
+that reply. The reply is the server's whole answer in one buffer, rows are visited with `pg.first_row` /
+`pg.next_row`, and a text value is a range of the reply -- nothing is copied, nothing is allocated per row.
+
+**Decisions, and what they cost.**
+
+* **No result type per query.** sqlc has `:one`, `:many` and `:exec`, and a row struct per query. lex-sys has no
+  generics and a struct per query is a second kind of generated code; a reply with accessors does the same job
+  for all three shapes, and `pg.first_row` is `:one`. It costs a few lines at each call site.
+* **Only `bool` and the integers are mapped.** Every other type is text in and text out. That is the honest
+  thing available -- the server's own text form of a `numeric` or a `timestamptz` is exact and a lex `float` is
+  not -- and it means a `uuid` parameter is checked by the server, not the type system.
+* **Nullability is the catalogue where the catalogue knows.** `describe` carries, for a column that is a plain
+  reference to a table column, the table and column number; one more query (`pg_attribute.attnotnull`) answers.
+  An expression is nullable, and so is *everything* in a statement with a `join`, because an outer join turns
+  a NOT NULL column into a NULL one and nothing in the protocol says which side was outer. That is
+  conservative in the right direction -- an extra `_is_null` is harmless, a missing one is a wrong answer --
+  and it is matched as a word: the first version looked for `join` anywhere and found it in a column named
+  `joined` (the test now has that column).
+* **No NULL parameters.** A `$n` is a value. Optional parameters want an annotation (`age?`) and a second
+  encoder; not built because no query asked.
+* **Refuse, write nothing.** Output is accumulated and written only if every query passed, so a half-generated
+  module never exists, and a refusal names the query and the reason (the server's SQLSTATE for SQL it rejects).
+  Names are checked for collisions across *all* generated functions: a column `a` of query `q` and a query
+  `q_a` would both be `q_a`.
+* **The module is checked in.** `tests/generated/queries.ls` is what the generator wrote, and a test fails if the
+  generator would write anything else, which makes "the SQL changed, the generated code did not" a red build.
+  A consumer does the same with its own queries.
+
+**What testing found.** (1) `join` matched inside `joined` (above). (2) A path with `..` in it makes the file
+capability *trap* -- a SIGILL, by design (`filesystem.md` §4.1) -- and the first end-to-end test passed a path
+built as `tests/../tests/queries.sql`; the generator now refuses such a path with a message, and the test keeps
+the case. (3) A syntax error was reported as "the server did not answer", because the check for a missing
+parameter description ran before the check for an `ErrorResponse`; the order is now the other way, and the
+test asserts the SQLSTATE. (4) A mutation run caught a unit test that looped forever rather than failing (a row
+visited twice); that is a pass for the mutation and a reminder that the runner has no timeout.
+
+**Not built.** Table-driven CRUD from `lexsys-schema` nodes (§6 C), migrations, dynamic filters (§6 A), NULL and
+array parameters, prepared statements (every call parses again; a `Parse` once and `Bind` many is the first thing a
+benchmark will ask for), and generating `lexsys-schema` nodes from result rows.
