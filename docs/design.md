@@ -126,7 +126,8 @@ protocol documentation and the RFC vectors (`tests/pg_test.ls`, 20 tests). Layer
    measurements say the case is not throughput (three copies of the blocking service already reach PostgreSQL's
    ceiling on reads) but shared state, slow queries and group commit for writes; the document states, before it
    is built, what the benchmark must show for it to be worth keeping.
-6. **TLS**, once the sidecar-or-FFI-or-implement question has an asker.
+6. **A connection pooler** (PgBouncer's job, in lex-sys): designed in [`pooler.md`](pooler.md), not built, with its slices, its gate against PgBouncer 1.22 and the conditions under which it is stopped written down first.
+7. **TLS**, once the sidecar-or-FFI-or-implement question has an asker.
 
 ## 6. If we cannot have SQLAlchemy, what is the best thing to have?
 
