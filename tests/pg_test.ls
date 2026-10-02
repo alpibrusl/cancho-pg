@@ -311,3 +311,177 @@ fn test_describe_message_and_a_parameter_description[&h](heap: &!h Heap) -> [hea
     buffer.drop(heap, reply);
     return 0;
 }
+
+// ---------------------------------------------------------------------- SCRAM
+
+fn hex_digit(n: int) -> [] byte {
+    if n < 10 {
+        return byte_of(48 + n);
+    }
+    return byte_of(87 + n);
+}
+
+// `data` as lower-case hex, to compare with a published vector.
+fn hex[&h, &d](heap: &!h Heap, data: &d [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, len(data) * 2);
+    var i = 0;
+    while i < len(data) {
+        let v = int_of(data[i]);
+        out = buffer.push(heap, out, hex_digit(v / 16));
+        out = buffer.push(heap, out, hex_digit(v % 16));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn expect_hex[&h, &d, &w](heap: &!h Heap, got: &d [byte], want: &w [byte]) -> [heap] int {
+    let x = hex(heap, got);
+    borrow x as &xr in {
+        expect_bytes(buffer.bytes(xr), want);
+    }
+    buffer.drop(heap, x);
+    return 0;
+}
+
+fn expect_b64[&h, &d, &w](heap: &!h Heap, data: &d [byte], want: &w [byte]) -> [heap] int {
+    let e = pg.base64_encode(heap, data);
+    borrow e as &er in {
+        expect_bytes(buffer.bytes(er), want);
+    }
+    buffer.drop(heap, e);
+    return 0;
+}
+
+// RFC 4648 section 10, every remainder length.
+fn test_base64_rfc4648_vectors[&h](heap: &!h Heap) -> [heap] int {
+    expect_b64(heap, "", "");
+    expect_b64(heap, "f", "Zg==");
+    expect_b64(heap, "fo", "Zm8=");
+    expect_b64(heap, "foo", "Zm9v");
+    expect_b64(heap, "foob", "Zm9vYg==");
+    expect_b64(heap, "fooba", "Zm9vYmE=");
+    expect_b64(heap, "foobar", "Zm9vYmFy");
+    // decode is the inverse, and refuses what is not base64
+    let (d, ok) = pg.base64_decode(heap, "Zm9vYmE=");
+    test.assert(ok);
+    borrow d as &dr in {
+        expect_bytes(buffer.bytes(dr), "fooba");
+    }
+    buffer.drop(heap, d);
+    let (d2, ok2) = pg.base64_decode(heap, "Zm9vYmE");
+    test.assert(!ok2);
+    buffer.drop(heap, d2);
+    let (d3, ok3) = pg.base64_decode(heap, "Zm9v!mE=");
+    test.assert(!ok3);
+    buffer.drop(heap, d3);
+    return 0;
+}
+
+fn repeated[&h](heap: &!h Heap, value: int, n: int) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, n);
+    var i = 0;
+    while i < n {
+        out = buffer.push(heap, out, byte_of(value));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn expect_mac[&h, &k, &m, &w](heap: &!h Heap, key: &k [byte], message: &m [byte], want: &w [byte]) -> [heap] int {
+    let t = pg.hmac_sha256(heap, key, message);
+    borrow t as &tr in {
+        expect_hex(heap, buffer.bytes(tr), want);
+    }
+    buffer.drop(heap, t);
+    return 0;
+}
+
+// RFC 4231 test cases 1, 2 and 6 (6: a key longer than the block size, hashed first).
+fn test_hmac_sha256_rfc4231_vectors[&h](heap: &!h Heap) -> [heap] int {
+    let k1 = repeated(heap, 11, 20);
+    borrow k1 as &k1r in {
+        expect_mac(heap, buffer.bytes(k1r), "Hi There", "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+    }
+    buffer.drop(heap, k1);
+    expect_mac(heap, "Jefe", "what do ya want for nothing?", "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    let k6 = repeated(heap, 170, 131);
+    borrow k6 as &k6r in {
+        expect_mac(heap, buffer.bytes(k6r), "Test Using Larger Than Block-Size Key - Hash Key First", "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+    }
+    buffer.drop(heap, k6);
+    return 0;
+}
+
+fn expect_pbkdf2[&h, &w](heap: &!h Heap, iterations: int, want: &w [byte]) -> [heap] int {
+    let k = pg.pbkdf2_sha256(heap, "password", "salt", iterations);
+    borrow k as &kr in {
+        expect_hex(heap, buffer.bytes(kr), want);
+    }
+    buffer.drop(heap, k);
+    return 0;
+}
+
+// Reference values from Python's hashlib.pbkdf2_hmac, which is OpenSSL's.
+fn test_pbkdf2_sha256_vectors[&h](heap: &!h Heap) -> [heap] int {
+    expect_pbkdf2(heap, 1, "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
+    expect_pbkdf2(heap, 4096, "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a");
+    return 0;
+}
+
+fn test_scram_client_first_message[&h](heap: &!h Heap) -> [heap] int {
+    let m = pg.scram_client_first(heap, "user", "rOprNGfwEbeRWgbNEkqO");
+    borrow m as &mr in {
+        expect_bytes(buffer.bytes(mr), "n,,n=user,r=rOprNGfwEbeRWgbNEkqO");
+    }
+    buffer.drop(heap, m);
+    return 0;
+}
+
+fn scram_answer[&h, &s](heap: &!h Heap, server_first: &s [byte]) -> [heap] (buffer.Buffer, buffer.Buffer, int) {
+    return pg.scram_client_final(heap, "pencil", "user", "rOprNGfwEbeRWgbNEkqO", server_first);
+}
+
+// RFC 7677 section 3: the exchange for user "user", password "pencil".
+fn test_scram_rfc7677_example[&h](heap: &!h Heap) -> [heap] int {
+    let (final, expected, status) = scram_answer(heap, "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096");
+    test.assert_eq(status, 0);
+    borrow final as &fr in {
+        expect_bytes(buffer.bytes(fr), "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=");
+    }
+    borrow expected as &er in {
+        expect_bytes(buffer.bytes(er), "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
+    }
+    buffer.drop(heap, final);
+    buffer.drop(heap, expected);
+    return 0;
+}
+
+fn expect_scram_refused[&h, &s](heap: &!h Heap, server_first: &s [byte], want: int) -> [heap] int {
+    let (final, expected, status) = scram_answer(heap, server_first);
+    test.assert_eq(status, want);
+    borrow final as &fr in {
+        test.assert_eq(buffer.size(fr), 0);
+    }
+    borrow expected as &er in {
+        test.assert_eq(buffer.size(er), 0);
+    }
+    buffer.drop(heap, final);
+    buffer.drop(heap, expected);
+    return 0;
+}
+
+// A server that is wrong or hostile is refused, never answered: a message missing a part, a
+// nonce that does not extend ours (or only equals it), an undecodable salt, and an iteration
+// count that is zero, not a number, or large enough to make the client compute for hours.
+fn test_scram_refuses_a_bad_server_first[&h](heap: &!h Heap) -> [heap] int {
+    expect_scram_refused(heap, "r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==", 1);
+    expect_scram_refused(heap, "s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", 1);
+    expect_scram_refused(heap, "r=otherNonceXXXXXXXXXXabc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", 2);
+    expect_scram_refused(heap, "r=rOprNGfwEbeRWgbNEkqO,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", 2);
+    expect_scram_refused(heap, "r=rOprNGfwEbeRWgbNEkqOabc,s=!!notbase64!!,i=4096", 3);
+    expect_scram_refused(heap, "r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=0", 4);
+    expect_scram_refused(heap, "r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=x", 4);
+    expect_scram_refused(heap, "r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1000001", 4);
+    expect_scram_refused(heap, "r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=99999999999", 4);
+    return 0;
+}

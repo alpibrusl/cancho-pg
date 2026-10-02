@@ -12,7 +12,9 @@ which is what a hand-written wire-protocol decoder is most likely to get wrong.
 
 Needs trust authentication for the user above. The cleartext-password test runs only when
 PG_CLEARTEXT_USER / PG_CLEARTEXT_PASSWORD / PG_CLEARTEXT_DB name a role the server asks a
-password of (pg_hba.conf method `password`).
+password of (pg_hba.conf method `password`). The SCRAM-SHA-256 tests run for each of
+PG_SCRAM_* and PG_SCRAM_UNICODE_* (_USER, _PASSWORD, _DB) that is set: roles whose pg_hba.conf
+method is `scram-sha-256`; the second has a non-ASCII password.
 """
 import os
 import subprocess
@@ -227,6 +229,201 @@ class Connections(unittest.TestCase):
         self.assertTrue(out.startswith("ERROR 28P01: "), out)
         out, st = ours("select 1", user=user, db=db, password="-")
         self.assertEqual(st, 4)
+
+    def scram_roles(self):
+        found = []
+        for prefix in ("PG_SCRAM", "PG_SCRAM_UNICODE"):
+            if os.environ.get(prefix + "_USER"):
+                found.append((os.environ[prefix + "_USER"], os.environ[prefix + "_PASSWORD"], os.environ[prefix + "_DB"]))
+        return found
+
+    def test_scram_sha_256(self):
+        roles = self.scram_roles()
+        if not roles:
+            self.skipTest("needs a role the server asks SCRAM-SHA-256 of (PG_SCRAM_USER, _PASSWORD, _DB)")
+        for user, secret, db in roles:
+            # the right password logs in, and the server says who it thinks we are
+            out, st = ours("select current_user, 1 as n", user=user, db=db, password=secret)
+            self.assertEqual((out, st), (user + "|1\n# SELECT 1\n", 0), user)
+            # the same through the reference client, so a role that psql cannot log in to is not blamed on us
+            ref = subprocess.run(["psql", "-At", "-F", "|", "-c", "select current_user"],
+                                 env={**os.environ, "PGHOST": HOST, "PGPORT": PORT, "PGUSER": user, "PGDATABASE": db, "PGPASSWORD": secret},
+                                 capture_output=True, text=True, timeout=60)
+            self.assertEqual(ref.stdout, user + "\n", ref.stderr)
+            # queries after the handshake work like any other (the SCRAM messages must not leave a byte behind)
+            out, st = ours("select $1::int + $2::int", "40", "2", user=user, db=db, password=secret)
+            self.assertEqual((out, st), ("42\n# SELECT 1\n", 0))
+            # the wrong password, a near miss, and none at all are refused by the server
+            for bad in (secret + "x", secret[:-1], secret.upper() if secret.upper() != secret else secret + " ", "-", "x"):
+                out, st = ours("select 1", user=user, db=db, password=bad)
+                self.assertEqual(st, 4, (user, bad, out))
+                self.assertTrue(out.startswith("ERROR 28P01: "), out)
+
+    def test_scram_logins_use_a_fresh_nonce(self):
+        """Two handshakes must not be the same conversation: capture what the client sends."""
+        roles = self.scram_roles()
+        if not roles:
+            self.skipTest("needs a SCRAM role")
+        import socket, threading
+        user, secret, db = roles[0]
+        seen = []
+
+        def tap(listener):
+            conn, _ = listener.accept()
+            up = socket.create_connection((HOST, int(PORT)))
+            def pump(a, b, record):
+                try:
+                    while True:
+                        d = a.recv(65536)
+                        if not d:
+                            break
+                        if record:
+                            seen.append(d)
+                        b.sendall(d)
+                except OSError:
+                    pass
+                finally:
+                    for x in (a, b):
+                        try:
+                            x.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+            t = threading.Thread(target=pump, args=(up, conn, False), daemon=True)
+            t.start()
+            pump(conn, up, True)
+            t.join(5)
+            conn.close()
+            up.close()
+
+        nonces = []
+        for _ in range(2):
+            lis = socket.socket()
+            lis.bind(("127.0.0.1", 0))
+            lis.listen(1)
+            th = threading.Thread(target=tap, args=(lis,), daemon=True)
+            th.start()
+            seen.clear()
+            p = subprocess.run([BIN, "127.0.0.1", str(lis.getsockname()[1]), user, db, secret, "select 1"],
+                               capture_output=True, text=True, timeout=60)
+            th.join(10)
+            lis.close()
+            self.assertEqual(p.returncode, 0, p.stdout)
+            blob = b"".join(seen)
+            # SASLInitialResponse: 'p', int32 length, mechanism\0, int32 data length, data
+            at = blob.index(b"SCRAM-SHA-256\0") + len(b"SCRAM-SHA-256\0")
+            size = int.from_bytes(blob[at:at + 4], "big")
+            first = blob[at + 4:at + 4 + size]
+            self.assertTrue(first.startswith(b"n,,n=,r="), first)
+            nonce = first[len(b"n,,n=,r="):]
+            self.assertGreaterEqual(len(nonce), 24, nonce)
+            nonces.append(nonce)
+        self.assertNotEqual(nonces[0], nonces[1])
+
+
+class ImpostorServer(unittest.TestCase):
+    """A server that speaks SCRAM without the password -- or with a hostile challenge -- must be refused.
+
+    The client checks the server's signature (that is the *server* proving it knows the password) and
+    bounds the iteration count a server may ask it to compute. A mock server written here holds the
+    password, so the honest run is the positive control for every dishonest one."""
+
+    PASSWORD = "pencil"
+
+    def exchange(self, tamper):
+        import base64, hashlib, hmac, socket, threading
+        lis = socket.socket()
+        lis.bind(("127.0.0.1", 0))
+        lis.listen(1)
+        result = {}
+
+        def read_exact(c, n):
+            data = b""
+            while len(data) < n:
+                chunk = c.recv(n - len(data))
+                if not chunk:
+                    raise EOFError
+                data += chunk
+            return data
+
+        def msg(kind, body):
+            return kind + (len(body) + 4).to_bytes(4, "big") + body
+
+        def serve():
+            c, _ = lis.accept()
+            try:
+                n = int.from_bytes(read_exact(c, 4), "big")
+                read_exact(c, n - 4)                                    # startup
+                c.sendall(msg(b"R", (10).to_bytes(4, "big") + b"SCRAM-SHA-256\0\0"))
+                assert read_exact(c, 1) == b"p"
+                n = int.from_bytes(read_exact(c, 4), "big")
+                body = read_exact(c, n - 4)
+                mech, rest = body.split(b"\0", 1)
+                first = rest[4:].decode()
+                bare = first[3:]                                        # strip the "n,," gs2 header
+                client_nonce = bare.split(",r=")[1]
+                nonce = client_nonce + "srvnonce" if tamper != "nonce" else "unrelated" + client_nonce[3:]
+                salt = base64.b64encode(b"0123456789abcdef").decode()
+                iterations = {"huge": 50000000, "zero": 0}.get(tamper, 4096)
+                server_first = f"r={nonce},s={salt},i={iterations}"
+                c.sendall(msg(b"R", (11).to_bytes(4, "big") + server_first.encode()))
+                if tamper in ("huge", "zero", "nonce"):
+                    result["stopped"] = c.recv(1) == b""                 # the client must close, not answer
+                    return
+                assert read_exact(c, 1) == b"p"
+                n = int.from_bytes(read_exact(c, 4), "big")
+                final = read_exact(c, n - 4).decode()
+                without_proof, proof_b64 = final.rsplit(",p=", 1)
+                salted = hashlib.pbkdf2_hmac("sha256", self.PASSWORD.encode(), b"0123456789abcdef", iterations)
+                client_key = hmac.new(salted, b"Client Key", hashlib.sha256).digest()
+                stored = hashlib.sha256(client_key).digest()
+                auth = ",".join([bare, server_first, without_proof]).encode()
+                signature = hmac.new(stored, auth, hashlib.sha256).digest()
+                recovered = bytes(a ^ b for a, b in zip(base64.b64decode(proof_b64), signature))
+                result["proof_ok"] = hashlib.sha256(recovered).digest() == stored
+                server_key = hmac.new(salted, b"Server Key", hashlib.sha256).digest()
+                v = base64.b64encode(hmac.new(server_key, auth, hashlib.sha256).digest()).decode()
+                if tamper == "signature":
+                    v = base64.b64encode(b"\0" * 32).decode()
+                if tamper != "skip_final":
+                    c.sendall(msg(b"R", (12).to_bytes(4, "big") + f"v={v}".encode()))
+                c.sendall(msg(b"R", (0).to_bytes(4, "big")) + msg(b"Z", b"I"))
+                assert read_exact(c, 1) == b"Q"
+                n = int.from_bytes(read_exact(c, 4), "big")
+                read_exact(c, n - 4)
+                c.sendall(msg(b"C", b"SELECT 0\0") + msg(b"Z", b"I"))
+                c.recv(1)
+            except (EOFError, OSError, AssertionError) as e:
+                result["error"] = repr(e)
+            finally:
+                c.close()
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        p = subprocess.run([BIN, "127.0.0.1", str(lis.getsockname()[1]), "user", "db", self.PASSWORD, "select 1"],
+                           capture_output=True, text=True, timeout=60)
+        t.join(10)
+        lis.close()
+        return p, result
+
+    def test_the_honest_server_is_the_control(self):
+        p, result = self.exchange(None)
+        self.assertEqual((p.stdout, p.returncode), ("# SELECT 0\n", 0), result)
+        self.assertTrue(result.get("proof_ok"), result)
+
+    def test_a_server_that_cannot_sign_is_refused(self):
+        p, result = self.exchange("signature")
+        self.assertTrue(result.get("proof_ok"), result)             # it did get a valid proof ...
+        self.assertEqual(p.returncode, 7, p.stdout)                 # ... and still is not trusted
+
+    def test_a_server_that_skips_the_signature_is_refused(self):
+        p, result = self.exchange("skip_final")
+        self.assertEqual(p.returncode, 7, p.stdout)
+
+    def test_a_hostile_challenge_is_not_answered(self):
+        for tamper in ("huge", "zero", "nonce"):
+            p, result = self.exchange(tamper)
+            self.assertEqual(p.returncode, 7, (tamper, p.stdout))
+            self.assertTrue(result.get("stopped"), (tamper, result))
 
 
 if __name__ == "__main__":

@@ -83,8 +83,33 @@ fn finish[&h, &i](heap: &!h Heap, io: &!i Io, reply: buffer.Buffer) -> [heap, io
     return 0;
 }
 
-fn run[&h, &g, &i, &c](heap: &!h Heap, args: &g Args, io: &!i Io, conn: &!c Conn) -> [heap, args, io_write, conn_read, conn_write] int {
-    let (hello, s0) = pg.login(heap, conn, arg(args, 3), arg(args, 5), arg(args, 4));
+// An unpredictable client nonce for SCRAM: 18 bytes from the kernel, as base64 (printable, no
+// comma). Empty if the read came up short, and `pg.login` then refuses a SCRAM server (status 7)
+// rather than proceed with a guessable nonce. The only authority it holds is a read of this one file.
+fn fresh_nonce[&h, &f](heap: &!h Heap, fs: &f Fs("/dev/urandom")) -> [heap, fs_read("/dev/urandom")] buffer.Buffer {
+    var nonce = buffer.empty(heap, 1);
+    region a {
+        let raw = alloc_slice[a](18, byte_of(0));
+        let got = fs_read(fs, "/dev/urandom", raw);
+        if got == 18 {
+            buffer.drop(heap, nonce);
+            nonce = pg.base64_encode(heap, raw);
+        }
+    }
+    return nonce;
+}
+
+fn run[&h, &g, &i, &c, &z](heap: &!h Heap, args: &g Args, io: &!i Io, conn: &!c Conn, rng: &z Fs("/dev/urandom")) -> [heap, args, io_write, conn_read, conn_write, fs_read("/dev/urandom")] int {
+    let nonce = fresh_nonce(heap, rng);
+    var hello = buffer.empty(heap, 1);
+    var s0 = 0;
+    borrow nonce as &nr in {
+        let (reply, st) = pg.login(heap, conn, arg(args, 3), arg(args, 5), arg(args, 4), buffer.bytes(nr));
+        buffer.drop(heap, hello);
+        hello = reply;
+        s0 = st;
+    }
+    buffer.drop(heap, nonce);
     if s0 != 0 {
         finish(heap, io, hello);
         return s0;
@@ -119,8 +144,8 @@ fn run[&h, &g, &i, &c](heap: &!h Heap, args: &g Args, io: &!i Io, conn: &!c Conn
 fn main(world: World) -> [] int {
     let Split { io, ffi, fs, heap, args, net, clock } = split(world);
     release(ffi);
-    release(fs);
     release(clock);
+    let rng = narrow(fs, "/dev/urandom");
     var status = 100;
     borrow args as &g in {
         if arg_count(g) >= 7 {
@@ -128,27 +153,30 @@ fn main(world: World) -> [] int {
             let port = number_of(arg(g, 2));
             if port > 0 && port < 65536 {
                 status = 102;
-                borrow net as &nn in {
-                    match tcp_connect(nn, arg(g, 1), port) {
-                        Dialed::Ok(c) => {
-                            var conn = c;
-                            borrow mut conn as &!ch in {
-                                borrow mut heap as &!h in {
-                                    borrow mut io as &!i in {
-                                        status = run(h, g, i, ch);
+                borrow rng as &z in {
+                    borrow net as &nn in {
+                        match tcp_connect(nn, arg(g, 1), port) {
+                            Dialed::Ok(c) => {
+                                var conn = c;
+                                borrow mut conn as &!ch in {
+                                    borrow mut heap as &!h in {
+                                        borrow mut io as &!i in {
+                                            status = run(h, g, i, ch, z);
+                                        }
                                     }
                                 }
+                                conn_close(conn);
                             }
-                            conn_close(conn);
-                        }
-                        Dialed::Failed(e) => {
-                            status = 103;
+                            Dialed::Failed(e) => {
+                                status = 103;
+                            }
                         }
                     }
                 }
             }
         }
     }
+    release(rng);
     release(net);
     release(args);
     release(io);

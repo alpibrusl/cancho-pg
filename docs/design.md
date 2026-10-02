@@ -1,9 +1,9 @@
 # lexsys-pg: a PostgreSQL client in lex-sys
 
-> **Status: slice 1 built** -- the v3 wire protocol (startup, trust and cleartext-password
-> login, simple and extended queries with parameters, describe), checked against a real
-> PostgreSQL 16 and the stock `psql` client. Not built: SCRAM-SHA-256 and MD5 login, TLS,
-> a non-blocking connection, binary result formats, `COPY`. §5 says what comes after, in
+> **Status: slices 1-2 built** -- the v3 wire protocol (startup, trust, cleartext-password and
+> SCRAM-SHA-256 login, simple and extended queries with parameters, describe), checked against
+> a real PostgreSQL 16 and the stock `psql` client. Not built: MD5 login, TLS, a non-blocking
+> connection, binary result formats, `COPY`. §5 says what comes after, in
 > order, and §6 answers *what sits on top of a driver in a language without reflection*.
 
 ## 1. What it is
@@ -32,7 +32,7 @@ It is a *driver*. It does not know what a table is.
    `describing`.
 
 Layers 1 and 2 are pure: they are tested with no server, from canned bytes laid out per the
-protocol documentation (`tests/pg_test.ls`, 7 tests). Layer 3 is the only place that waits.
+protocol documentation and the RFC vectors (`tests/pg_test.ls`, 13 tests). Layer 3 is the only place that waits.
 
 ## 3. How it was checked
 
@@ -50,10 +50,27 @@ protocol documentation (`tests/pg_test.ls`, 7 tests). Layer 3 is the only place 
 * **Parameters are data.** Hostile values (`'; drop table ...; --`, `$1`, a backslash, a
   newline, a multi-byte character) come back byte for byte; NULL and `''` are distinguished;
   rows written through the driver are read back through `psql`.
-* **Login.** Trust, cleartext password (the right one, the wrong one, none) against a role the
-  server asks a password of; an unknown database is an `ErrorResponse`, not a hang.
+* **Login.** Trust, cleartext password and SCRAM-SHA-256 (the right password, near misses, none, an
+  accented one with an emoji) against roles the server asks those of; an unknown database is an
+  `ErrorResponse`, not a hang. The reference client logs in to the same roles first, so a role `psql`
+  cannot use is not blamed on this.
+* **An impostor server.** SCRAM is mutual, and the half a client most easily forgets is the check of
+  the *server's* signature. `tests/e2e.py` has a mock server holding the password: honest, it is the
+  control (the client logs in and runs a query); signing wrongly, or not signing at all, it must be
+  refused; answering a nonce that does not extend the client's, or asking for zero or fifty million
+  PBKDF2 iterations, it must be refused without being answered. A hostile server would otherwise choose
+  how long the client computes. The client's nonce is read off the wire through a tap on two logins and
+  must differ and be at least 24 characters.
 * **Describe.** Parameter and column oids printed by `examples/describe.ls` are compared with
   `pg_type` on the same server.
+* **Mutation checks, SCRAM.** Seven deliberate bugs -- the server-signature check replaced by `true`, the
+  nonce-extension check removed, PBKDF2 one iteration short, a long HMAC key not hashed first, the
+  `Server Key` label wrong, the proof computed from the wrong key, the iteration cap raised -- each
+  fail at least one suite. Two are caught by only one: the signature check by the end-to-end impostor
+  (a connection is needed), the long HMAC key by the unit vector (no PostgreSQL password is 65 bytes).
+  One was *not* caught at first: the cap raised to 2,000,000,000 survived the end-to-end suite because the
+  digit-count limit in the parser refused the 10-digit value the mock asked for; the mock now asks for
+  50,000,000, which only the cap stops.
 * **Mutation checks.** Four deliberate bugs in the decoder -- NULL read as empty, a message size
   one byte short, the column-oid offset off by one, a NULL that does not advance the cursor --
   each fail the unit tests; the end-to-end suite catches three of them (it does not print oids,
@@ -61,12 +78,10 @@ protocol documentation (`tests/pg_test.ls`, 7 tests). Layer 3 is the only place 
 
 ## 4. What it does not do, and why that is the order it is in
 
-* **Authentication beyond cleartext.** A server asked for `scram-sha-256` -- the default
-  `password_encryption` of every PostgreSQL since 14, and what managed offerings use -- is
-  answered with status 5. SCRAM needs HMAC-SHA-256, PBKDF2, base64 and an unpredictable client
-  nonce; `std` has `sha256` and nothing else of the four. Roughly 150 lines, and the RFC 7677
-  test vectors check it. It is the next slice because without it the driver only talks to a
-  database configured for it.
+* **MD5 and channel binding.** MD5 password login (`R` code 5) is answered with status 5: it is
+  deprecated in PostgreSQL 18, needs an MD5 `std` does not have, and a database that still uses
+  it can use SCRAM. `SCRAM-SHA-256-PLUS` needs TLS. SASLprep (RFC 4013) of the password is not
+  applied; see the README for what that excludes.
 * **TLS.** There is none in pure lex-sys. The honest options are a sidecar (`stunnel`,
   `pgbouncer`) in front of the database, OpenSSL through the existing FFI (`lex-sys`'s
   `examples/tls_client` shows it works, and puts C back on the authority report), or a TLS 1.3
@@ -87,10 +102,10 @@ protocol documentation (`tests/pg_test.ls`, 7 tests). Layer 3 is the only place 
 
 ## 5. Order of work
 
-1. **Slice 1 (this).** The protocol, tested against a real server.
-2. **SCRAM-SHA-256**, with HMAC, PBKDF2 and base64 as small modules of their own (they are useful
-   outside this repository, and belong in `lex-sys`'s `std` if they prove out), and the RFC 7677
-   vectors as unit tests.
+1. **Slice 1 (built).** The protocol, tested against a real server.
+2. **SCRAM-SHA-256 (built).** HMAC, PBKDF2 and base64 are here, as public functions beside the
+   rest of `pg` (they belong in `lex-sys`'s `std` if they prove out; see §7), with the RFC 4231,
+   RFC 4648 and RFC 7677 vectors as unit tests, a real server, and an impostor.
 3. **Migrations and a typed-query generator** (§6): SQL files in, plain lex functions out.
 4. **A users service on PostgreSQL** in `lexsys-web`, its end-to-end tests and Schemathesis
    unchanged, benchmarked against FastAPI with SQLAlchemy and asyncpg -- the comparison that says
