@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  # The compiler these sources are built and tested with. A package store records no hash
+  # of the `std` it was published against, so the revision is part of the contract.
+  LEX_SYS_REV: bbeb75f6918105db6e49ec7c642f56009a911b8f
+  PGHOST: 127.0.0.1
+  PGPORT: "5432"
+  PGUSER: postgres
+  PGDATABASE: postgres
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # trust authentication: SCRAM-SHA-256 is the next slice (docs/design.md section 5)
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: pg
+
+      - uses: actions/checkout@v4
+        with:
+          repository: alpibrusl/lex-sys
+          ref: ${{ env.LEX_SYS_REV }}
+          path: lex-sys
+
+      - name: Cache the compiler
+        id: compiler
+        uses: actions/cache@v4
+        with:
+          path: lex-sys/target/release/lex-sys
+          key: lex-sys-${{ env.LEX_SYS_REV }}
+
+      - name: Build lex-sys
+        if: steps.compiler.outputs.cache-hit != 'true'
+        working-directory: lex-sys
+        run: cargo build --release -p lex-sys
+
+      - name: The reference client
+        run: which psql || (sudo apt-get update -q && sudo apt-get install -y -q postgresql-client)
+
+      - name: Unit tests (no server)
+        working-directory: pg
+        run: ../lex-sys/target/release/lex-sys test tests/pg_test.ls src/pg.ls --std
+
+      - name: Formatting
+        working-directory: pg
+        run: ../lex-sys/target/release/lex-sys fmt --check src tests examples
+
+      # The real server and the stock psql client as the reference: every query must print
+      # the same rows, errors and tags must be the server's, parameters must stay data.
+      - name: End-to-end tests against PostgreSQL 16
+        working-directory: pg
+        env:
+          LEX_SYS: ${{ github.workspace }}/lex-sys/target/release/lex-sys
+        run: python3 tests/e2e.py
+
+      # A consumer locks names from the checked-in store; it must be the store of this source.
+      - name: The published store is the store of src/pg.ls
+        working-directory: pg
+        run: |
+          rm -rf /tmp/store
+          ../lex-sys/target/release/lex-sys vcs publish --std --store /tmp/store src/pg.ls > /dev/null
+          diff -r /tmp/store .lex-sys-vcs
