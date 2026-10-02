@@ -485,3 +485,131 @@ fn test_scram_refuses_a_bad_server_first[&h](heap: &!h Heap) -> [heap] int {
     expect_scram_refused(heap, "r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=99999999999", 4);
     return 0;
 }
+
+// ------------------------------------------------------- what generated code uses
+
+fn test_rows_are_visited_once_each_and_a_failure_is_found[&h](heap: &!h Heap) -> [heap] int {
+    let r = canned(heap);
+    borrow r as &rr in {
+        let m = buffer.bytes(rr);
+        var seen = 0;
+        var at = pg.first_row(m);
+        while at >= 0 {
+            seen = seen + 1;
+            at = pg.next_row(m, at);
+        }
+        test.assert_eq(seen, 2);
+        test.assert_eq(pg.failure(m), 0 - 1);
+        test.assert_eq(pg.affected(m), 2);
+    }
+    buffer.drop(heap, r);
+    // no rows: first_row is -1, and a reply with only a failure reports where it is
+    let e = frame(heap, buffer.empty(heap, 64), 69, cstr(heap, buffer.push(heap, buffer.empty(heap, 16), byte_of(67)), "42P01"));
+    let e2 = frame(heap, e, 90, buffer.push(heap, buffer.empty(heap, 1), byte_of(73)));
+    borrow e2 as &er in {
+        let m = buffer.bytes(er);
+        test.assert_eq(pg.first_row(m), 0 - 1);
+        test.assert_eq(pg.failure(m), 0);
+        test.assert_eq(pg.affected(m), 0 - 1);
+    }
+    buffer.drop(heap, e2);
+    return 0;
+}
+
+fn tag_reply[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] buffer.Buffer {
+    return frame(heap, buffer.empty(heap, 32), 67, cstr(heap, buffer.empty(heap, 16), text));
+}
+
+fn expect_affected[&h, &t](heap: &!h Heap, text: &t [byte], want: int) -> [heap] int {
+    let r = tag_reply(heap, text);
+    borrow r as &rr in {
+        test.assert_eq(pg.affected(buffer.bytes(rr)), want);
+    }
+    buffer.drop(heap, r);
+    return 0;
+}
+
+fn test_the_row_count_in_a_command_tag[&h](heap: &!h Heap) -> [heap] int {
+    expect_affected(heap, "INSERT 0 1", 1);
+    expect_affected(heap, "INSERT 0 250", 250);
+    expect_affected(heap, "UPDATE 0", 0);
+    expect_affected(heap, "DELETE 17", 17);
+    expect_affected(heap, "SELECT 3", 3);
+    expect_affected(heap, "CREATE TABLE", 0 - 1);
+    expect_affected(heap, "BEGIN", 0 - 1);
+    return 0;
+}
+
+fn expect_int[&t](text: &t [byte], want: int) -> [] int {
+    test.assert_eq(pg.int_text(text, 0, len(text)), want);
+    return 0;
+}
+
+fn test_integers_read_from_text_exactly() -> [] int {
+    expect_int("0", 0);
+    expect_int("7", 7);
+    expect_int("-7", 0 - 7);
+    expect_int("2147483647", 2147483647);
+    expect_int("-2147483648", 0 - 2147483648);
+    expect_int("9223372036854775807", 9223372036854775807);
+    expect_int("-9223372036854775808", 0 - 9223372036854775807 - 1);
+    // not a number: 0, never garbage
+    expect_int("12x", 0);
+    test.assert(pg.bool_text("t", 0, 1));
+    test.assert(!pg.bool_text("f", 0, 1));
+    test.assert(!pg.bool_text("true", 0, 4));
+    return 0;
+}
+
+fn expect_param[&h, &w](heap: &!h Heap, value: int, want: &w [byte]) -> [heap] int {
+    var ps = pg.params(heap);
+    ps = pg.param_int(heap, ps, value);
+    borrow ps as &pr in {
+        let sql = pg.execute(heap, "select $1", pr);
+        borrow sql as &sr in {
+            let m = buffer.bytes(sr);
+            // Bind is the second message; its parameter is length(4) + digits, after the two empty
+            // names (2), the format count (2) and the parameter count (2)
+            let parse = pg.size(m, 0);
+            let at = parse + 5 + 1 + 1 + 2 + 2;
+            test.assert_eq(int_of(m[at - 2]) * 256 + int_of(m[at - 1]), 1);
+            test.assert_eq(int_of(m[at + 3]), len(want));
+            expect_bytes(m[at + 4..at + 4 + len(want)], want);
+        }
+        buffer.drop(heap, sql);
+    }
+    pg.drop_params(heap, ps);
+    return 0;
+}
+
+fn test_integer_parameters_are_written_in_decimal[&h](heap: &!h Heap) -> [heap] int {
+    expect_param(heap, 0, "0");
+    expect_param(heap, 5, "5");
+    expect_param(heap, 0 - 5, "-5");
+    expect_param(heap, 1234567890, "1234567890");
+    expect_param(heap, 9223372036854775807, "9223372036854775807");
+    expect_param(heap, 0 - 9223372036854775807 - 1, "-9223372036854775808");
+    return 0;
+}
+
+fn test_a_column_that_is_a_table_column_says_which[&h](heap: &!h Heap) -> [heap] int {
+    // one column "id": table oid 16385, attnum 3, type int4; and one expression column: 0, 0
+    var t = b16(heap, buffer.empty(heap, 64), 2);
+    t = b16(heap, b32(heap, b16(heap, b32(heap, cstr(heap, t, "id"), 16385), 3), 23), 4);
+    t = b16(heap, b32(heap, t, 4294967295), 0);
+    t = b16(heap, b32(heap, b16(heap, b32(heap, cstr(heap, t, "n"), 0), 0), 23), 4);
+    t = b16(heap, b32(heap, t, 4294967295), 0);
+    let r = frame(heap, buffer.empty(heap, 64), 84, t);
+    borrow r as &rr in {
+        let m = buffer.bytes(rr);
+        test.assert_eq(pg.column_table(m, 0, 0), 16385);
+        test.assert_eq(pg.column_attnum(m, 0, 0), 3);
+        test.assert_eq(pg.column_oid(m, 0, 0), 23);
+        test.assert_eq(pg.column_table(m, 0, 1), 0);
+        test.assert_eq(pg.column_attnum(m, 0, 1), 0);
+        test.assert_eq(pg.column_oid(m, 0, 1), 23);
+        test.assert_eq(pg.column_table(m, 0, 2), 0 - 1);
+    }
+    buffer.drop(heap, r);
+    return 0;
+}

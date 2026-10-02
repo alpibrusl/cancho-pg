@@ -10,9 +10,10 @@ It is a *driver*: it moves SQL and rows. What sits on top of it (typed queries g
 `.sql` files, migrations, table-driven CRUD) and why that is the right shape for a language
 without reflection is [`docs/design.md`](docs/design.md) §6.
 
-> **Status: slices 1-2 built** -- startup, trust, cleartext-password and **SCRAM-SHA-256** login
+> **Status: slices 1-3 built** -- startup, trust, cleartext-password and **SCRAM-SHA-256** login
 > (the default of every PostgreSQL since 14), simple queries, extended queries with parameters,
-> `describe`; checked against PostgreSQL 16 and the stock `psql` client. **Not yet:** MD5 login
+> `describe`, and a generator of typed query functions (`tools/pgen.ls`, [below](#typed-queries-pgen)); checked against
+> PostgreSQL 16 and the stock `psql` client. **Not yet:** MD5 login
 > (answered with status 5), TLS, a non-blocking connection, binary result formats, `COPY`. Every
 > helper here waits for the server. [`docs/design.md`](docs/design.md) §4-§5 says why, and in what
 > order it is fixed.
@@ -92,6 +93,62 @@ ERROR 28P01: password authentication failed for user "scramuser"
 SCRAM is mutual: the client also checks the server's signature, which only a server that knows the
 password can compute, so an impostor that answers every login with "ok" is refused (exit status 7), as is
 a server that asks the client to compute a million-times-over key derivation.
+
+## Typed queries: `pgen`
+
+Writing `pg.extended(heap, conn, "select ... where id = $1", ps)` by hand and counting columns is what a
+generator should do. `tools/pgen.ls` reads a file of SQL, asks the server what each statement's parameters and
+columns are (`describe`: parsed and planned, not run), and writes a lex-sys module with a typed function per
+query. The SQL stays SQL -- joins, CTEs, `RETURNING`, `ON CONFLICT` all work on day one, because nothing is
+abstracted -- and a query that does not compile against the schema fails the *generation*, not production.
+
+```
+-- queries.sql
+-- name: user_by_id id
+select id, name, age from users where id = $1
+
+-- name: add_user name age
+insert into users (name, age) values ($1, $2) returning id
+```
+
+```
+$ lex-sys build --std tools/pgen.ls src/pg.ls -o pgen
+$ ./pgen 127.0.0.1 5432 postgres postgres - queries.sql > queries.ls          # module `queries`, from the file name
+$ lex-sys build --std app.ls queries.ls src/pg.ls -o app
+```
+
+and the generated functions are what the program calls (`tests/gen_use.ls` is a complete one):
+
+```
+let (reply, status) = queries.user_by_id(heap, conn, 7);       // (id: int) -- the type came from the server
+borrow reply as &rr in {
+    let m = buffer.bytes(rr);
+    var row = pg.first_row(m);
+    while row >= 0 {
+        let id = queries.user_by_id_id(m, row);                 // int
+        let (from, to) = queries.user_by_id_name(m, row);       // text: a range of `m`, no copy
+        if !queries.user_by_id_age_is_null(m, row) {            // age can be NULL, so it has an `_is_null`
+            let age = queries.user_by_id_age(m, row);
+        }
+        row = pg.next_row(m, row);
+    }
+}
+buffer.drop(heap, reply);
+```
+
+What the types are: a `$n` or a column of type `bool`, `int2`, `int4`, `int8` or `oid` is a `bool` or an `int`;
+every other type (uuid, timestamp, numeric, json, bytea, ...) is `&[byte]` going in and the `(from, to)` range
+of the **server's own text** coming out -- the generator does not guess a representation. A column gets an
+`_is_null` accessor unless it is a plain reference to a table column the catalogue says is `NOT NULL`; a query
+with a `join` in it has none, because an outer join makes a `NOT NULL` column NULL and the server does not say
+so (a column *named* `joined` is not a join). Expressions -- `count(*)` -- are conservatively nullable.
+`pg.failure(reply)` is the server's error, `pg.affected(reply)` the row count of an `INSERT`/`UPDATE`/`DELETE`.
+
+Refused, with the query's name and a reason, and **nothing written** if any query is: a statement the server
+rejects (its SQLSTATE), a name used twice, a result column that is not a plain identifier (alias it), two
+functions that would share a name, parameter names that are the wrong number, repeated, or `heap`/`conn`, and a
+statement with a control character in it. Not yet: NULL parameters, dynamic filters, a result type per query
+(`:one`/`:many`), and `float`/`numeric` as lex types. [`docs/design.md`](docs/design.md) §8 has the reasoning.
 
 ## Using it from your program
 
@@ -188,9 +245,9 @@ of the end-to-end tests. Channel binding (`SCRAM-SHA-256-PLUS`) needs TLS, which
 ## Tests
 
 ```
-lex-sys test tests/pg_test.ls src/pg.ls --std                     # 13 unit tests, no server
+lex-sys test tests/pg_test.ls src/pg.ls --std                     # 18 unit tests, no server
 eval "$(sh tests/postgres.sh)"                                    # a throwaway postgres:16 with a role of each login kind
-python3 tests/e2e.py                                              # 19 tests against it (and a mock server)
+python3 tests/e2e.py                                              # 25 tests against it (and a mock server)
 ```
 
 The unit tests encode and decode with no server, from replies built here from the protocol's documented
@@ -212,6 +269,18 @@ answers with a nonce that is not an extension of the client's, and asks for zero
 the client must refuse each. Seven deliberate bugs in the SCRAM code (signature check off, nonce check off, an
 iteration short, a long HMAC key not hashed, a wrong key label, the proof computed from the wrong key, the
 iteration cap raised) each fail at least one of the two suites.
+
+The generator is checked four ways: its output for `tests/queries.sql` must equal the checked-in
+`tests/generated/queries.ls` (so that file cannot go stale); a program using that checked-in module
+(`tests/gen_use.ls`) runs a scenario against the seeded database, its output is compared line by line and the
+tables it leaves behind are read back with `psql` (a hostile string passed as a parameter is stored as data and
+the table is still there); the types and the nullability it infers are asserted for each kind of parameter and
+column, and every module it writes is run through `lex-sys check`; and fourteen kinds of bad input each fail with
+a reason and write nothing. Thirteen deliberate bugs in the generator and the new decoders -- nullability
+inverted, the join check off, `"` or `\` not escaped in the SQL literal, `int8` or `bool` read as text, a repeated
+name allowed, a server error ignored, an integer read or written without its sign, the wrong word of a command tag, a
+row visited twice, the column number off by one -- each fail at least one suite; the two sign bugs only the unit
+tests catch, since the scenario has no negative numbers.
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds the pinned compiler and runs all of it
 against a `postgres:16` service, and checks that the checked-in package store is the store of `src/pg.ls`.
