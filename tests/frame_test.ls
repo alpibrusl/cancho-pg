@@ -247,6 +247,15 @@ fn test_the_scan_finds_every_ready_for_query_at_any_cut() -> [] int {
             test.assert_eq(fs[2], 0);
             chunk = chunk + 1;
         }
+        // Three ReadyForQuerys in one look are counted, and the status is the last.
+        var j = 0;
+        while j < frame.scan_size() {
+            fs[j] = 0;
+            j = j + 1;
+        }
+        test.assert(frame.scan(s[before_z..at], fs));
+        test.assert_eq(fs[5], 3);
+        test.assert_eq(fs[3], 69);
         // One cut where every Z is taken on its own: after each of the three ends.
         var i = 0;
         while i < frame.scan_size() {

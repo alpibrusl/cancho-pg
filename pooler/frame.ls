@@ -136,8 +136,9 @@ pub fn client_step[&v](view: &v [byte], left: int, skipping: int) -> [] (int, in
 //     2  how much of it is still to come, after the header
 //     3  the status of the last `ReadyForQuery` that has been seen and not yet taken (0: none)
 //     4  its length so far, while the header is being read
+//     5  how many `ReadyForQuery`s have been seen and not yet taken
 pub fn scan_size() -> [] int {
-    return 5;
+    return 6;
 }
 
 // Look through `view`, which is the next part of what the server sends, and keep the state in `fs`. Answers whether the stream is at a message
@@ -175,6 +176,7 @@ pub fn scan[&v, &f](view: &v [byte], fs: &!f [int]) -> [] bool {
             // The status of a ReadyForQuery is the one byte of its body.
             if fs[1] == 90 && fs[4] == 5 && n > 0 {
                 fs[3] = int_of(view[i]);
+                fs[5] = fs[5] + 1;
             }
             fs[2] = fs[2] - n;
             i = i + n;

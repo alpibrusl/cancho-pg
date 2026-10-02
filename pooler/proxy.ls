@@ -242,7 +242,7 @@ fn accept_all[&h, &l, &c, &n](heap: &!h Heap, conn: conns.Table, listener: &!l L
                                 st[stride() * b + 3] = 1;
                                 st[stride() * b + 4] = 0;
                                 borrow mut table as &!ct in {
-                                    if conns.nonblocking(ct, a) != 0 || conns.nonblocking(ct, b) != 0 || conns.watch(ct, core.poller, a, a + 1, 1) != 0 || conns.watch(ct, core.poller, b, b + 1, 1) != 0 {
+                                    if conns.nonblocking(ct, a) != 0 || conns.nonblocking(ct, b) != 0 || conns.nodelay(ct, a) != 0 || conns.nodelay(ct, b) != 0 || conns.watch(ct, core.poller, a, a + 1, 1) != 0 || conns.watch(ct, core.poller, b, b + 1, 1) != 0 {
                                         shut(ct, core, a);
                                         shut(ct, core, b);
                                     }
