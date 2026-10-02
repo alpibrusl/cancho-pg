@@ -1,6 +1,6 @@
 # lexsys-pg: a PostgreSQL client in lex-sys
 
-> **Status: slices 1-4 built** -- the v3 wire protocol (startup, trust, cleartext-password and
+> **Status: slices 1-4 built; the non-blocking connection is designed ([`nonblocking.md`](nonblocking.md))** -- the v3 wire protocol (startup, trust, cleartext-password and
 > SCRAM-SHA-256 login, simple and extended queries with parameters, describe), checked against
 > a real PostgreSQL 16 and the stock `psql` client, the typed-query generator `tools/pgen.ls` (§8), and prepared statements (§4, §9). Not built: MD5 login, TLS, a non-blocking
 > connection, binary result formats, `COPY`. §5 says what comes after, in
@@ -122,7 +122,10 @@ protocol documentation and the RFC vectors (`tests/pg_test.ls`, 20 tests). Layer
    `fsync`-bound at about 2,700 a second. What it found is in §4 and §8.
 4b. **Prepared statements (built, §9)**: the slice, because the read path is PostgreSQL-bound and about
    half of PostgreSQL's time on a lookup is parsing and planning (37 against 80 microseconds).
-5. **The non-blocking connection and a pool**, with a design document first.
+5. **The non-blocking connection and a pool**: designed in [`nonblocking.md`](nonblocking.md), not built. The
+   measurements say the case is not throughput (three copies of the blocking service already reach PostgreSQL's
+   ceiling on reads) but shared state, slow queries and group commit for writes; the document states, before it
+   is built, what the benchmark must show for it to be worth keeping.
 6. **TLS**, once the sidecar-or-FFI-or-implement question has an asker.
 
 ## 6. If we cannot have SQLAlchemy, what is the best thing to have?
