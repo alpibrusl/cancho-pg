@@ -53,7 +53,7 @@ logfile = {PGB_DIR}/log
         time.sleep(0.1)
     else:
         raise SystemExit(f"{name} did not come up")
-    pid = int(subprocess.check_output(["pgrep", "-x", "proxy" if name == "proxy" else "pgbouncer"]).split()[0])
+    pid = int(subprocess.check_output(["pgrep", "-n", "-x", "proxy" if name == "proxy" else "pgbouncer"]).split()[0])
     return p, pid
 
 
