@@ -254,6 +254,33 @@ fn scenario[&h, &c, &i](heap: &!h Heap, conn: &!c Conn, io: &!i Io, null_user: i
     }
     buffer.drop(heap, r11);
 
+    // an optional parameter that is not given is NULL, and one that is given is not: an empty
+    // string and the number 0 are values
+    let (r13, s13) = queries.add_user_partial(heap, conn, "eve", 0, false, "nick", true);
+    var eve = 0 - 1;
+    borrow r13 as &r13r in {
+        let m = buffer.bytes(r13r);
+        eve = queries.add_user_partial_id(m, pg.first_row(m));
+    }
+    buffer.drop(heap, r13);
+    user_line(heap, conn, io, eve);
+    let (r14, s14) = queries.add_user_partial(heap, conn, "fay", 0, true, "", true);
+    var fay = 0 - 1;
+    borrow r14 as &r14r in {
+        let m = buffer.bytes(r14r);
+        fay = queries.add_user_partial_id(m, pg.first_row(m));
+    }
+    buffer.drop(heap, r14);
+    user_line(heap, conn, io, fay);
+    let (r15, s15) = queries.add_user_partial(heap, conn, "gus", 5, false, "", false);
+    var gus = 0 - 1;
+    borrow r15 as &r15r in {
+        let m = buffer.bytes(r15r);
+        gus = queries.add_user_partial_id(m, pg.first_row(m));
+    }
+    buffer.drop(heap, r15);
+    user_line(heap, conn, io, gus);
+
     // SQL with quotes, a backslash and a line break in it reaches the server as written
     let (r12, s12) = queries.tricky(heap, conn);
     borrow r12 as &r12r in {

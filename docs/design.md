@@ -89,13 +89,24 @@ protocol documentation and the RFC vectors (`tests/pg_test.ls`, 18 tests). Layer
   database on the same host or the same private network does not.
 * **A non-blocking connection.** Every helper in layer 3 waits for the server. In an event loop
   that is one thread serving every client (`http.server`), a query inside a handler stops all of
-  them for a round trip -- expected to be on the order of 100-300 microseconds to a local
-  server (an estimate; not measured here), which would cap one core at a few thousand requests a
-  second whatever the framework does. It is the right first version
-  and the wrong last one. Layers 1 and 2 are already sans-io, so the fix is a state machine around
+  them for a round trip. **Measured** (`lexsys-web`, docs/benchmarks.md "On PostgreSQL"): about
+  **90 microseconds** for a one-row lookup to a PostgreSQL on its own core, which caps a service
+  that makes one such query per request at about **10,000 a second** -- 81% of what PostgreSQL itself
+  answers over the same protocol -- and about **370 microseconds** for a durable `INSERT` (the
+  commit's `fsync`), which caps writes at about **2,700 a second** with the loop blocked the whole
+  time, because one connection cannot have its commits grouped. (The first version of this paragraph
+  estimated 100-300 microseconds and "a few thousand requests a second"; the read figure was
+  pessimistic, the write figure about right.) It is the right first version
+  and the wrong last one for a service that writes. Layers 1 and 2 are already sans-io, so the fix is a state machine around
   them registered with the `Poller` and a request that can be suspended and resumed by an id
   (there is no `async`, no closure to resume with): the same inversion `http.server` needed.
   That is a design document and two slices of its own (§5).
+* **Prepared statements.** `execute` sends Parse every time (the unnamed statement). PostgreSQL does
+  2.1x as many one-row lookups a second when the statement is parsed once (`pgbench`: 26,787 against
+  12,577 on the same machine), and asyncpg, which the FastAPI services it is compared with use,
+  already does. A Parse once and a Bind and Execute many (a named statement per generated query,
+  prepared at connect) is the cheapest large win left, and it is a change to layers 1-2 that needs
+  neither TLS nor a non-blocking connection.
 * **Binary formats, `COPY`, `LISTEN`/`NOTIFY`, cancellation, pipelining.** Text results are
   what every consumer so far wants and what `psql` prints, so they are what could be checked
   against a reference. The rest are additions to layers 1 and 2, in that order of demand.
@@ -107,9 +118,12 @@ protocol documentation and the RFC vectors (`tests/pg_test.ls`, 18 tests). Layer
    rest of `pg` (they belong in `lex-sys`'s `std` if they prove out; see §7), with the RFC 4231,
    RFC 4648 and RFC 7677 vectors as unit tests, a real server, and an impostor.
 3. **A typed-query generator (built, §8)**: SQL files in, plain lex functions out. **Migrations and table-driven CRUD** (§6 C) are next.
-4. **A users service on PostgreSQL** in `lexsys-web`, its end-to-end tests and Schemathesis
-   unchanged, benchmarked against FastAPI with SQLAlchemy and asyncpg -- the comparison that says
-   what the driver and the blocking model cost.
+4. **A users service on PostgreSQL (built)** in `lexsys-web`, its end-to-end tests and Schemathesis
+   unchanged, benchmarked against FastAPI with SQLAlchemy and with asyncpg and against `pgbench`: a
+   read is 3.5x lean FastAPI and at 81% of what PostgreSQL itself does over this protocol; a write is
+   `fsync`-bound at about 2,700 a second. What it found is in §4 and §8.
+4b. **Prepared statements** (§4): the next slice, because the read path is PostgreSQL-bound and about
+   half of PostgreSQL's time on a lookup is parsing and planning (37 against 80 microseconds).
 5. **The non-blocking connection and a pool**, with a design document first.
 6. **TLS**, once the sidecar-or-FFI-or-implement question has an asker.
 
@@ -215,8 +229,11 @@ that reply. The reply is the server's whole answer in one buffer, rows are visit
   conservative in the right direction -- an extra `_is_null` is harmless, a missing one is a wrong answer --
   and it is matched as a word: the first version looked for `join` anywhere and found it in a column named
   `joined` (the test now has that column).
-* **No NULL parameters.** A `$n` is a value. Optional parameters want an annotation (`age?`) and a second
-  encoder; not built because no query asked.
+* **NULL parameters are marked, and cost a flag.** `age?` in the annotation adds an `age_given: bool` after the
+  parameter, and the generated function sends `param_null` when it is false. A `$n` that is not marked cannot be
+  NULL, so a caller cannot forget; the flag rather than an `Option` because lex-sys has no generics. The
+  first service on the generator (`lexsys-web`'s users on PostgreSQL) asked for it: four of the five columns of
+  an `INSERT` are optional.
 * **Refuse, write nothing.** Output is accumulated and written only if every query passed, so a half-generated
   module never exists, and a refusal names the query and the reason (the server's SQLSTATE for SQL it rejects).
   Names are checked for collisions across *all* generated functions: a column `a` of query `q` and a query
@@ -233,6 +250,11 @@ parameter description ran before the check for an `ErrorResponse`; the order is 
 test asserts the SQLSTATE. (4) A mutation run caught a unit test that looped forever rather than failing (a row
 visited twice); that is a pass for the mutation and a reminder that the runner has no timeout.
 
-**Not built.** Table-driven CRUD from `lexsys-schema` nodes (§6 C), migrations, dynamic filters (§6 A), NULL and
-array parameters, prepared statements (every call parses again; a `Parse` once and `Bind` many is the first thing a
+**What the first consumer found.** `lexsys-web`'s users service on PostgreSQL asked for optional parameters
+(four of five columns of its `INSERT` are optional; added, above) and, through Schemathesis, found that
+PostgreSQL `text` cannot hold U+0000 although a JSON string, and so the OpenAPI document, allows it. The fix is
+not in the database layer: a constraint the store imposes belongs in the schema the document is generated from
+(`lexsys-schema` design.md §13), so the generated queries stay free of validation.
+
+**Not built.** Table-driven CRUD from `lexsys-schema` nodes (§6 C), migrations, dynamic filters (§6 A), array parameters, prepared statements (every call parses again; a `Parse` once and `Bind` many is the first thing a
 benchmark will ask for), and generating `lexsys-schema` nodes from result rows.
