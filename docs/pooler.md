@@ -1,8 +1,8 @@
 # A PostgreSQL connection pooler in lex-sys
 
-> **Status: designed, not built.** This document says what would be built, in what order, what each step must
-> show to be kept, and what would make the whole project not worth continuing. It is written before the code so
-> that the gate cannot move to fit the result.
+> **Status: P0 built and measured (section 7); P1-P3 designed, not built.** Sections 1-6 were written before the code
+> and say what is built, in what order, what each step must show to be kept, and what would make the whole project not
+> worth continuing, so that the gate could not move to fit the result. Section 7 is what P0 showed.
 
 ## 1. What it is, and why it is a candidate at all
 
@@ -139,3 +139,49 @@ Stopped, and written up as a negative result, if any of these holds after the sl
 server side), and the test rig (a real PostgreSQL, `psql`, a mock server). The pooler is a second *program* here, not a
 second layer of the driver: `examples/` or a `pooler/` directory with its own entry point, sharing `src/pg.ls` for
 what it needs and adding nothing to the driver's public surface.
+
+## 7. P0, built and measured
+
+`pooler/proxy.ls` (about 330 lines) is the transparent proxy: one loop on `std.conns` and `Poller` (the cache's), a client paired with a server connection
+opened when it is accepted, bytes forwarded in 32 KiB chunks, a 256 KiB queue per connection for what the kernel will not take, a connection read from only while
+its peer's queue has room, and a peer closed once what is queued for it has gone. It understands nothing of the protocol. `lex-sys build` of it needs nothing outside
+`std` (`Net("")`, `conn_*`, the poller, the heap).
+
+**Correctness (section 4's list, the part P0 can show).** `tests/e2e.py`, 46 tests (29 queries compared with stock `psql`, hostile parameters, trust, cleartext and SCRAM-SHA-256 logins including a non-ASCII
+password and an impostor server, the pool tests against the real server) passes unchanged **through the proxy**, and CI runs it that way. `pgbench` (simple, extended, prepared; select-only and TPC-B)
+through the proxy completes with no failed transactions. **Not yet done** from the list: the hostile-bytes test and mutation testing of the framing (the proxy has no framing yet: it is bytes in, bytes out),
+the differential against PgBouncer's behaviour on refusals (P1 and later), and the other real clients.
+
+**Performance** (`pooler/bench/p0.py`, 5 rounds, runs interleaved proxy / PgBouncer / direct; pooler on core 0, PostgreSQL 16.15 on cores 1-2, `pgbench` on core 3; PgBouncer 1.22.0 in
+session mode with server TLS disabled, so that neither side spends CPU on encryption; this is a noisy 4-vCPU VM). Medians, with every run in the script's output:
+
+| cell | tps direct / proxy / PgBouncer | PostgreSQL cores busy % (direct / proxy / PgBouncer) | proxy over PgBouncer, throughput | pooler CPU per transaction, proxy / PgBouncer |
+|---|---|---|---|---|
+| `-S` 1 client | 12,481 / 8,261 / 9,121 | 35 / 26 / 25 | **0.91** | 32.3 / 34.8 us (0.93) |
+| `-S` 10 clients | 34,328 / 37,812 / 47,144 | 98 / 94 / 96 | no ratio: PostgreSQL-bound (0.80) | 16.1 / 18.0 (0.90) |
+| `-S` 50 clients | 29,982 / 31,520 / 40,076 | 97 / 81 / 99 | **0.79** | 16.8 / 17.7 (0.95) |
+| `-S` 10 clients, extended | 29,828 / 34,607 / 41,629 | 98 / 93 / 97 | no ratio: PostgreSQL-bound (0.83) | 16.7 / 19.2 (0.87) |
+| 10,000 tps offered, 10 clients | 9,994 / 10,026 / 10,001 | 43 / 42 / 38 | 1.00 (latency 0.30 / 0.44 ms) | 26.5 / 29.6 (0.90) |
+| 20,000 tps offered, 10 clients | 19,986 / 20,000 / 20,011 | 67 / 64 / 59 | 1.00 (latency 0.32 / 0.29 ms) | 21.5 / 24.6 (0.87) |
+| a 200 MB result, one client | 0.59 s / 0.69 s / 0.57 s | | 0.83 (time) | **0.75 / 1.45 ms per MB (0.52)** |
+
+**Against the gate.** The CPU the pooler spends is at or below PgBouncer's in every cell (0.87 to 0.95 per transaction, 0.52 per megabyte forwarded), where the gate allowed 1.5x and the stop condition was
+2x: **that part passes, and the forwarding-path stop condition does not fire.** Throughput does not clear the gate in the cells where it can be judged: **0.91 at one client (passes, narrowly) and 0.79 at
+fifty (fails 0.9)**, and the two ten-client cells, flagged PostgreSQL-bound by the rule (PostgreSQL's cores at 90% or more under every target), show the same direction (0.80, 0.83) and are not quoted as ratios. At a fixed offered load both keep up, and the latencies are in the same range and noisy
+(rounds of 2 to 4 ms appear under every target, direct included).
+
+**What was ruled out, and what is not explained.** The pooler's own cost is not the difference: its CPU per transaction is lower, and its core is 53% busy at fifty clients. `strace -c` shows the same syscalls per
+transaction (2.0 `sendto`, 2.0 `recvfrom`, 0.22 `epoll_wait`) for both. PgBouncer sets `TCP_NODELAY` and `SO_KEEPALIVE` on its sockets and the proxy sets neither (lex-sys has no way to set a socket option on a
+`Conn`); a throwaway `LD_PRELOAD` shim that set `TCP_NODELAY` on both of the proxy's sockets made **no difference** (36-38k plain, 36-37k with it, at ten clients), so it is not that. What does differ is PostgreSQL's own cost per transaction: measured on the
+backends' CPU times, about 44 us of user time per transaction behind the proxy and 46 direct, against 33-35 behind PgBouncer (system time 19 / 20 / 14-15), with one context switch per transaction in each case. PgBouncer's traffic makes PostgreSQL ~25% cheaper per transaction, and
+PgBouncer is faster than a direct connection at ten clients, which a proxy cannot be by doing less. Two guesses, neither tested: bursts of requests arriving back to back help the backends' caches, or something in how it writes to the server socket changes the kernel work done on PostgreSQL's side.
+This needs a profiler (`perf` is not installed here) and a quieter machine, and it is the first thing to look at before P1 is judged.
+
+**The 200 MB cell** was bimodal (rounds of 0.45-0.7 s and of 1.1-1.5 s, under every target, direct too), and the median of five is the ordinary mode; the run-to-run noise of this VM is larger than the difference between the three. The CPU per megabyte is not noisy and is the figure to read.
+
+**Decision.** P0 is not a stop: the forwarding path is cheap, the protocol is untouched, the existing end-to-end suite passes through it. But P0 does **not** meet its own throughput gate at fifty clients, and that is recorded here
+instead of being averaged away. Slice P1 (transaction pooling, which is the point of a pooler and changes the traffic shape PostgreSQL sees) is the next step; the throughput gate is to be re-run on P1, and
+if the difference in PostgreSQL's cost per transaction persists there it is a finding about PgBouncer's behaviour to reproduce, not about our CPU.
+
+**Not built in P0, as designed:** the connection to the server is opened with a blocking `tcp_connect` when a client is accepted; there is no limit on connection attempts, no timeout, and a client that connects and
+says nothing holds a server connection (P1 and P3).

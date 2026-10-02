@@ -50,7 +50,7 @@ jobs:
 
       - name: Formatting
         working-directory: pg
-        run: ../lex-sys/target/release/lex-sys fmt --check src tests tools examples
+        run: ../lex-sys/target/release/lex-sys fmt --check src tests tools examples pooler
 
       # The real server and the stock psql client as the reference: every query must print
       # the same rows, errors and tags must be the server's, parameters must stay data; and
@@ -63,6 +63,21 @@ jobs:
         run: |
           eval "$(cat /tmp/pg.env.sh)"
           python3 tests/e2e.py
+
+      # The pooler's first slice (docs/pooler.md, P0): a transparent proxy. The whole end-to-end suite
+      # again, with every client and every test going through it to the same PostgreSQL.
+      - name: End-to-end tests through the proxy (pooler P0)
+        working-directory: pg
+        env:
+          LEX_SYS: ${{ github.workspace }}/lex-sys/target/release/lex-sys
+        run: |
+          mkdir -p build
+          ../lex-sys/target/release/lex-sys build --std pooler/proxy.ls -o build/proxy
+          build/proxy 6433 127.0.0.1 5432 &
+          sleep 1
+          eval "$(cat /tmp/pg.env.sh)"
+          PGPORT=6433 python3 tests/e2e.py
+          kill %1
 
       # A consumer locks names from the checked-in store; it must be the store of this source.
       - name: The published store is the store of src/pg.ls
