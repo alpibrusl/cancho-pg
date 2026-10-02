@@ -32,10 +32,11 @@ BIN = os.environ.get("BIN")
 DESCRIBE = None
 PGEN = None
 GEN_USE = None
+POOL_DRIVE = None
 
 
 def build():
-    global BIN, DESCRIBE, PGEN, GEN_USE
+    global BIN, DESCRIBE, PGEN, GEN_USE, POOL_DRIVE
     lex = os.environ.get("LEX_SYS", "lex-sys")
     os.makedirs(os.path.join(ROOT, "build"), exist_ok=True)
     def one(name):
@@ -52,6 +53,8 @@ def build():
     # the program that uses the *checked-in* generated module, so a stale one is a failure
     GEN_USE = os.path.join(ROOT, "build", "gen_use")
     lex_files(GEN_USE, os.path.join(ROOT, "tests", "gen_use.ls"), os.path.join(ROOT, "tests", "generated", "queries.ls"))
+    POOL_DRIVE = os.path.join(ROOT, "build", "pool_drive")
+    lex_files(POOL_DRIVE, os.path.join(ROOT, "tests", "pool_drive.ls"), os.path.join(ROOT, "src", "pool.ls"))
 
 
 def describe(sql, user=USER, db=DB):
@@ -631,6 +634,281 @@ class ImpostorServer(unittest.TestCase):
             p, result = self.exchange(tamper)
             self.assertEqual(p.returncode, 7, (tamper, p.stdout))
             self.assertTrue(result.get("stopped"), (tamper, result))
+
+
+def pool_run(port, lanes, count, mode="plain", depth=64, budget=6000, host=HOST, user=USER, db=DB, out_cap=65536, nbytes=0):
+    """Run tests/pool_drive.ls: (the `done` lines as (tag, status, value), the `finished` line, the exit code)."""
+    p = subprocess.run([POOL_DRIVE, host, str(port), user, db, str(lanes), str(count), mode, str(depth), str(budget), str(out_cap), str(nbytes)],
+                       capture_output=True, text=True, timeout=120)
+    done, finished = [], None
+    for line in p.stdout.splitlines():
+        f = line.split()
+        if f and f[0] == "done":
+            done.append((int(f[1]), int(f[2]), " ".join(f[3:])))
+        elif f and f[0] == "finished":
+            finished = (int(f[1]), int(f[2]))
+    return done, finished, p.returncode
+
+
+class PoolAgainstPostgreSQL(unittest.TestCase):
+    """`pg.pool` over real connections: the answers are the ones `pg.run_named` would get, every request
+    is answered once, and nothing waits for the server."""
+
+    def test_one_connection_pipelines_and_keeps_the_order(self):
+        done, finished, rc = pool_run(PORT, 1, 300)
+        self.assertEqual(rc, 0)
+        self.assertEqual(done, [(i, 0, str(2 * i)) for i in range(300)])
+        self.assertEqual(finished[0], 300)
+
+    def test_more_connections_each_request_once(self):
+        done, finished, rc = pool_run(PORT, 4, 2000)
+        self.assertEqual(rc, 0)
+        self.assertEqual(sorted(done), [(i, 0, str(2 * i)) for i in range(2000)])
+
+    def test_back_pressure_a_full_pool_refuses_and_nothing_is_lost(self):
+        # depth 2 on one connection: submit answers -1 most of the time, and the driver submits again
+        done, finished, rc = pool_run(PORT, 1, 500, depth=2)
+        self.assertEqual(rc, 0)
+        self.assertEqual(done, [(i, 0, str(2 * i)) for i in range(500)])
+
+    def test_a_slow_request_holds_up_its_own_connection_and_no_other(self):
+        done, finished, rc = pool_run(PORT, 2, 6, "slow0")
+        self.assertEqual(rc, 0)
+        order = [t for t, _, _ in done]
+        self.assertEqual(sorted(order), list(range(6)))
+        # request 0 sleeps 0.4 s on one connection: what was queued behind it waits (so 2 and 4 are
+        # after it), what went to the other connection does not (1, 3, 5 come first)
+        self.assertEqual(order, [1, 3, 5, 0, 2, 4])
+
+    def test_the_servers_error_is_the_answer_and_the_rest_go_on(self):
+        done, finished, rc = pool_run(PORT, 1, 4, "err")
+        self.assertEqual(done[0], (0, 0, "0"))
+        self.assertEqual(done[1], (1, 0, "- 26000"))
+        self.assertEqual(done[2:], [(2, 0, "4"), (3, 0, "6")])
+
+    def test_a_request_the_kernel_will_not_take_at_once_goes_out_as_it_is_taken(self):
+        # 6 requests of 3 MB through one connection with room for 4 MB of them: the socket's buffers
+        # fill, writes answer Again, and the rest goes when the poller says the socket is writable
+        done, finished, rc = pool_run(PORT, 1, 6, "big", out_cap=4 << 20, nbytes=3 << 20, budget=20000)
+        self.assertEqual(rc, 0)
+        self.assertEqual(done, [(i, 0, str(3 << 20)) for i in range(6)])
+
+    def test_an_idle_loop_sleeps(self):
+        # one 0.4 s request: the loop must not wake up every few microseconds meanwhile
+        done, finished, rc = pool_run(PORT, 1, 1, "slowall")
+        self.assertEqual(done, [(0, 0, "0")])
+        self.assertLess(finished[1], 10, finished)
+
+    def test_killing_the_backends_answers_every_request_once_with_a_status(self):
+        import threading, time
+        def kill():
+            time.sleep(0.25)
+            subprocess.run(["psql", "-Atc", "select count(pg_terminate_backend(pid)) from pg_stat_activity "
+                            "where pid <> pg_backend_pid() and backend_type = 'client backend' and application_name = ''"],
+                           capture_output=True, text=True)
+        t = threading.Thread(target=kill)
+        t.start()
+        done, finished, rc = pool_run(PORT, 2, 6, "slowall")
+        t.join()
+        self.assertEqual(rc, 0)
+        self.assertEqual(sorted(t for t, _, _ in done), list(range(6)))        # none lost, none twice
+        self.assertTrue(all(s != 0 for _, s, _ in done), done)
+
+
+class PoolAgainstAMock(unittest.TestCase):
+    """The same, against a server that answers as a bad network would: in pieces, late, never, and not at
+    all in the protocol."""
+
+    def serve(self, plan, lanes=1, pause=0.0):
+        """A fake backend on a port. `plan(conn_index, request_index, value)` says what it does for a Bind:
+        a list of (bytes, delay_before_seconds), None for never answering it, or "close". `pause`: seconds
+        the server does not read for after the client has prepared its statements."""
+        import socket, threading
+        lis = socket.socket()
+        lis.bind(("127.0.0.1", 0))
+        lis.listen(8)
+        self.addCleanup(lis.close)
+
+        def msg(kind, body):
+            return kind + (len(body) + 4).to_bytes(4, "big") + body
+
+        def good(value):
+            text = str(value * 2).encode()
+            return (msg(b"2", b"") + msg(b"D", (1).to_bytes(2, "big") + len(text).to_bytes(4, "big") + text)
+                    + msg(b"C", b"SELECT 1\0") + msg(b"Z", b"I"))
+        self.good = good
+        self.msg = msg
+
+        def read_exact(c, n):
+            data = b""
+            while len(data) < n:
+                chunk = c.recv(n - len(data))
+                if not chunk:
+                    raise EOFError
+                data += chunk
+            return data
+
+        def handle(c, index):
+            import time
+            try:
+                n = int.from_bytes(read_exact(c, 4), "big")
+                read_exact(c, n - 4)                                            # startup
+                c.sendall(msg(b"R", (0).to_bytes(4, "big")) + msg(b"Z", b"I"))
+                requested = 0
+                parsed = 0
+                value = None
+                hung = False
+                while True:
+                    kind = read_exact(c, 1)
+                    body = read_exact(c, int.from_bytes(read_exact(c, 4), "big") - 4)
+                    if kind == b"P":                                            # Parse: ParseComplete, then Sync's Z
+                        read_exact(c, 5)
+                        c.sendall(msg(b"1", b"") + msg(b"Z", b"I"))
+                        parsed += 1
+                        if parsed == 3 and pause:                               # the driver prepares three statements
+                            time.sleep(pause)
+                    elif kind == b"B":
+                        # portal \0 statement \0 formats(2+..) nparams(2) [len(4) value]...
+                        rest = body.split(b"\0", 2)[2]
+                        nfmt = int.from_bytes(rest[:2], "big")
+                        rest = rest[2 + 2 * nfmt + 2:]
+                        length = int.from_bytes(rest[:4], "big")
+                        text = rest[4:4 + length]
+                        value = int(text) if text.isdigit() else len(text)
+                    elif kind == b"S":
+                        action = plan(index, requested, value)
+                        requested += 1
+                        if action == "close":
+                            # a FIN, not a reset: a close with unread requests in the receive buffer
+                            # sends RST, which may discard replies the client has not read yet
+                            c.shutdown(socket.SHUT_WR)
+                            while c.recv(4096):
+                                pass
+                            return
+                        if action is None:
+                            hung = True
+                        if hung:
+                            continue
+                        for chunk, delay in action:
+                            if delay:
+                                time.sleep(delay)
+                            c.sendall(chunk)
+            except (EOFError, OSError):
+                pass
+
+        def accept():
+            index = 0
+            while True:
+                try:
+                    c, _ = lis.accept()
+                except OSError:
+                    return
+                threading.Thread(target=handle, args=(c, index), daemon=True).start()
+                index += 1
+        threading.Thread(target=accept, daemon=True).start()
+        return lis.getsockname()[1]
+
+    def test_replies_in_pieces_of_one_byte(self):
+        def plan(conn, i, v):
+            return [(bytes([b]), 0.0005) for b in self.good(v)]
+        port = self.serve(plan)
+        done, finished, rc = pool_run(port, 1, 12)
+        self.assertEqual(done, [(i, 0, str(2 * i)) for i in range(12)])
+
+    def test_replies_that_arrive_late_and_all_at_once(self):
+        def plan(conn, i, v):
+            return [(self.good(v), 0.3 if i == 0 else 0)]
+        port = self.serve(plan)
+        done, finished, rc = pool_run(port, 1, 8)
+        self.assertEqual(done, [(i, 0, str(2 * i)) for i in range(8)])
+        self.assertLess(finished[1], 12, finished)                           # it slept; it did not spin
+
+    def test_two_replies_in_one_write(self):
+        pending = {}
+        def plan(conn, i, v):
+            if i % 2 == 0:
+                pending["held"] = self.good(v)
+                return []
+            return [(pending.pop("held") + self.good(v), 0)]
+        port = self.serve(plan)
+        done, finished, rc = pool_run(port, 1, 6)
+        self.assertEqual(done, [(i, 0, str(2 * i)) for i in range(6)])
+
+    def test_a_request_that_is_never_answered_is_not_answered_and_the_loop_gives_up_quietly(self):
+        def plan(conn, i, v):
+            return None if i == 2 else [(self.good(v), 0)]
+        port = self.serve(plan)
+        done, finished, rc = pool_run(port, 1, 5, budget=800)
+        self.assertEqual(rc, 0)
+        self.assertEqual(done, [(0, 0, "0"), (1, 0, "2")])                   # the rest wait behind the one that never came
+        # (the mock stops answering after it: a real server cannot answer the ones behind it either)
+        self.assertEqual(finished[0], 2)
+
+    def test_a_server_that_hangs_up_part_way_fails_the_rest_in_place(self):
+        def plan(conn, i, v):
+            return "close" if i == 3 else [(self.good(v), 0)]
+        port = self.serve(plan)
+        done, finished, rc = pool_run(port, 1, 8)
+        self.assertEqual([t for t, _, _ in done], list(range(8)))            # each once, in order
+        self.assertEqual([s for _, s, _ in done[:3]], [0, 0, 0])
+        self.assertTrue(all(s == 1 for _, s, _ in done[3:]), done)           # 1: the server closed the connection
+        self.assertEqual(done[2][2], "4")
+
+    def test_a_reply_that_is_not_the_protocol_fails_the_connection(self):
+        def plan(conn, i, v):
+            if i == 1:
+                return [(b"Z\x00\x00\x00\x01", 0)]                          # a length no message can have
+            return [(self.good(v), 0)]
+        port = self.serve(plan)
+        done, finished, rc = pool_run(port, 1, 4)
+        self.assertEqual([t for t, _, _ in done], [0, 1, 2, 3])
+        self.assertEqual(done[0], (0, 0, "0"))
+        self.assertTrue(all(s == 10 for _, s, _ in done[1:]), done)
+
+    def test_a_reply_larger_than_the_input_slab_fails_the_connection(self):
+        def plan(conn, i, v):
+            if i == 1:
+                big = b"x" * 100000
+                return [(self.msg(b"D", (1).to_bytes(2, "big") + len(big).to_bytes(4, "big") + big), 0)]
+            return [(self.good(v), 0)]
+        port = self.serve(plan)
+        done, finished, rc = pool_run(port, 1, 3)
+        self.assertEqual(done[0], (0, 0, "0"))
+        self.assertEqual([s for _, s, _ in done[1:]], [8, 8])
+
+    def test_a_request_larger_than_the_kernels_buffers_goes_out_as_the_socket_takes_it(self):
+        # The server does not read for a second: 3 MB requests fill the socket's buffers, writes answer
+        # Again, the rest of what is queued waits for the poller to say writable. Eight of them through
+        # an output slab of 8 MB, so that some are queued while others are half sent (the queue is
+        # moved down to make room), and the answers come late enough that a connection still watched
+        # for writing -- always ready -- would spin the loop.
+        def plan(conn, i, v):
+            return [(self.good(v), 0.4 if i == 0 else 0)]
+        port = self.serve(plan, pause=1.0)
+        done, finished, rc = pool_run(port, 1, 8, "big", out_cap=8 << 20, nbytes=3 << 20, budget=20000)
+        self.assertEqual(rc, 0)
+        self.assertEqual(done, [(i, 0, str(2 * (3 << 20))) for i in range(8)])
+        self.assertLess(finished[1], 60, finished)
+
+    def test_a_connection_that_fails_with_answers_nobody_has_taken_loses_none_of_them(self):
+        # "lazy": the driver takes answers only when the poller has been quiet, so the first three replies
+        # and the server's hang-up are both in before it looks
+        def plan(conn, i, v):
+            return "close" if i == 3 else [(self.good(v), 0)]
+        port = self.serve(plan)
+        done, finished, rc = pool_run(port, 1, 8, "lazy")
+        self.assertEqual([t for t, _, _ in done], list(range(8)))
+        self.assertEqual([s for _, s, _ in done], [0, 0, 0, 1, 1, 1, 1, 1])
+
+    def test_one_connection_dying_leaves_the_other_serving(self):
+        def plan(conn, i, v):
+            return "close" if conn == 0 and i == 1 else [(self.good(v), 0)]
+        port = self.serve(plan, lanes=2)
+        done, finished, rc = pool_run(port, 2, 8)
+        self.assertEqual(sorted(t for t, _, _ in done), list(range(8)))
+        failed = [t for t, s, _ in done if s != 0]
+        self.assertTrue(failed, done)                                        # what was on the dead one
+        self.assertTrue(any(s == 0 for _, s, _ in done), done)               # and the other one answered
 
 
 if __name__ == "__main__":

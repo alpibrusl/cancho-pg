@@ -263,13 +263,26 @@ fn complain_server[&i, &n, &m](io: &!i Io, name: &n [byte], reply: &m [byte], at
 
 // The function that runs the query: typed parameters in, the server's whole reply and a status out.
 // It runs the statement `prepare_all` prepared under the query's name.
-fn emit_runner[&h, &n, &d, &r](heap: &!h Heap, out: buffer.Buffer, name: &n [byte], pnames: &d [byte], m: &r [byte], tpos: int) -> [heap] buffer.Buffer {
+//
+// With `start` it is the first half only, `<name>_start`: the request as bytes (`pg.bind_named`), for a
+// caller that sends it itself (`pg.pool.submit`) and reads the answer with the accessors below.
+fn emit_runner[&h, &n, &d, &r](heap: &!h Heap, out: buffer.Buffer, name: &n [byte], pnames: &d [byte], m: &r [byte], tpos: int, start: bool) -> [heap] buffer.Buffer {
     let count = pg.param_count(m, tpos);
     var o = buffer.append(heap, out, "\n// ");
     o = buffer.append(heap, o, name);
-    o = buffer.append(heap, o, ": the whole reply, and a status (0 ok); `pg.failure(reply)` is the server's error, if any\npub fn ");
+    if start {
+        o = buffer.append(heap, o, "_start: the request, encoded, for `pg.pool.submit`; the reply is read with the accessors below\npub fn ");
+    } else {
+        o = buffer.append(heap, o, ": the whole reply, and a status (0 ok); `pg.failure(reply)` is the server's error, if any\npub fn ");
+    }
     o = buffer.append(heap, o, name);
-    o = buffer.append(heap, o, "[&h, &c");
+    if start {
+        o = buffer.append(heap, o, "_start");
+    }
+    o = buffer.append(heap, o, "[&h");
+    if !start {
+        o = buffer.append(heap, o, ", &c");
+    }
     var k = 1;
     while k <= count {
         if oid_kind(pg.param_oid(m, tpos, k)) == 0 {
@@ -278,7 +291,10 @@ fn emit_runner[&h, &n, &d, &r](heap: &!h Heap, out: buffer.Buffer, name: &n [byt
         }
         k = k + 1;
     }
-    o = buffer.append(heap, o, "](heap: &!h Heap, conn: &!c Conn");
+    o = buffer.append(heap, o, "](heap: &!h Heap");
+    if !start {
+        o = buffer.append(heap, o, ", conn: &!c Conn");
+    }
     k = 1;
     while k <= count {
         let kind = oid_kind(pg.param_oid(m, tpos, k));
@@ -301,7 +317,11 @@ fn emit_runner[&h, &n, &d, &r](heap: &!h Heap, out: buffer.Buffer, name: &n [byt
         }
         k = k + 1;
     }
-    o = buffer.append(heap, o, ") -> [heap, conn_read, conn_write] (buffer.Buffer, int) {\n    var ps = pg.params(heap);\n");
+    if start {
+        o = buffer.append(heap, o, ") -> [heap] buffer.Buffer {\n    var ps = pg.params(heap);\n");
+    } else {
+        o = buffer.append(heap, o, ") -> [heap, conn_read, conn_write] (buffer.Buffer, int) {\n    var ps = pg.params(heap);\n");
+    }
     k = 1;
     while k <= count {
         let kind = oid_kind(pg.param_oid(m, tpos, k));
@@ -330,6 +350,12 @@ fn emit_runner[&h, &n, &d, &r](heap: &!h Heap, out: buffer.Buffer, name: &n [byt
             o = buffer.append(heap, o, "    } else {\n        ps = pg.param_null(heap, ps);\n    }\n");
         }
         k = k + 1;
+    }
+    if start {
+        o = buffer.append(heap, o, "    var request = buffer.empty(heap, 1);\n    borrow ps as &pr in {\n        buffer.drop(heap, request);\n        request = pg.bind_named(heap, \"");
+        o = buffer.append(heap, o, name);
+        o = buffer.append(heap, o, "\", pr);\n    }\n    pg.drop_params(heap, ps);\n    return request;\n}\n");
+        return o;
     }
     o = buffer.append(heap, o, "    var reply = buffer.empty(heap, 1);\n    var status = 0;\n    borrow ps as &pr in {\n        let (r, s) = pg.run_named(heap, conn, \"");
     o = buffer.append(heap, o, name);
@@ -485,7 +511,8 @@ fn generate[&h, &c, &i, &n, &d, &s](heap: &!h Heap, conn: &!c Conn, io: &!i Io, 
             }
             if code == 0 {
                 borrow pnames as &pr in {
-                    o = emit_runner(heap, o, name, buffer.bytes(pr), m, tpos);
+                    o = emit_runner(heap, o, name, buffer.bytes(pr), m, tpos, true);
+                    o = emit_runner(heap, o, name, buffer.bytes(pr), m, tpos, false);
                     // the step of `prepare_all` that parses this query, under its name
                     pp = buffer.append(heap, pp, "    let (r");
                     pp = buffer.push_nat(heap, pp, index);
@@ -618,7 +645,7 @@ fn generate_all[&h, &c, &i, &t, &f](heap: &!h Heap, conn: &!c Conn, io: &!i Io, 
     out = buffer.append(heap, out, file);
     out = buffer.append(heap, out, " against ");
     out = buffer.append(heap, out, database);
-    out = buffer.append(heap, out, ". Do not edit: change the SQL and run pgen again.\n//\n// Each query is a function that runs it (`<name>`: the whole reply and a status, 0 for ok) and one\n// accessor per result column (`<name>_<column>`, read from a row as `pg.first_row`/`pg.next_row` give\n// it; `_is_null` where the column can be NULL). Call `prepare_all` once after login, before the first query.\nedition 5;\n\nmodule ");
+    out = buffer.append(heap, out, ". Do not edit: change the SQL and run pgen again.\n//\n// Each query is a function that runs it (`<name>`: the whole reply and a status, 0 for ok), one that only\n// encodes the request for `pg.pool.submit` (`<name>_start`), and one accessor per result column\n// (`<name>_<column>`, read from a row as `pg.first_row`/`pg.next_row` give it; `_is_null` where the\n// column can be NULL). Call `prepare_all` once after login, before the first query.\nedition 5;\n\nmodule ");
     out = buffer.append(heap, out, stem(file));
     out = buffer.append(heap, out, ";\n\nimport std.buffer;\nimport pg;\n");
     var seen = buffer.push(heap, buffer.empty(heap, 256), byte_of(10));
