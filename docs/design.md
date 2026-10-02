@@ -1,8 +1,8 @@
 # lexsys-pg: a PostgreSQL client in lex-sys
 
-> **Status: slices 1-3 built** -- the v3 wire protocol (startup, trust, cleartext-password and
+> **Status: slices 1-4 built** -- the v3 wire protocol (startup, trust, cleartext-password and
 > SCRAM-SHA-256 login, simple and extended queries with parameters, describe), checked against
-> a real PostgreSQL 16 and the stock `psql` client, and the typed-query generator `tools/pgen.ls` (§8). Not built: MD5 login, TLS, a non-blocking
+> a real PostgreSQL 16 and the stock `psql` client, the typed-query generator `tools/pgen.ls` (§8), and prepared statements (§4, §9). Not built: MD5 login, TLS, a non-blocking
 > connection, binary result formats, `COPY`. §5 says what comes after, in
 > order, and §6 answers *what sits on top of a driver in a language without reflection*.
 
@@ -32,7 +32,7 @@ It is a *driver*. It does not know what a table is.
    `describing`.
 
 Layers 1 and 2 are pure: they are tested with no server, from canned bytes laid out per the
-protocol documentation and the RFC vectors (`tests/pg_test.ls`, 18 tests). Layer 3 is the only place that waits.
+protocol documentation and the RFC vectors (`tests/pg_test.ls`, 20 tests). Layer 3 is the only place that waits.
 
 ## 3. How it was checked
 
@@ -101,12 +101,10 @@ protocol documentation and the RFC vectors (`tests/pg_test.ls`, 18 tests). Layer
   them registered with the `Poller` and a request that can be suspended and resumed by an id
   (there is no `async`, no closure to resume with): the same inversion `http.server` needed.
   That is a design document and two slices of its own (§5).
-* **Prepared statements.** `execute` sends Parse every time (the unnamed statement). PostgreSQL does
-  2.1x as many one-row lookups a second when the statement is parsed once (`pgbench`: 26,787 against
-  12,577 on the same machine), and asyncpg, which the FastAPI services it is compared with use,
-  already does. A Parse once and a Bind and Execute many (a named statement per generated query,
-  prepared at connect) is the cheapest large win left, and it is a change to layers 1-2 that needs
-  neither TLS nor a non-blocking connection.
+* **Prepared statements: built (§9).** `execute` still sends Parse every time (the unnamed statement), and stays
+  for ad-hoc SQL. PostgreSQL does 2.1x as many one-row lookups a second when the statement is parsed once
+  (`pgbench`: 26,787 against 12,577 on the same machine), and asyncpg, which the FastAPI services it is
+  compared with use, already did.
 * **Binary formats, `COPY`, `LISTEN`/`NOTIFY`, cancellation, pipelining.** Text results are
   what every consumer so far wants and what `psql` prints, so they are what could be checked
   against a reference. The rest are additions to layers 1 and 2, in that order of demand.
@@ -122,7 +120,7 @@ protocol documentation and the RFC vectors (`tests/pg_test.ls`, 18 tests). Layer
    unchanged, benchmarked against FastAPI with SQLAlchemy and with asyncpg and against `pgbench`: a
    read is 3.5x lean FastAPI and at 81% of what PostgreSQL itself does over this protocol; a write is
    `fsync`-bound at about 2,700 a second. What it found is in §4 and §8.
-4b. **Prepared statements** (§4): the next slice, because the read path is PostgreSQL-bound and about
+4b. **Prepared statements (built, §9)**: the slice, because the read path is PostgreSQL-bound and about
    half of PostgreSQL's time on a lookup is parsing and planning (37 against 80 microseconds).
 5. **The non-blocking connection and a pool**, with a design document first.
 6. **TLS**, once the sidecar-or-FFI-or-implement question has an asker.
@@ -258,3 +256,25 @@ not in the database layer: a constraint the store imposes belongs in the schema 
 
 **Not built.** Table-driven CRUD from `lexsys-schema` nodes (§6 C), migrations, dynamic filters (§6 A), array parameters, prepared statements (every call parses again; a `Parse` once and `Bind` many is the first thing a
 benchmark will ask for), and generating `lexsys-schema` nodes from result rows.
+
+## 9. Prepared statements, as built
+
+`pg.parse_named` / `pg.bind_named` are the two messages, `pg.prepare` / `pg.run_named` the blocking helpers, and
+`pgen` writes `prepare_all` (a chain of `pg.prepare_after`) and has each query run by name. A named statement is
+per connection and lives as long as it, so the call goes once after login.
+
+* **No Describe on the named path.** `execute` asks the server to describe the portal every time, which costs it
+  work and the client bytes it then ignores: a generated function knows its columns. `bind_named` sends Bind,
+  Execute and Sync only. (A reply therefore has no RowDescription; the accessors never read one.)
+* **Refuse, and say which.** `prepare_all` stops at the first statement the server refuses and answers that reply,
+  so a schema that has moved under the queries is one message at start-up -- `42703`, column does not exist --
+  instead of a failure on the first request that uses it. The first version of the test renamed a column that
+  *every* query used, and a `prepare_after` that ignored failures still passed it, because the last prepare failed
+  too; the test now renames one that only the first query uses.
+* **A statement that was not prepared** is the server's `26000` (`prepared statement "x" does not exist`) in the
+  reply, which `pg.failure` finds; it does not hang and does not run the SQL.
+* **What it does not do.** No automatic re-prepare: a connection that is replaced has to run `prepare_all` again,
+  which is the pool's job once there is one. No server-side statement for dynamic SQL: `execute` is still the way.
+  A statement prepared with the types the server inferred is re-planned by PostgreSQL itself when the table changes
+  under it, and fails with `0A000` ("cached plan must not change result type") if a column's *type* changed: the
+  same message `prepare_all` would give on a restart.

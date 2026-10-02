@@ -7,7 +7,7 @@ import queries;
 
 // Uses the functions `pgen` wrote for tests/queries.sql, against the database tests/e2e.py seeded.
 //
-//     gen_use <host> <port> <user> <database> <password|-> <id of a user with a NULL age and nickname>
+//     gen_use <host> <port> <user> <database> <password|-> <id of a user with a NULL age and nickname> [unprepared]
 //
 // What it prints is checked line by line in tests/e2e.py, and the table it leaves behind is checked
 // with `psql`.
@@ -311,6 +311,29 @@ fn run[&h, &g, &i, &c, &z](heap: &!h Heap, args: &g Args, io: &!i Io, conn: &!c 
     if s0 != 0 {
         return s0;
     }
+    if arg_count(args) > 7 {
+        // an eighth argument: run a query without having prepared it, and say what the server answered
+        let (reply, status) = queries.count_users(heap, conn);
+        borrow reply as &rr in {
+            if failed(io, "count_users", buffer.bytes(rr)) == 0 {
+                put(io, "count_users answered\n");
+            }
+        }
+        buffer.drop(heap, reply);
+        return status;
+    }
+    // every query is prepared once, on this connection, before the first is run
+    let (refused, prepared) = queries.prepare_all(heap, conn);
+    var bad = prepared;
+    borrow refused as &fr in {
+        if pg.failure(buffer.bytes(fr)) >= 0 {
+            bad = 1;
+        }
+    }
+    buffer.drop(heap, refused);
+    if bad != 0 {
+        return 7;
+    }
     return scenario(heap, conn, io, number_of(arg(args, 6)));
 }
 
@@ -321,7 +344,7 @@ fn main(world: World) -> [] int {
     var status = 100;
     borrow fs as &z in {
         borrow args as &g in {
-            if arg_count(g) == 7 {
+            if arg_count(g) >= 7 {
                 status = 101;
                 let port = number_of(arg(g, 2));
                 if port > 0 && port < 65536 {
