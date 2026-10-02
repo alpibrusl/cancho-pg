@@ -338,7 +338,8 @@ class Failures(PoolerCase):
         pid_a = a.one("select pg_backend_pid()")
         a.query("begin")
         admin("select pg_terminate_backend(%s)" % pid_a)
-        with self.assertRaises(Exception):
+        a.s.settimeout(3)
+        with self.assertRaises(ConnectionError):  # closed by the pooler, not a read that timed out
             a.query("select 1")
             a.query("select 1")
         time.sleep(0.5)
@@ -363,6 +364,15 @@ class Volume(PoolerCase):
         self.assertEqual(len(rows), 50000)
         self.assertEqual(rows[49999][0], "50000")
         self.assertEqual(statuses, ["I"])
+
+    def test_a_slow_server_pushes_back_on_a_client_that_keeps_sending_and_nothing_is_lost(self):
+        a = self.client()
+        # The server is busy for two seconds and does not read; the client has already sent 6 MB behind it, more than every buffer between them holds.
+        a.raw(msg(b"Q", b"select pg_sleep(2)\0") + msg(b"Q", ("select length('%s')" % ("z" * 6000000)).encode() + b"\0") + msg(b"Q", b"select 99\0"))
+        a.s.settimeout(20)
+        rows, errors, tags, statuses, _ = a.until_ready(3)
+        self.assertEqual((errors, statuses), ([], ["I", "I", "I"]))
+        self.assertEqual([r for r in rows if r != [""]], [["6000000"], ["99"]])
 
     def test_a_large_query_arrives_whole(self):
         a = self.client()
