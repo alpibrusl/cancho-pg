@@ -276,5 +276,6 @@ per connection and lives as long as it, so the call goes once after login.
 * **What it does not do.** No automatic re-prepare: a connection that is replaced has to run `prepare_all` again,
   which is the pool's job once there is one. No server-side statement for dynamic SQL: `execute` is still the way.
   A statement prepared with the types the server inferred is re-planned by PostgreSQL itself when the table changes
-  under it, and fails with `0A000` ("cached plan must not change result type") if a column's *type* changed: the
-  same message `prepare_all` would give on a restart.
+  under it, and fails with `0A000` ("cached plan must not change result type") if a column's *type* changed; a
+  fresh connection, running `prepare_all` again, picks up the new types, and the generated accessors are regenerated
+  from the changed schema like any other.
