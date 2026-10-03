@@ -3,13 +3,19 @@ edition 5;
 import std.buffer;
 import std.bytes;
 import std.conns;
+import std.crypto;
 import std.io;
 import frame;
 import pg;
+import scram;
 
 // `pooler` -- slice P1 of the connection pooler (`docs/pooler.md`): transaction pooling.
 //
-//     pooler <listen port> <server host> <server port> <user> <database> <password | -> <pool size>
+//     pooler <listen port> <server host> <server port> <user> <database> <password | -> <pool size> [<client password | ->]
+//
+// The password is the one the pooler logs in to the server with. A client password makes the pooler ask its clients for it (SCRAM-SHA-256, as PostgreSQL does: the
+// pooler holds the salted keys, never the password, and the exchange is the one `libpq` speaks); without it, or with `-`, clients are trusted, which is for a
+// network nobody else is on.
 //
 // A pool of `pool size` connections to the server is logged in when it starts (`pg.login`: trust, cleartext or SCRAM, whatever the server
 // asks), and a client is lent one for the length of one transaction. A client that connects is answered by the pooler itself (the
@@ -21,7 +27,7 @@ import pg;
 //
 // What it refuses, in the protocol's own words: a prepared statement with a name (it would outlive the transaction on a connection the
 // client will not get back), a client whose user or database is not the pool's. What it does not do yet: authenticate clients (P2: it
-// is for a trusted network), map `CancelRequest`, time anything out (P3), open its connections without blocking (a connection that is
+// is for a trusted network unless a client password is given), map `CancelRequest`, time anything out (P3), open its connections without blocking (a connection that is
 // replaced is logged in while the loop waits).
 //
 // One thread, one poller. Sizes are fixed at start.
@@ -63,13 +69,14 @@ fn queue_size() -> [] int {
 //      4  bytes waiting to be sent to it
 //      5  what it is watched for (1 read, 2 write, 3 both, 0 neither)
 //      6  1 if it closes once what is queued for it has gone
-//      7  a client: 0 before its startup message has been answered, 1 after. A server: 1 if it is idle
+//      7  a client: 0 before its startup message has been answered, 2 and 3 in the two steps of SCRAM, 1 after. A server: 1 if it is idle
 //      8  a client: how much of the message being passed on is still to come
 //      9  a client: 1 while its messages are dropped up to a Sync
 //     10  a client: the ReadyForQuerys the server still owes it
 //     11  a client: 1 if it is in the queue for a server
 //     12  a client: its number
-//     13  a server: the scan of what it sends (`frame.scan_size()` ints)
+//     13  a server: the scan of what it sends (`frame.scan_size()` ints). A client in SCRAM: the length of its first message, and of the pooler's answer
+//     14  (see 13)
 fn stride() -> [] int {
     return 24;
 }
@@ -78,13 +85,14 @@ fn stride() -> [] int {
 //
 //     0  servers idle      1  the queue's head   2  clients queued   3  bytes of parameters to replay   4  the next client number
 //     5  servers in the pool   6  the size asked for   7  the server's port   8  user's length   9  password's   10  database's   11  host's
+//     12  the client password's length (0: clients are trusted)   13  random bytes held   14  how many of them are used
 fn meta_size() -> [] int {
-    return 16;
+    return 24;
 }
 
-// `config`: the user at 0, the password at 128, the database at 384, the host at 512.
+// `config`: the user at 0, the password at 128, the database at 384, the host at 512, the client password at 640.
 fn config_size() -> [] int {
-    return 640;
+    return 768;
 }
 
 res struct Core {
@@ -102,6 +110,11 @@ res struct Core {
     hello: Box[[byte]],
     scratch: Box[[byte]],
     config: Box[[byte]],
+    // The client password's salt (16 bytes) and its StoredKey (32) and ServerKey (32); random bytes from the kernel for the nonces of logins; and per client the
+    // part of the SCRAM exchange that has to be remembered (the client's first message and the pooler's answer).
+    keys: Box[[byte]],
+    rand: Box[[byte]],
+    authbuf: Box[[byte]],
 }
 
 // ---------------------------------------------------------------------
@@ -446,6 +459,206 @@ fn give_back[&t, &c](tab: &!t conns.Table, core: &!c Core, s: int) -> [conn_writ
     return 0;
 }
 
+// Tell client `k` it is in: AuthenticationOk, the parameters, a BackendKeyData of its own, ReadyForQuery idle. `lead` is bytes already written to `sc`.
+fn send_hello[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int, lead: int) -> [conn_write] int {
+    let st = contents(core.state);
+    let mt = contents(core.meta);
+    let sc = contents(core.scratch);
+    let hl = contents(core.hello);
+    let p = stride() * k;
+    var o = lead;
+    sc[o] = byte_of('R');
+    put_be32(sc, o + 1, 8);
+    put_be32(sc, o + 5, 0);
+    o = o + 9;
+    var i = 0;
+    while i < mt[3] {
+        sc[o + i] = hl[i];
+        i = i + 1;
+    }
+    o = o + mt[3];
+    sc[o] = byte_of('K');
+    put_be32(sc, o + 1, 12);
+    put_be32(sc, o + 5, st[p + 12]);
+    put_be32(sc, o + 9, 0);
+    o = o + 13;
+    o = put_ready(sc, o, 73);
+    send_to(tab, core, k, sc[0..o]);
+    st[p + 7] = 1;
+    return 0;
+}
+
+// What a client that fails to authenticate is told, and then it is on its way out.
+fn auth_failed[&t, &c, &d, &m](tab: &!t conns.Table, core: &!c Core, k: int, code: &d [byte], message: &m [byte]) -> [conn_write, poll] int {
+    let sc = contents(core.scratch);
+    let o = put_error(sc, 0, "FATAL", code, message);
+    send_to(tab, core, k, sc[0..o]);
+    finish_client(tab, core, k);
+    return 0;
+}
+
+// The size of the part of a client's SCRAM exchange that is remembered (its first message and the answer to it).
+fn auth_size() -> [] int {
+    return 512;
+}
+
+// One message of the client's SCRAM-SHA-256 exchange (`view` starts at it): the first (phase 2) is answered with the pooler's challenge, the second (phase 3) is
+// checked and answered with the server signature and the start of the session. Answers how many bytes it took, 0 if the message has not all arrived, -1 if the client
+// was refused (it is on its way out).
+fn auth_step[&t, &c, &v](tab: &!t conns.Table, core: &!c Core, k: int, view: &v [byte]) -> [conn_write, poll] int {
+    let st = contents(core.state);
+    let mt = contents(core.meta);
+    let sc = contents(core.scratch);
+    let ks = contents(core.keys);
+    let rn = contents(core.rand);
+    let ab = contents(core.authbuf);
+    let p = stride() * k;
+    let base = k * auth_size();
+    if len(view) < 5 {
+        return 0;
+    }
+    let size = be32(view, 1);
+    if int_of(view[0]) != 112 || size < 4 || size > 2048 {
+        auth_failed(tab, core, k, "08P01", "expected a password message");
+        return 0 - 1;
+    }
+    if len(view) < 1 + size {
+        return 0;
+    }
+    let body = view[5..1 + size];
+    let total = 1 + size;
+    if st[p + 7] == 2 {
+        // SASLInitialResponse: the mechanism, the length of the client-first message, the message.
+        let m_end = cstr_end(body, 0);
+        if m_end < 0 || !same_text(body[0..m_end - 1], "SCRAM-SHA-256") || len(body) < m_end + 4 {
+            auth_failed(tab, core, k, "28000", "the authentication mechanism is not supported (only SCRAM-SHA-256)");
+            return 0 - 1;
+        }
+        let first = body[m_end + 4..len(body)];
+        if be32(body, m_end) != len(first) || len(first) < 8 || int_of(first[1]) != 44 || int_of(first[2]) != 44 || int_of(first[0]) != 110 && int_of(first[0]) != 121 {
+            auth_failed(tab, core, k, "28000", "channel binding and an authorization identity are not supported");
+            return 0 - 1;
+        }
+        let bare = first[3..len(first)];
+        let (rf, rt) = pg.scram_attr(bare, 114);
+        if rf < 0 || rt - rf < 8 || rt - rf > 64 || len(bare) > 256 || int_of(bare[0]) != 110 {
+            auth_failed(tab, core, k, "08P01", "malformed SCRAM message");
+            return 0 - 1;
+        }
+        if mt[13] - mt[14] < 18 {
+            auth_failed(tab, core, k, "53000", "the pooler has no random bytes to make a nonce of");
+            return 0 - 1;
+        }
+        var i = 0;
+        while i < len(bare) {
+            ab[base + i] = bare[i];
+            i = i + 1;
+        }
+        ab[base + len(bare)] = byte_of(44);
+        var at = base + len(bare) + 1;
+        let sf_start = at;
+        ab[at] = byte_of(114);
+        ab[at + 1] = byte_of(61);
+        at = at + 2;
+        i = rf;
+        while i < rt {
+            ab[at] = bare[i];
+            at = at + 1;
+            i = i + 1;
+        }
+        at = at + scram.b64_encode(rn[mt[14]..mt[14] + 18], ab[at..at + 24]);
+        mt[14] = mt[14] + 18;
+        let tail = ",s=";
+        i = 0;
+        while i < 3 {
+            ab[at + i] = tail[i];
+            i = i + 1;
+        }
+        at = at + 3;
+        at = at + scram.b64_encode(ks[0..16], ab[at..at + 24]);
+        let iters = ",i=4096";
+        i = 0;
+        while i < 7 {
+            ab[at + i] = iters[i];
+            i = i + 1;
+        }
+        at = at + 7;
+        st[p + 13] = len(bare);
+        st[p + 14] = at - sf_start;
+        // AuthenticationSASLContinue: 'R', its length, 11, the server-first message.
+        sc[0] = byte_of('R');
+        put_be32(sc, 1, 8 + at - sf_start);
+        put_be32(sc, 5, 11);
+        i = 0;
+        while i < at - sf_start {
+            sc[9 + i] = ab[sf_start + i];
+            i = i + 1;
+        }
+        send_to(tab, core, k, sc[0..9 + at - sf_start]);
+        st[p + 7] = 3;
+        return total;
+    }
+    // SASLResponse: the client-final message, "c=biws,r=<nonce>,p=<proof>".
+    var cut = len(body) - 3;
+    while cut >= 0 && !(int_of(body[cut]) == 44 && int_of(body[cut + 1]) == 112 && int_of(body[cut + 2]) == 61) {
+        cut = cut - 1;
+    }
+    let bare_len = st[p + 13];
+    let sf_len = st[p + 14];
+    let server_first = ab[base + bare_len + 1..base + bare_len + 1 + sf_len];
+    if cut < 0 {
+        auth_failed(tab, core, k, "08P01", "malformed SCRAM message");
+        return 0 - 1;
+    }
+    let without_proof = body[0..cut];
+    let proof = body[cut + 3..len(body)];
+    let (cf_from, cf_to) = pg.scram_attr(without_proof, 99);
+    let (nf, nt) = pg.scram_attr(without_proof, 114);
+    let (sn_from, sn_to) = pg.scram_attr(server_first, 114);
+    if cf_from < 0 || nf < 0 || !(same_text(without_proof[cf_from..cf_to], "biws") || same_text(without_proof[cf_from..cf_to], "eSws")) || !same_text(without_proof[nf..nt], server_first[sn_from..sn_to]) {
+        auth_failed(tab, core, k, "28P01", "password authentication failed");
+        return 0 - 1;
+    }
+    var good = false;
+    region a {
+        let message = alloc_slice[a](bare_len + 1 + sf_len + 1 + len(without_proof), byte_of(0));
+        var i = 0;
+        while i < bare_len {
+            message[i] = ab[base + i];
+            i = i + 1;
+        }
+        message[bare_len] = byte_of(44);
+        i = 0;
+        while i < sf_len {
+            message[bare_len + 1 + i] = server_first[i];
+            i = i + 1;
+        }
+        message[bare_len + 1 + sf_len] = byte_of(44);
+        i = 0;
+        while i < len(without_proof) {
+            message[bare_len + 2 + sf_len + i] = without_proof[i];
+            i = i + 1;
+        }
+        let signature = alloc_slice[a](32, byte_of(0));
+        if scram.verify(ks[16..48], ks[48..80], message, proof, signature) {
+            good = true;
+            // AuthenticationSASLFinal: 'R', its length, 12, "v=" and the server signature; then the session starts.
+            sc[0] = byte_of('R');
+            put_be32(sc, 1, 4 + 4 + 2 + 44);
+            put_be32(sc, 5, 12);
+            sc[9] = byte_of(118);
+            sc[10] = byte_of(61);
+            scram.b64_encode(signature, sc[11..55]);
+            send_hello(tab, core, k, 55);
+        }
+    }
+    if !good {
+        auth_failed(tab, core, k, "28P01", "password authentication failed");
+        return 0 - 1;
+    }
+    return total;
+}
+
 // Everything the client in slot `k` has sent that can be dealt with: its startup message, then its messages, decided by `frame.client_step`.
 fn process[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [conn_write, poll] int {
     let st = contents(core.state);
@@ -506,31 +719,30 @@ fn process[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [conn_write,
                         send_to(tab, core, k, sc[0..o]);
                         finish_client(tab, core, k);
                         going = false;
-                    } else {
-                        // AuthenticationOk, the parameters, a BackendKeyData of its own, ReadyForQuery idle.
-                        let hl = contents(core.hello);
+                    } else if mt[12] > 0 {
+                        // Ask for the password: AuthenticationSASL, with the one mechanism.
                         var o = 0;
                         sc[o] = byte_of('R');
-                        put_be32(sc, o + 1, 8);
-                        put_be32(sc, o + 5, 0);
-                        o = o + 9;
-                        var i = 0;
-                        while i < mt[3] {
-                            sc[o + i] = hl[i];
-                            i = i + 1;
-                        }
-                        o = o + mt[3];
-                        sc[o] = byte_of('K');
-                        put_be32(sc, o + 1, 12);
-                        put_be32(sc, o + 5, st[p + 12]);
-                        put_be32(sc, o + 9, 0);
-                        o = o + 13;
-                        o = put_ready(sc, o, 73);
+                        put_be32(sc, o + 1, 4 + 4 + 14 + 1);
+                        put_be32(sc, o + 5, 10);
+                        o = put_text(sc, o + 9, "SCRAM-SHA-256");
+                        sc[o] = byte_of(0);
+                        o = o + 1;
                         send_to(tab, core, k, sc[0..o]);
-                        st[p + 7] = 1;
+                        st[p + 7] = 2;
+                        used = used + size;
+                    } else {
+                        send_hello(tab, core, k, 0);
                         used = used + size;
                     }
                 }
+            }
+        } else if st[p + 7] == 2 || st[p + 7] == 3 {
+            let taken = auth_step(tab, core, k, view);
+            if taken <= 0 {
+                going = false;
+            } else {
+                used = used + taken;
             }
         } else {
             let (act, n, rest, owed) = frame.client_step(view, st[p + 8], st[p + 9]);
@@ -875,6 +1087,27 @@ fn keep_parameters[&c, &r](core: &!c Core, reply: &r [byte]) -> [] int {
     return 0;
 }
 
+// Keep a few hundred random bytes in hand for the nonces of logins: `meta[13]` held, `meta[14]` used. Reads from the kernel when fewer than 512 are left.
+fn top_up[&c, &f](core: &!c Core, fs: &f Fs("/dev/urandom")) -> [fs_read("/dev/urandom")] int {
+    let mt = contents(core.meta);
+    let rn = contents(core.rand);
+    if mt[13] - mt[14] >= 512 {
+        return 0;
+    }
+    var i = 0;
+    while i < mt[13] - mt[14] {
+        rn[i] = rn[mt[14] + i];
+        i = i + 1;
+    }
+    mt[13] = mt[13] - mt[14];
+    mt[14] = 0;
+    let got = fs_read(fs, "/dev/urandom", rn[mt[13]..len(rn)]);
+    if got > 0 {
+        mt[13] = mt[13] + got;
+    }
+    return 0;
+}
+
 // Log in connections until the pool is the size asked for, or one cannot be made (tried again on the next turn).
 fn refill[&h, &n, &z, &c](heap: &!h Heap, conn: conns.Table, net: &n Net(""), rng: &z Fs("/dev/urandom"), core: &!c Core) -> [heap, net_out(""), conn_read, conn_write, fs_read("/dev/urandom"), poll] conns.Table {
     let mt = contents(core.meta);
@@ -951,7 +1184,7 @@ fn run[&h, &l, &n, &z, &g](heap: &!h Heap, listener: &!l Listener, net: &n Net("
                 poller_add_listener(pw, listener, 0);
             }
             let slots = max_slots() + 2;
-            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * slots, 0), meta: box_slice(heap, meta_size(), 0), idle: box_slice(heap, max_pool() + 2, 0), queue: box_slice(heap, max_clients() + 2, 0), inbuf: box_slice(heap, slots * input_size(), byte_of(0)), rbuf: box_slice(heap, chunk(), byte_of(0)), pends: box_slice(heap, slots * queue_size(), byte_of(0)), hello: box_slice(heap, 4096, byte_of(0)), scratch: box_slice(heap, 4096, byte_of(0)), config: box_slice(heap, config_size(), byte_of(0)) };
+            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * slots, 0), meta: box_slice(heap, meta_size(), 0), idle: box_slice(heap, max_pool() + 2, 0), queue: box_slice(heap, max_clients() + 2, 0), inbuf: box_slice(heap, slots * input_size(), byte_of(0)), rbuf: box_slice(heap, chunk(), byte_of(0)), pends: box_slice(heap, slots * queue_size(), byte_of(0)), hello: box_slice(heap, 4096, byte_of(0)), scratch: box_slice(heap, 4096, byte_of(0)), config: box_slice(heap, config_size(), byte_of(0)), keys: box_slice(heap, 80, byte_of(0)), rand: box_slice(heap, 4096, byte_of(0)), authbuf: box_slice(heap, slots * auth_size(), byte_of(0)) };
             borrow mut core as &!cw in {
                 // The configuration: where the server is, who to be, how many connections.
                 let cf = contents(cw.config);
@@ -990,10 +1223,48 @@ fn run[&h, &l, &n, &z, &g](heap: &!h Heap, listener: &!l Listener, net: &n Net("
                 mt[11] = len(host);
                 mt[7] = number_of(arg(args, 3));
                 mt[6] = number_of(arg(args, 7));
+                if arg_count(args) > 8 && !(len(arg(args, 8)) == 1 && int_of(arg(args, 8)[0]) == 45) {
+                    let cp = arg(args, 8);
+                    i = 0;
+                    while i < len(cp) && i < 120 {
+                        cf[640 + i] = cp[i];
+                        i = i + 1;
+                    }
+                    mt[12] = i;
+                }
+            }
+            borrow mut core as &!cw in {
+                top_up(cw, rng);
+            }
+            borrow mut core as &!cw in {
+                // The salted keys of the client password, once: 16 random bytes of salt, 4096 iterations (what PostgreSQL does).
+                let mt = contents(cw.meta);
+                if mt[12] > 0 {
+                    let ks = contents(cw.keys);
+                    let rn = contents(cw.rand);
+                    let cf = contents(cw.config);
+                    var i = 0;
+                    while i < 16 {
+                        ks[i] = rn[i];
+                        i = i + 1;
+                    }
+                    mt[14] = 16;
+                    let salted = pg.pbkdf2_sha256(heap, cf[640..640 + mt[12]], ks[0..16], 4096);
+                    borrow salted as &sr in {
+                        region ra {
+                            let ck = alloc_slice[ra](32, byte_of(0));
+                            scram.hmac(buffer.bytes(sr), "Client Key", ck);
+                            crypto.sha256(ck, ks[16..48]);
+                            scram.hmac(buffer.bytes(sr), "Server Key", ks[48..80]);
+                        }
+                    }
+                    buffer.drop(heap, salted);
+                }
             }
             var tab = conns.empty(heap, 64);
             while true {
                 borrow mut core as &!cw in {
+                    top_up(cw, rng);
                     tab = refill(heap, tab, net, rng, cw);
                 }
                 var ready = 0 - 1;
@@ -1029,7 +1300,7 @@ fn run[&h, &l, &n, &z, &g](heap: &!h Heap, listener: &!l Listener, net: &n Net("
                 }
             }
             conns.drop(heap, tab);
-            let Core { poller, events, state, meta, idle, queue, inbuf, rbuf, pends, hello, scratch, config } = core;
+            let Core { poller, events, state, meta, idle, queue, inbuf, rbuf, pends, hello, scratch, config, keys, rand, authbuf } = core;
             poller_close(poller);
             unbox_slice(heap, events);
             unbox_slice(heap, state);
@@ -1042,6 +1313,9 @@ fn run[&h, &l, &n, &z, &g](heap: &!h Heap, listener: &!l Listener, net: &n Net("
             unbox_slice(heap, hello);
             unbox_slice(heap, scratch);
             unbox_slice(heap, config);
+            unbox_slice(heap, keys);
+            unbox_slice(heap, rand);
+            unbox_slice(heap, authbuf);
             return 0;
         }
         Polling::Failed(e) => {
@@ -1076,7 +1350,7 @@ fn main(world: World) -> [] int {
     var pool = 0 - 1;
     var server_port = 0 - 1;
     borrow args as &g in {
-        if arg_count(g) == 8 {
+        if arg_count(g) == 8 || arg_count(g) == 9 {
             listen_port = number_of(arg(g, 1));
             server_port = number_of(arg(g, 3));
             pool = number_of(arg(g, 7));

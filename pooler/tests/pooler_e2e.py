@@ -6,13 +6,20 @@
 Needs trust authentication for `postgres` on the database `bench` (any database will do: PGDATABASE). Each test starts its own pooler on its own
 port with the pool size it needs, speaks the wire protocol to it over raw sockets, and looks at what PostgreSQL itself says (backend pids, what is visible).
 """
-import os, socket, struct, subprocess, sys, threading, time, unittest
+import base64, hashlib, hmac, os, socket, struct, subprocess, sys, threading, time, unittest
 
 BIN = sys.argv.pop(1) if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else os.path.join(os.path.dirname(__file__), "..", "..", "build", "pooler")
 HOST = os.environ.get("PGHOST", "127.0.0.1")
 PORT = int(os.environ.get("PGPORT", "5432"))
 DB = os.environ.get("PGDATABASE", "bench")
 USER = os.environ.get("PGUSER", "postgres")
+
+
+class AuthError(Exception):
+    pass
+
+
+REPLAY = [None, None]
 
 
 def msg(kind, body=b""):
@@ -22,13 +29,77 @@ def msg(kind, body=b""):
 class Client:
     """A bare protocol client: startup, simple and extended messages, replies parsed to what the tests look at."""
 
-    def __init__(self, port, user=USER, db=DB, timeout=10):
+    def __init__(self, port, user=USER, db=DB, timeout=10, password=None, mutate=None):
         self.s = socket.create_connection(("127.0.0.1", port), timeout)
         self.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.buf = b""
+        self.user = user
         body = struct.pack("!i", 196608) + b"user\0" + user.encode() + b"\0database\0" + db.encode() + b"\0\0"
         self.s.sendall(struct.pack("!i", len(body) + 4) + body)
+        if password is not None:
+            self.scram(password, mutate)
         self.startup = self.until_ready()
+
+    def scram(self, password, mutate=None):
+        """The client side of SCRAM-SHA-256 (RFC 7677), independent of the pooler's code. `mutate` names a way to get it wrong."""
+        k, body = self.read_message()
+        if k == b"E":
+            raise AuthError(self.parse_error(body))
+        assert k == b"R" and struct.unpack("!i", body[:4])[0] == 10, (k, body)
+        mech = b"SCRAM-SHA-256"
+        if mutate == "plus":
+            mech = b"SCRAM-SHA-256-PLUS"
+        cnonce = base64.b64encode(os.urandom(18)).decode()
+        if mutate == "replay":
+            cnonce = REPLAY[1]  # the same client nonce as the session the final message was captured in
+        gs2 = "n,,"
+        if mutate == "channel_binding":
+            gs2 = "p=tls-server-end-point,,"
+        bare = "n=,r=" + cnonce
+        first = (gs2 + bare).encode()
+        self.s.sendall(msg(b"p", mech + b"\0" + struct.pack("!i", len(first)) + first))
+        k, body = self.read_message()
+        if k == b"E":
+            raise AuthError(self.parse_error(body))
+        assert k == b"R" and struct.unpack("!i", body[:4])[0] == 11, (k, body)
+        server_first = body[4:].decode()
+        attrs = dict(a.split("=", 1) for a in server_first.split(","))
+        assert attrs["r"].startswith(cnonce) and len(attrs["r"]) > len(cnonce)
+        salt, iters = base64.b64decode(attrs["s"]), int(attrs["i"])
+        salted = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iters)
+        client_key = hmac.new(salted, b"Client Key", hashlib.sha256).digest()
+        stored = hashlib.sha256(client_key).digest()
+        nonce = attrs["r"] if mutate != "wrong_nonce" else cnonce + "XXXXXXXXXXXXXXXXXXXXXXXX"
+        without_proof = "c=biws,r=" + nonce
+        if mutate == "bad_binding_flag":
+            without_proof = "c=cD10bHMtc2VydmVyLWVuZC1wb2ludCws,r=" + nonce
+        auth = bare + "," + server_first + "," + without_proof
+        signature = hmac.new(stored, auth.encode(), hashlib.sha256).digest()
+        proof = bytes(a ^ b for a, b in zip(client_key, signature))
+        if mutate == "tampered_proof":
+            proof = bytes([proof[0] ^ 1]) + proof[1:]
+        final = without_proof + ",p=" + base64.b64encode(proof).decode()
+        if mutate == "no_proof":
+            final = without_proof
+        self.captured = (cnonce, final)
+        if mutate == "replay":
+            final = REPLAY[0]
+        self.s.sendall(msg(b"p", final.encode()))
+        k, body = self.read_message()
+        if k == b"E":
+            raise AuthError(self.parse_error(body))
+        assert k == b"R" and struct.unpack("!i", body[:4])[0] == 12, (k, body)
+        server_key = hmac.new(salted, b"Server Key", hashlib.sha256).digest()
+        expected = base64.b64encode(hmac.new(server_key, auth.encode(), hashlib.sha256).digest()).decode()
+        assert body[4:].decode() == "v=" + expected, "the server's signature is not the one only a holder of the password can make"
+
+    @staticmethod
+    def parse_error(body):
+        fields = {}
+        for part in body.split(b"\0"):
+            if part:
+                fields[chr(part[0])] = part[1:].decode()
+        return fields
 
     def raw(self, data):
         self.s.sendall(data)
@@ -115,10 +186,11 @@ _next_port = [6500]
 
 
 class Pooler:
-    def __init__(self, size, db=DB):
+    def __init__(self, size, db=DB, client_password=None):
         _next_port[0] += 1
         self.port = _next_port[0]
-        self.p = subprocess.Popen([BIN, str(self.port), HOST, str(PORT), USER, db, "-", str(size)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.client_password = client_password
+        self.p = subprocess.Popen([BIN, str(self.port), HOST, str(PORT), USER, db, "-", str(size)] + ([client_password] if client_password else []), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(100):
             try:
                 socket.create_connection(("127.0.0.1", self.port), 0.2).close()
@@ -128,7 +200,7 @@ class Pooler:
         # wait until the pool is logged in: a client is answered only when it is
         for _ in range(100):
             try:
-                c = Client(self.port)
+                c = Client(self.port, password=client_password)
                 c.close()
                 break
             except Exception:
@@ -458,6 +530,117 @@ class Hostile(PoolerCase):
                 s.close()
         time.sleep(0.3)
         self.alive()
+
+
+class Authentication(unittest.TestCase):
+    PASSWORD = "correct horse battery staple"
+
+    def setUp(self):
+        self.pooler = Pooler(2, client_password=self.PASSWORD)
+        self.addCleanup(self.pooler.stop)
+
+    def login(self, password=None, mutate=None):
+        c = Client(self.pooler.port, password=self.PASSWORD if password is None else password, mutate=mutate)
+        self.addCleanup(c.close)
+        return c
+
+    def refused(self, code, **kw):
+        with self.assertRaises(AuthError) as ctx:
+            self.login(**kw)
+        self.assertEqual(ctx.exception.args[0]["C"], code)
+        self.alive()
+
+    def alive(self):
+        self.assertEqual(self.login().one("select 41 + 1"), "42")
+
+    def test_the_right_password_logs_in_and_the_server_signature_is_the_one_only_the_pooler_can_make(self):
+        c = self.login()
+        self.assertEqual(c.startup[3], ["I"])
+        self.assertEqual(c.one("select current_user"), USER)
+
+    def test_libpq_logs_in_with_the_right_password_and_not_with_a_wrong_or_no_one(self):
+        env = dict(os.environ, PGPASSWORD=self.PASSWORD)
+        r = subprocess.run(["psql", "-h", "127.0.0.1", "-p", str(self.pooler.port), "-U", USER, "-d", DB, "-Atc", "select 'libpq', 1 + 1"], capture_output=True, text=True, env=env)
+        self.assertEqual(r.stdout.strip(), "libpq|2", r.stderr)
+        bad = subprocess.run(["psql", "-h", "127.0.0.1", "-p", str(self.pooler.port), "-U", USER, "-d", DB, "-Atc", "select 1"], capture_output=True, text=True, env=dict(os.environ, PGPASSWORD="wrong"))
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("password authentication failed", bad.stderr)
+        none = subprocess.run(["psql", "-w", "-h", "127.0.0.1", "-p", str(self.pooler.port), "-U", USER, "-d", DB, "-Atc", "select 1"], capture_output=True, text=True, env={k: v for k, v in os.environ.items() if k != "PGPASSWORD"})
+        self.assertNotEqual(none.returncode, 0)
+        self.alive()
+
+    def test_pgbench_logs_in_through_it(self):
+        r = subprocess.run(["pgbench", "-h", "127.0.0.1", "-p", str(self.pooler.port), "-U", USER, "-S", "-c", "4", "-j", "1", "-T", "1", DB], capture_output=True, text=True, env=dict(os.environ, PGPASSWORD=self.PASSWORD))
+        self.assertIn("number of failed transactions: 0", r.stdout, r.stderr)
+
+    def test_a_wrong_password_is_refused_in_the_servers_words(self):
+        self.refused("28P01", password="wrong")
+        self.refused("28P01", password=self.PASSWORD + " ")
+        self.refused("28P01", password="")
+
+    def test_a_proof_with_one_bit_changed_is_refused(self):
+        self.refused("28P01", mutate="tampered_proof")
+
+    def test_a_final_message_with_another_nonce_or_no_proof_is_refused(self):
+        self.refused("28P01", mutate="wrong_nonce")
+        self.refused("08P01", mutate="no_proof")
+
+    def test_a_proof_replayed_from_another_session_is_refused(self):
+        first = self.login()
+        REPLAY[0] = first.captured[1]
+        REPLAY[1] = first.captured[0]
+        self.refused("28P01", mutate="replay")
+
+    def test_channel_binding_and_the_plus_mechanism_are_not_offered(self):
+        self.refused("28000", mutate="channel_binding")
+        self.refused("28000", mutate="plus")
+        self.refused("28P01", mutate="bad_binding_flag")
+
+    def test_a_client_that_does_not_answer_the_password_request_with_a_password_is_refused(self):
+        for first in [msg(b"Q", b"select 1\0"), msg(b"X"), b"\0\0\0\0\0", msg(b"p", b""), b"p\xff\xff\xff\xff", msg(b"p", b"SCRAM-SHA-256\0\0\0\0\x05n,,n"), msg(b"p", b"SCRAM-SHA-256\0" + struct.pack("!i", 1000) + b"n,,n=,r=abc"), os.urandom(200)]:
+            s = socket.create_connection(("127.0.0.1", self.pooler.port), 5)
+            body = struct.pack("!i", 196608) + b"user\0" + USER.encode() + b"\0database\0" + DB.encode() + b"\0\0"
+            s.sendall(struct.pack("!i", len(body) + 4) + body)
+            s.recv(4096)
+            s.sendall(first)
+            s.settimeout(1)
+            try:
+                s.recv(4096)
+            except OSError:
+                pass
+            s.close()
+        self.alive()
+
+    def test_a_password_exchange_cut_off_at_any_byte_leaves_the_pooler_answering(self):
+        cnonce = base64.b64encode(os.urandom(18)).decode()
+        first = ("n,,n=,r=" + cnonce).encode()
+        whole = struct.pack("!i", 196608) + b"user\0" + USER.encode() + b"\0database\0" + DB.encode() + b"\0\0"
+        stream = struct.pack("!i", len(whole) + 4) + whole + msg(b"p", b"SCRAM-SHA-256\0" + struct.pack("!i", len(first)) + first)
+        for cut in range(1, len(stream), 3):
+            s = socket.create_connection(("127.0.0.1", self.pooler.port), 5)
+            s.sendall(stream[:cut])
+            time.sleep(0.002)
+            s.close()
+        self.alive()
+
+    def test_clients_that_start_the_exchange_and_stop_do_not_stop_others(self):
+        socks = []
+        for _ in range(50):
+            s = socket.create_connection(("127.0.0.1", self.pooler.port), 5)
+            body = struct.pack("!i", 196608) + b"user\0" + USER.encode() + b"\0database\0" + DB.encode() + b"\0\0"
+            s.sendall(struct.pack("!i", len(body) + 4) + body)
+            socks.append(s)
+        self.alive()
+        for s in socks:
+            s.close()
+        self.alive()
+
+    def test_without_a_client_password_clients_are_not_asked_for_one(self):
+        p = Pooler(1)
+        self.addCleanup(p.stop)
+        c = Client(p.port)
+        self.assertEqual(c.one("select 5"), "5")
+        c.close()
 
 
 if __name__ == "__main__":
