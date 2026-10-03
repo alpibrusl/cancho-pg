@@ -57,7 +57,8 @@ class Client:
             gs2 = "p=tls-server-end-point,,"
         bare = "n=,r=" + cnonce
         first = (gs2 + bare).encode()
-        self.s.sendall(msg(b"p", mech + b"\0" + struct.pack("!i", len(first)) + first))
+        declared = len(first) + (1 if mutate == "bad_length" else 0)
+        self.s.sendall(msg(b"p", mech + b"\0" + struct.pack("!i", declared) + first))
         k, body = self.read_message()
         if k == b"E":
             raise AuthError(self.parse_error(body))
@@ -81,6 +82,8 @@ class Client:
         final = without_proof + ",p=" + base64.b64encode(proof).decode()
         if mutate == "no_proof":
             final = without_proof
+        if mutate == "empty_proof":
+            final = without_proof + ",p="
         self.captured = (cnonce, final)
         if mutate == "replay":
             final = REPLAY[0]
@@ -304,20 +307,20 @@ class TransactionBoundaries(PoolerCase):
         a = self.client()
         a.query("begin")
         a.query("select pg_sleep(0)")
-        order, threads = [], []
+        stamps, threads = {}, []
         cs = [self.client() for _ in range(4)]
         for i, c in enumerate(cs):
             def go(i=i, c=c):
-                c.one("select 1")
-                order.append(i)
+                # What the server says, not when this thread woke up: the one connection runs them one after another, each at least 50 ms.
+                stamps[i] = c.one("select clock_timestamp()::text from (select pg_sleep(0.05)) s")
             t = threading.Thread(target=go)
             t.start()
             threads.append(t)
             time.sleep(0.15)
         a.query("commit")
         for t in threads:
-            t.join(5)
-        self.assertEqual(order, [0, 1, 2, 3])
+            t.join(10)
+        self.assertEqual(sorted(stamps, key=lambda i: stamps[i]), [0, 1, 2, 3])
 
 
 class Pipelining(PoolerCase):
@@ -570,7 +573,13 @@ class Authentication(unittest.TestCase):
         self.alive()
 
     def test_pgbench_logs_in_through_it(self):
-        r = subprocess.run(["pgbench", "-h", "127.0.0.1", "-p", str(self.pooler.port), "-U", USER, "-S", "-c", "4", "-j", "1", "-T", "1", DB], capture_output=True, text=True, env=dict(os.environ, PGPASSWORD=self.PASSWORD))
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".sql", delete=False) as f:
+            f.write("select 1;\n")
+        try:
+            r = subprocess.run(["pgbench", "-n", "-f", f.name, "-h", "127.0.0.1", "-p", str(self.pooler.port), "-U", USER, "-c", "4", "-j", "1", "-T", "1", DB], capture_output=True, text=True, env=dict(os.environ, PGPASSWORD=self.PASSWORD))
+        finally:
+            os.unlink(f.name)
         self.assertIn("number of failed transactions: 0", r.stdout, r.stderr)
 
     def test_a_wrong_password_is_refused_in_the_servers_words(self):
@@ -584,6 +593,25 @@ class Authentication(unittest.TestCase):
     def test_a_final_message_with_another_nonce_or_no_proof_is_refused(self):
         self.refused("28P01", mutate="wrong_nonce")
         self.refused("08P01", mutate="no_proof")
+        self.refused("28P01", mutate="empty_proof")
+
+    def test_a_first_message_whose_declared_length_is_wrong_is_refused(self):
+        self.refused("28000", mutate="bad_length")
+
+    def test_a_message_that_is_not_a_password_message_is_refused_as_one(self):
+        for first in [msg(b"Q", b"select 1\0"), msg(b"X"), msg(b"S")]:
+            s = socket.create_connection(("127.0.0.1", self.pooler.port), 5)
+            body = struct.pack("!i", 196608) + b"user\0" + USER.encode() + b"\0database\0" + DB.encode() + b"\0\0"
+            s.sendall(struct.pack("!i", len(body) + 4) + body)
+            c = Client.__new__(Client)
+            c.s, c.buf = s, b""
+            k, _ = c.read_message()
+            self.assertEqual(k, b"R")
+            s.sendall(first)
+            k, err = c.read_message()
+            self.assertEqual((k, Client.parse_error(err)["C"]), (b"E", "08P01"))
+            s.close()
+        self.alive()
 
     def test_a_proof_replayed_from_another_session_is_refused(self):
         first = self.login()
