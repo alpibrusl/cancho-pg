@@ -752,6 +752,29 @@ class Timeouts(unittest.TestCase):
             self.assertEqual(a.one("select 1"), "1")
         a.query("commit")
 
+    def test_a_query_that_runs_longer_than_the_idle_timeout_is_not_idle(self):
+        p = Pooler(1, timeouts=(60000, 500, 120000))
+        self.addCleanup(p.stop)
+        a = Client(p.port)
+        a.query("begin")
+        # The previous answer left a deadline half a second away; this query takes more than that, and the client is waiting for the server, not the other way round.
+        a.s.settimeout(5)
+        rows, errors, tags, statuses, _ = a.query("select pg_sleep(1.2)")
+        self.assertEqual((errors, statuses), ([], ["T"]))
+        a.query("commit")
+
+    def test_a_client_that_waited_for_a_connection_is_not_cut_off_while_it_runs(self):
+        p = Pooler(1, timeouts=(60000, 0, 600))
+        self.addCleanup(p.stop)
+        a, b = Client(p.port), Client(p.port)
+        a.query("begin")
+        b.raw(msg(b"Q", b"select pg_sleep(1.2), 1\0"))
+        time.sleep(0.3)
+        a.query("commit")  # b is given the connection at 0.3 s of its 0.6 s wait
+        b.s.settimeout(5)
+        rows, errors, tags, statuses, _ = b.until_ready()
+        self.assertEqual((errors, statuses), ([], ["I"]))
+
     def test_a_client_that_waits_too_long_for_a_connection_is_told_and_the_holder_is_not_touched(self):
         p = Pooler(1, timeouts=(60000, 0, 500))
         self.addCleanup(p.stop)
