@@ -27,7 +27,7 @@ so the compiler revision is part of the contract; this is the one CI builds and 
 
 ```
 git clone https://github.com/alpibrusl/lex-sys
-(cd lex-sys && git checkout bbeb75f6918105db6e49ec7c642f56009a911b8f && cargo build --release -p lex-sys)
+(cd lex-sys && git checkout 2704d427224c789fa15e0e5ded4318fafceb5bc5 && cargo build --release -p lex-sys)
 export PATH=$PWD/lex-sys/target/release:$PATH
 
 git clone https://github.com/alpibrusl/lexsys-pg && cd lexsys-pg
