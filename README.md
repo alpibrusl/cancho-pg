@@ -326,3 +326,18 @@ against a `postgres:16` service, and checks that the checked-in package store is
 ## Licence
 
 [EUPL-1.2](LICENSE).
+
+## A connection pooler
+
+`pooler/pooler.ls` is a PostgreSQL connection pooler in the PgBouncer's `transaction` mode, written in lex-sys on the same loop as the cache: a few logged-in server connections
+are lent to many clients one transaction at a time, clients are asked for a password with SCRAM-SHA-256 if one is given, and a named prepared statement is refused in the server's
+words (it would outlive the transaction on a connection the client will not see again).
+
+```
+lex-sys build --std pooler/pooler.ls pooler/frame.ls pooler/scram.ls src/pg.ls -o pooler-bin
+./pooler-bin <listen port> <server host> <server port> <user> <database> <server password | -> <pool size> [<client password>]
+```
+
+Against PgBouncer 1.22 it measures at parity (within about ten percent either way) on throughput and below it on CPU per transaction. What it does and does not do, and
+every measurement with its caveats, is [`docs/pooler.md`](docs/pooler.md).
+

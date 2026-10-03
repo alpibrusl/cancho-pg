@@ -1,8 +1,8 @@
 # A PostgreSQL connection pooler in lex-sys
 
-> **Status: P0 and P1 built and measured (sections 7 and 8); P2-P3 designed, not built.** Sections 1-6 were written before the code
+> **Status: P0, P1 and P2 built (sections 7, 8 and 9); P3 designed, not built.** Sections 1-6 were written before the code
 > and say what is built, in what order, what each step must show to be kept, and what would make the whole project not
-> worth continuing, so that the gate could not move to fit the result. Sections 7 and 8 are what P0 and P1 showed.
+> worth continuing, so that the gate could not move to fit the result. Sections 7, 8 and 9 are what P0, P1 and P2 showed.
 
 ## 1. What it is, and why it is a candidate at all
 
@@ -247,3 +247,26 @@ not explain P0's gap, where both had a backend per client and PostgreSQL still s
 
 **Decision.** P1 is kept. The stop conditions of section 5 did not fire: transaction boundaries needed no SQL parsing, the CPU per transaction is below PgBouncer's, and no client-reachable crash survived the mutants and the hostile-bytes tests. What is between this and something to run in front of a database is P2 (clients that are
 authenticated) and P3 (cancel, timeouts, limits, a connection that is replaced without waiting).
+
+## 9. P2, built: clients are asked for a password
+
+`pooler/scram.ls` and the startup state machine in `pooler/pooler.ls`. Given a client password as the last argument (`pooler <listen> <host> <port> <user> <database> <server password | -> <pool size> <client password>`), the pooler answers a startup with
+`AuthenticationSASL` and runs SCRAM-SHA-256 (RFC 5802, 7677) against the client before the client is told it is in; without one (or `-`) clients are trusted, as in P1. The pooler never holds the password after start: it derives the salt, `StoredKey` and `ServerKey` once (16 random bytes of salt,
+4096 iterations, as PostgreSQL does) and a login is two HMACs, a SHA-256 and a constant-time comparison. The client's proof is checked, the exchange's nonces are checked (the final message's must be the one the pooler made, so a captured final message is useless in another session even with the same client nonce),
+the channel-binding flag is checked, and the server signature the client is sent is the one only a holder of the password can make.
+
+It works over plain slices, with no heap, because the request loop has none; the random bytes for nonces come from a pool the main loop (the one holding `/dev/urandom`) keeps topped up.
+
+**Checked.**
+
+* `tests/scram_test.ls`: the RFC 7677 exchange (the proof is accepted, the server signature is the RFC's); the heap-free HMAC and base64 against the driver's own at every key length from 0 to 64 and every message length in steps of 13 up to 200, and base64 at every length to 40; each of the 44 characters of the proof changed in turn, another message,
+  another password and another iteration count refused, and no signature written for a refusal. 9 mutants killed (one, a comparison that stops at the first difference, cannot be told apart by a test and is left to review).
+* `pooler/tests/pooler_e2e.py`, class `Authentication` (14 tests): **`libpq` (`psql`, `pgbench`) logs in** with the right password (it checks the server signature too, so this is the independent oracle) and not with a wrong or no password; an independent Python SCRAM client does the same and verifies the signature; a wrong password, a proof with one bit changed, another nonce, no proof,
+  an empty proof, a proof replayed from another session with the same client nonce, channel binding requested, the `-PLUS` mechanism, a bad channel-binding flag, a first message with a wrong declared length, and messages that are not password messages (each refused with the SQLSTATE PostgreSQL would use: `28P01`, `28000`, `08P01`); an exchange cut off at every third byte, 50 half-finished exchanges, and
+  garbage in the place of the password leave the pooler answering; without a client password nobody is asked for one. 13 mutants of the authentication code were run and **the first version of the tests let three survive** (the message type not checked as a password message, the proof search stopping one byte early so an empty proof was a "malformed message"
+  instead of a wrong password, and the declared length not checked): each now has a test, the error codes are asserted where the mutant changed only the code, and all 13 are killed. A fourth, a pattern that did not match after formatting, was rewritten and killed.
+* A test that was wrong, found by running the whole suite instead of one class: "waiting clients are served in the order they came" recorded the order in which Python threads woke up, which two answers a fraction of a millisecond apart can swap (it failed two runs in eight when the database was `postgres`). It now orders the answers by the server's own `clock_timestamp()`, and three full runs of 39 tests pass.
+
+**What it costs and what it does not do.** The login is one extra round trip pair and two HMACs; the pooler's request path is untouched after it. **The password is a command-line argument**, which any user on the machine can read from the process list: it is for tests and for a network of one. Reading it from a file needs
+a file capability the pooler does not hold (`lex-sys authority` shows exactly what it holds, which is the point), and that is the next thing to design, not done. One user, one secret: the client password is separate from the password the pooler logs in to the server with, and there is no per-user list (a second pool is a second process). The password is used as the bytes given, not run through SASLprep (so an ASCII
+password is correct and a non-ASCII one that needs normalising is not). Cleartext and MD5 authentication are not offered, only SCRAM; and an unauthenticated client holds one of the 200 client slots until it is cut off, because there are no timeouts yet (P3): fifty half-open exchanges are survived, 200 would fill the slots.

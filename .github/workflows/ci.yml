@@ -85,11 +85,15 @@ jobs:
         working-directory: pg
         run: ../lex-sys/target/release/lex-sys test tests/frame_test.ls pooler/frame.ls --std
 
+      - name: Pooler SCRAM tests (RFC 7677, against the driver's HMAC and base64 at every length)
+        working-directory: pg
+        run: ../lex-sys/target/release/lex-sys test tests/scram_test.ls pooler/scram.ls src/pg.ls --std
+
       - name: Pooler end-to-end tests (P1)
         working-directory: pg
         run: |
           mkdir -p build
-          ../lex-sys/target/release/lex-sys build --std pooler/pooler.ls pooler/frame.ls src/pg.ls -o build/pooler
+          ../lex-sys/target/release/lex-sys build --std pooler/pooler.ls pooler/frame.ls pooler/scram.ls src/pg.ls -o build/pooler
           eval "$(cat /tmp/pg.env.sh)"
           PGDATABASE=postgres python3 pooler/tests/pooler_e2e.py build/pooler
 
