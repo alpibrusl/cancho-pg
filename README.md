@@ -1,5 +1,7 @@
 # lexsys-pg
 
+[![ci](https://github.com/alpibrusl/lexsys-pg/actions/workflows/ci.yml/badge.svg)](https://github.com/alpibrusl/lexsys-pg/actions/workflows/ci.yml)
+
 A PostgreSQL client for [lex-sys](https://github.com/alpibrusl/lex-sys), written in lex-sys:
 the v3 frontend/backend wire protocol over a TCP connection. **No C and no foreign call** --
 `lex-sys authority` on a program using it reports the network (`net_out`, narrowable to one
@@ -10,27 +12,35 @@ It is a *driver*: it moves SQL and rows. What sits on top of it (typed queries g
 `.sql` files, migrations, table-driven CRUD) and why that is the right shape for a language
 without reflection is [`docs/design.md`](docs/design.md) §6.
 
-> **Status: slices 1-4 built** -- startup, trust, cleartext-password and **SCRAM-SHA-256** login
-> (the default of every PostgreSQL since 14), simple queries, extended queries with parameters,
-> `describe`, prepared statements, and a generator of typed query functions (`tools/pgen.ls`, [below](#typed-queries-pgen)); checked against
-> PostgreSQL 16 and the stock `psql` client. **Not yet:** MD5 login
-> (answered with status 5), TLS, binary result formats, `COPY`. The helpers of layer 3 wait for the
-> server; **`pg.pool`** ([below](#a-pool-that-does-not-wait)) is the connection that does not, and
-> [`docs/nonblocking.md`](docs/nonblocking.md) has what it measured. [`docs/design.md`](docs/design.md)
-> §4-§5 says why the blocking ones are what they are.
+## Status
+
+**Slices 1 to 4 built:** startup, trust, cleartext-password and **SCRAM-SHA-256** login
+(the default of every PostgreSQL since 14), simple queries, extended queries with parameters,
+`describe`, prepared statements, and a generator of typed query functions (`tools/pgen.ls`, [below](#typed-queries-pgen)); checked against
+PostgreSQL 16 and the stock `psql` client. **Not yet:** MD5 login
+(answered with status 5), TLS, binary result formats, `COPY`. The helpers of layer 3 wait for the
+server; **`pg.pool`** ([below](#a-pool-that-does-not-wait)) is the connection that does not, and
+[`docs/nonblocking.md`](docs/nonblocking.md) has what it measured. [`docs/design.md`](docs/design.md)
+§4-§5 says why the blocking ones are what they are.
+
+## Requirements
+
+- The **lex-sys** compiler at the revision this repository's CI builds with (below). A package store records no hash of the `std`
+  it was published against, so the compiler revision is part of the contract.
+- Rust, to build that compiler (its `rust-toolchain.toml` pins the toolchain).
+- A **PostgreSQL** to talk to (any version; the tests use 16), and for the tests `docker` and the stock `psql` client.
 
 ## Quick start
 
-You need the `lex-sys` compiler (Rust; the toolchain is pinned by its `rust-toolchain.toml`) and
-a PostgreSQL to talk to. A package store records no hash of the `std` it was published against,
-so the compiler revision is part of the contract; this is the one CI builds and tests with:
+Get the compiler at the revision CI builds and tests with (read from `ci.yml`, so this text cannot drift from it), and a PostgreSQL:
 
 ```
 git clone https://github.com/alpibrusl/lex-sys
-(cd lex-sys && git checkout 2704d427224c789fa15e0e5ded4318fafceb5bc5 && cargo build --release -p lex-sys)
-export PATH=$PWD/lex-sys/target/release:$PATH
-
 git clone https://github.com/alpibrusl/lexsys-pg && cd lexsys-pg
+REV=$(sed -n 's/^ *LEX_SYS_REV: *//p' .github/workflows/ci.yml)
+(cd ../lex-sys && git checkout "$REV" && cargo build --release -p lex-sys)
+export PATH=$PWD/../lex-sys/target/release:$PATH
+
 docker run --rm -d -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16     # or any server; trust is simplest
 
 lex-sys build --std examples/psql.ls src/pg.ls -o psql
@@ -280,6 +290,20 @@ whose normalised form differs from what was typed (a non-breaking space, a compa
 logged in with here. ASCII and already-normalised text are, and a password with accents and an emoji is one
 of the end-to-end tests. Channel binding (`SCRAM-SHA-256-PLUS`) needs TLS, which does not exist yet.
 
+## A connection pooler
+
+`pooler/pooler.ls` is a PostgreSQL connection pooler in the PgBouncer's `transaction` mode, written in lex-sys on the same loop as the cache: a few logged-in server connections
+are lent to many clients one transaction at a time, clients are asked for a password with SCRAM-SHA-256 if one is given, and a named prepared statement is refused in the server's
+words (it would outlive the transaction on a connection the client will not see again).
+
+```
+lex-sys build --std pooler/pooler.ls pooler/frame.ls pooler/scram.ls src/pg.ls -o pooler-bin
+./pooler-bin <listen port> <server host> <server port> <user> <database> <server password | -> <pool size> [<client password>]
+```
+
+Against PgBouncer 1.22 it measures at parity (within about ten percent either way) on throughput and below it on CPU per transaction. What it does and does not do, and
+every measurement with its caveats, is [`docs/pooler.md`](docs/pooler.md).
+
 ## Tests
 
 ```
@@ -323,21 +347,36 @@ tests catch, since the scenario has no negative numbers.
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds the pinned compiler and runs all of it
 against a `postgres:16` service, and checks that the checked-in package store is the store of `src/pg.ls`.
 
+## Documentation
+
+- [`docs/design.md`](docs/design.md): the layers (driver, typed queries, helpers), why the blocking calls are what they are, and
+  what each slice found.
+- [`docs/nonblocking.md`](docs/nonblocking.md): the non-blocking connection and `pg.pool`, with what they measured.
+- [`docs/pooler.md`](docs/pooler.md): the connection pooler, what it does and does not do, and every measurement with its caveats.
+
+## Layout
+
+```
+src/pg.ls          the driver: login (trust, cleartext, SCRAM-SHA-256), simple and extended queries, describe, prepared statements
+src/pool.ls        pg.pool: a few non-blocking connections, pipelined, for a loop that must not wait
+tools/pgen.ls      the generator of typed query functions from .sql files
+examples/          psql.ls and describe.ls: small command-line clients
+pooler/            the connection pooler (PgBouncer's transaction mode)
+tests/             unit tests (lex-sys), end-to-end tests against PostgreSQL 16 and a mock server (Python)
+docs/              design, non-blocking, pooler
+```
+
+## Limitations
+
+Not yet: MD5 login (answered with status 5), TLS (so no channel binding), binary result formats, `COPY`. The password is not
+SASLprep-normalised. The blocking helpers wait for the server; `pg.pool` is the connection that does not.
+
+## Contributing
+
+Every change goes through what CI runs: the unit tests, `lex-sys fmt --check`, the end-to-end tests against a `postgres:16`
+service, the pooler tests, and the check that the published package stores are the stores of `src/pg.ls` and `src/pool.ls`. Design
+before code, in `docs/`, with claims measured; a claim that turns out false is corrected in place.
+
 ## Licence
 
 [EUPL-1.2](LICENSE).
-
-## A connection pooler
-
-`pooler/pooler.ls` is a PostgreSQL connection pooler in the PgBouncer's `transaction` mode, written in lex-sys on the same loop as the cache: a few logged-in server connections
-are lent to many clients one transaction at a time, clients are asked for a password with SCRAM-SHA-256 if one is given, and a named prepared statement is refused in the server's
-words (it would outlive the transaction on a connection the client will not see again).
-
-```
-lex-sys build --std pooler/pooler.ls pooler/frame.ls pooler/scram.ls src/pg.ls -o pooler-bin
-./pooler-bin <listen port> <server host> <server port> <user> <database> <server password | -> <pool size> [<client password>]
-```
-
-Against PgBouncer 1.22 it measures at parity (within about ten percent either way) on throughput and below it on CPU per transaction. What it does and does not do, and
-every measurement with its caveats, is [`docs/pooler.md`](docs/pooler.md).
-
