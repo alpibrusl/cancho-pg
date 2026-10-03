@@ -11,7 +11,11 @@ import scram;
 
 // `pooler` -- slice P1 of the connection pooler (`docs/pooler.md`): transaction pooling.
 //
-//     pooler <listen port> <server host> <server port> <user> <database> <password | -> <pool size> [<client password | ->]
+//     pooler <listen port> <server host> <server port> <user> <database> <password | -> <pool size> [<client password | -> [<login ms> [<idle in transaction ms> [<queue wait ms>]]]]
+//
+// Timeouts, in milliseconds, 0 for none: a client that has not finished its startup and login in `login` ms (default 60,000), one that holds a server connection
+// in a transaction and says nothing for `idle in transaction` ms (default none), one that waits for a server connection for `queue wait` ms (default 120,000) is told so and
+// cut off. `CancelRequest` is mapped: a client's `BackendKeyData` is the pooler's own, and a cancel that quotes it is sent to whichever server connection the client holds then.
 //
 // The password is the one the pooler logs in to the server with. A client password makes the pooler ask its clients for it (SCRAM-SHA-256, as PostgreSQL does: the
 // pooler holds the salted keys, never the password, and the exchange is the one `libpq` speaks); without it, or with `-`, clients are trusted, which is for a
@@ -77,6 +81,8 @@ fn queue_size() -> [] int {
 //     12  a client: its number
 //     13  a server: the scan of what it sends (`frame.scan_size()` ints). A client in SCRAM: the length of its first message, and of the pooler's answer
 //     14  (see 13)
+//     15  a client: when it is cut off if nothing happens (ms; 0: never)   16  what that is for (1 login, 2 idle in a transaction, 3 waiting for a server)   17  its cancel secret
+//     19, 20  a server: its own process id and secret, for a cancel
 fn stride() -> [] int {
     return 24;
 }
@@ -86,6 +92,7 @@ fn stride() -> [] int {
 //     0  servers idle      1  the queue's head   2  clients queued   3  bytes of parameters to replay   4  the next client number
 //     5  servers in the pool   6  the size asked for   7  the server's port   8  user's length   9  password's   10  database's   11  host's
 //     12  the client password's length (0: clients are trusted)   13  random bytes held   14  how many of them are used
+//     15  the time now (ms)   16  login timeout   17  idle-in-transaction timeout   18  queue-wait timeout   19  cancels waiting to be sent
 fn meta_size() -> [] int {
     return 24;
 }
@@ -115,6 +122,8 @@ res struct Core {
     keys: Box[[byte]],
     rand: Box[[byte]],
     authbuf: Box[[byte]],
+    // Cancels to send to the server: (its process id, its secret) pairs.
+    cancels: Box[[int]],
 }
 
 // ---------------------------------------------------------------------
@@ -281,6 +290,10 @@ fn queue_push[&c](core: &!c Core, k: int) -> [] int {
         q[(mt[1] + mt[2]) % len(q)] = k;
         mt[2] = mt[2] + 1;
         st[stride() * k + 11] = 1;
+        if mt[18] > 0 {
+            st[stride() * k + 15] = mt[15] + mt[18];
+            st[stride() * k + 16] = 3;
+        }
     }
     return 0;
 }
@@ -306,6 +319,7 @@ fn queue_pop[&c](core: &!c Core) -> [] int {
 fn assign[&t, &x](tab: &!t conns.Table, core: &!x Core, c: int, s: int) -> [poll] int {
     let st = contents(core.state);
     st[stride() * c + 2] = s;
+    st[stride() * c + 15] = 0;
     st[stride() * s + 2] = c;
     st[stride() * s + 7] = 0;
     var i = 0;
@@ -480,11 +494,12 @@ fn send_hello[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int, lead: int) -
     sc[o] = byte_of('K');
     put_be32(sc, o + 1, 12);
     put_be32(sc, o + 5, st[p + 12]);
-    put_be32(sc, o + 9, 0);
+    put_be32(sc, o + 9, st[p + 17]);
     o = o + 13;
     o = put_ready(sc, o, 73);
     send_to(tab, core, k, sc[0..o]);
     st[p + 7] = 1;
+    st[p + 15] = 0;
     return 0;
 }
 
@@ -693,6 +708,22 @@ fn process[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [conn_write,
                     send_to(tab, core, k, sc[0..1]);
                     used = used + size;
                 } else if code == 80877102 {
+                    // CancelRequest: the process id and secret this pooler gave a client; if that client holds a server connection, its own is sent a cancel (by the loop).
+                    if size == 16 {
+                        let pid = be32(view, 8);
+                        let secret = be32(view, 12);
+                        var j = 0;
+                        while j < max_slots() {
+                            let q = stride() * j;
+                            if st[q] == 1 && st[q + 1] == 1 && st[q + 12] == pid && st[q + 17] == secret && st[q + 2] >= 0 && mt[19] < 16 {
+                                let sv = stride() * st[q + 2];
+                                contents(core.cancels)[2 * mt[19]] = st[sv + 19];
+                                contents(core.cancels)[2 * mt[19] + 1] = st[sv + 20];
+                                mt[19] = mt[19] + 1;
+                            }
+                            j = j + 1;
+                        }
+                    }
                     finish_client(tab, core, k);
                     going = false;
                 } else if code / 65536 != 3 {
@@ -773,6 +804,7 @@ fn process[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [conn_write,
                         going = false;
                     } else {
                         batch = batch + n;
+                        st[p + 15] = 0;
                         st[p + 10] = st[p + 10] + owed;
                         st[p + 8] = rest;
                         used = used + n;
@@ -907,6 +939,10 @@ fn from_server[&t, &c](tab: &!t conns.Table, core: &!c Core, s: int) -> [conn_re
                         st[p + 18] = 0;
                         if st[q + 10] == 0 && status == 73 {
                             give_back(tab, core, s);
+                        } else if st[q + 10] == 0 && mt_idle_tx(core) > 0 {
+                            // In a transaction and owed nothing: it is the client's move.
+                            st[q + 15] = contents(core.meta)[15] + mt_idle_tx(core);
+                            st[q + 16] = 2;
                         }
                     }
                     settle(tab, core, k);
@@ -1024,6 +1060,18 @@ fn accept_all[&h, &l, &c](heap: &!h Heap, conn: conns.Table, listener: &!l Liste
                         st[p + 5] = 1;
                         mt[4] = mt[4] + 1;
                         st[p + 12] = mt[4];
+                        // The secret a cancel for this client must quote: 31 random bits.
+                        let rn = contents(core.rand);
+                        if mt[13] - mt[14] >= 4 {
+                            st[p + 17] = (int_of(rn[mt[14]]) * 16777216 + int_of(rn[mt[14] + 1]) * 65536 + int_of(rn[mt[14] + 2]) * 256 + int_of(rn[mt[14] + 3])) % 2147483648;
+                            mt[14] = mt[14] + 4;
+                        } else {
+                            st[p + 17] = (mt[4] * 40503 + 12345) % 2147483648;
+                        }
+                        if mt[16] > 0 {
+                            st[p + 15] = mt[15] + mt[16];
+                            st[p + 16] = 1;
+                        }
                         borrow mut table as &!ct in {
                             if conns.nonblocking(ct, slot) != 0 || conns.nodelay(ct, slot) != 0 || conns.watch(ct, core.poller, slot, slot + 1, 1) != 0 {
                                 shut(ct, core, slot);
@@ -1050,6 +1098,76 @@ fn accept_all[&h, &l, &c](heap: &!h Heap, conn: conns.Table, listener: &!l Liste
 // ---------------------------------------------------------------------
 // The pool
 // ---------------------------------------------------------------------
+
+// The idle-in-transaction timeout (ms; 0: none).
+fn mt_idle_tx[&c](core: &!c Core) -> [] int {
+    return contents(core.meta)[17];
+}
+
+// Cut off the clients whose time has run out, each with the error PostgreSQL would give for it. A client that holds a server connection in a transaction takes it with it
+// (finish_client drops a server a client was on, because what state it left it in is not known).
+fn expire[&t, &c](tab: &!t conns.Table, core: &!c Core) -> [conn_write, poll] int {
+    let st = contents(core.state);
+    let mt = contents(core.meta);
+    let sc = contents(core.scratch);
+    var k = 0;
+    while k < max_slots() {
+        let p = stride() * k;
+        if st[p] == 1 && st[p + 1] == 1 && st[p + 15] != 0 && mt[15] >= st[p + 15] {
+            var o = 0;
+            if st[p + 16] == 1 {
+                o = put_error(sc, 0, "FATAL", "08P01", "login timeout: the startup was not completed in time");
+            } else if st[p + 16] == 2 {
+                o = put_error(sc, 0, "FATAL", "25P03", "terminating connection due to idle-in-transaction timeout");
+            } else {
+                o = put_error(sc, 0, "FATAL", "53000", "no server connection became free in time");
+            }
+            st[p + 15] = 0;
+            send_to(tab, core, k, sc[0..o]);
+            finish_client(tab, core, k);
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// Send the cancels that clients asked for to the server, each on a connection of its own, as a client library does: 16 bytes, no answer.
+fn send_cancels[&n, &c](net: &n Net(""), core: &!c Core) -> [net_out(""), conn_write] int {
+    let mt = contents(core.meta);
+    let cn = contents(core.cancels);
+    let cf = contents(core.config);
+    var i = 0;
+    while i < mt[19] {
+        match tcp_connect(net, cf[512..512 + mt[11]], mt[7]) {
+            Dialed::Ok(c) => {
+                var conn = c;
+                region a {
+                    let m = alloc_slice[a](16, byte_of(0));
+                    put_be32(m, 0, 16);
+                    put_be32(m, 4, 80877102);
+                    put_be32(m, 8, cn[2 * i]);
+                    put_be32(m, 12, cn[2 * i + 1]);
+                    borrow mut conn as &!ch in {
+                        match conn_write(ch, m) {
+                            Sent::Wrote(w) => {
+                            }
+                            Sent::Again => {
+                            }
+                            Sent::Failed(e) => {
+                            }
+                        }
+                    }
+                }
+                conn_close(conn);
+            }
+            Dialed::Failed(e) => {
+            }
+        }
+        i = i + 1;
+    }
+    mt[19] = 0;
+    return 0;
+}
 
 // An unpredictable client nonce for SCRAM: 18 bytes from the kernel, as base64 (as `examples/psql.ls`).
 fn fresh_nonce[&h, &f](heap: &!h Heap, fs: &f Fs("/dev/urandom")) -> [heap, fs_read("/dev/urandom")] buffer.Buffer {
@@ -1122,10 +1240,24 @@ fn refill[&h, &n, &z, &c](heap: &!h Heap, conn: conns.Table, net: &n Net(""), rn
                 var server = c;
                 let nonce = fresh_nonce(heap, rng);
                 var status = 1;
+                var key_pid = 0;
+                var key_secret = 0;
                 borrow nonce as &nr in {
                     borrow mut server as &!sh in {
                         let (reply, s) = pg.login(heap, sh, cf[0..mt[8]], cf[128..128 + mt[9]], cf[384..384 + mt[10]], buffer.bytes(nr));
                         status = s;
+                        // The process id and secret this connection has on the server: what a cancel for whoever is using it must quote.
+                        borrow reply as &kr in {
+                            let km = buffer.bytes(kr);
+                            var ka = 0;
+                            while pg.size(km, ka) > 0 {
+                                if pg.kind(km, ka) == 75 && pg.size(km, ka) >= 13 {
+                                    key_pid = be32(km, ka + 5);
+                                    key_secret = be32(km, ka + 9);
+                                }
+                                ka = ka + pg.size(km, ka);
+                            }
+                        }
                         if s == 0 && mt[3] == 0 {
                             borrow reply as &rb in {
                                 keep_parameters(core, buffer.bytes(rb));
@@ -1152,6 +1284,8 @@ fn refill[&h, &n, &z, &c](heap: &!h Heap, conn: conns.Table, net: &n Net(""), rn
                         st[p + 2] = 0 - 1;
                         st[p + 5] = 1;
                         st[p + 7] = 1;
+                        st[p + 19] = key_pid;
+                        st[p + 20] = key_secret;
                         borrow mut table as &!ct in {
                             if conns.nonblocking(ct, slot) != 0 || conns.nodelay(ct, slot) != 0 || conns.watch(ct, core.poller, slot, slot + 1, 1) != 0 {
                                 shut(ct, core, slot);
@@ -1176,7 +1310,7 @@ fn refill[&h, &n, &z, &c](heap: &!h Heap, conn: conns.Table, net: &n Net(""), rn
     return table;
 }
 
-fn run[&h, &l, &n, &z, &g](heap: &!h Heap, listener: &!l Listener, net: &n Net(""), rng: &z Fs("/dev/urandom"), args: &g Args) -> [heap, conn_accept, conn_read, conn_write, net_out(""), fs_read("/dev/urandom"), poll, args] int {
+fn run[&h, &l, &n, &z, &g, &k](heap: &!h Heap, listener: &!l Listener, net: &n Net(""), rng: &z Fs("/dev/urandom"), args: &g Args, clock: &k Clock) -> [heap, conn_accept, conn_read, conn_write, net_out(""), fs_read("/dev/urandom"), poll, args, clock] int {
     match poller_new() {
         Polling::Ok(p) => {
             var poller = p;
@@ -1184,7 +1318,7 @@ fn run[&h, &l, &n, &z, &g](heap: &!h Heap, listener: &!l Listener, net: &n Net("
                 poller_add_listener(pw, listener, 0);
             }
             let slots = max_slots() + 2;
-            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * slots, 0), meta: box_slice(heap, meta_size(), 0), idle: box_slice(heap, max_pool() + 2, 0), queue: box_slice(heap, max_clients() + 2, 0), inbuf: box_slice(heap, slots * input_size(), byte_of(0)), rbuf: box_slice(heap, chunk(), byte_of(0)), pends: box_slice(heap, slots * queue_size(), byte_of(0)), hello: box_slice(heap, 4096, byte_of(0)), scratch: box_slice(heap, 4096, byte_of(0)), config: box_slice(heap, config_size(), byte_of(0)), keys: box_slice(heap, 80, byte_of(0)), rand: box_slice(heap, 4096, byte_of(0)), authbuf: box_slice(heap, slots * auth_size(), byte_of(0)) };
+            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * slots, 0), meta: box_slice(heap, meta_size(), 0), idle: box_slice(heap, max_pool() + 2, 0), queue: box_slice(heap, max_clients() + 2, 0), inbuf: box_slice(heap, slots * input_size(), byte_of(0)), rbuf: box_slice(heap, chunk(), byte_of(0)), pends: box_slice(heap, slots * queue_size(), byte_of(0)), hello: box_slice(heap, 4096, byte_of(0)), scratch: box_slice(heap, 4096, byte_of(0)), config: box_slice(heap, config_size(), byte_of(0)), keys: box_slice(heap, 80, byte_of(0)), rand: box_slice(heap, 4096, byte_of(0)), authbuf: box_slice(heap, slots * auth_size(), byte_of(0)), cancels: box_slice(heap, 32, 0) };
             borrow mut core as &!cw in {
                 // The configuration: where the server is, who to be, how many connections.
                 let cf = contents(cw.config);
@@ -1232,6 +1366,19 @@ fn run[&h, &l, &n, &z, &g](heap: &!h Heap, listener: &!l Listener, net: &n Net("
                     }
                     mt[12] = i;
                 }
+                // The timeouts: the login, idle in a transaction, waiting for a server connection.
+                mt[16] = 60000;
+                mt[17] = 0;
+                mt[18] = 120000;
+                if arg_count(args) > 9 {
+                    mt[16] = number_of(arg(args, 9));
+                }
+                if arg_count(args) > 10 {
+                    mt[17] = number_of(arg(args, 10));
+                }
+                if arg_count(args) > 11 {
+                    mt[18] = number_of(arg(args, 11));
+                }
             }
             borrow mut core as &!cw in {
                 top_up(cw, rng);
@@ -1270,10 +1417,14 @@ fn run[&h, &l, &n, &z, &g](heap: &!h Heap, listener: &!l Listener, net: &n Net("
                 var ready = 0 - 1;
                 borrow mut core as &!cw in {
                     var wait_ms = 1000;
+                    if contents(cw.meta)[16] > 0 || contents(cw.meta)[17] > 0 || contents(cw.meta)[18] > 0 {
+                        wait_ms = 100;
+                    }
                     if contents(cw.meta)[5] < contents(cw.meta)[6] {
                         wait_ms = 200;
                     }
                     ready = poller_wait(cw.poller, contents(cw.events), wait_ms);
+                    contents(cw.meta)[15] = clock_ms(clock);
                 }
                 var j = 0;
                 while j < ready {
@@ -1298,9 +1449,15 @@ fn run[&h, &l, &n, &z, &g](heap: &!h Heap, listener: &!l Listener, net: &n Net("
                     }
                     j = j + 1;
                 }
+                borrow mut tab as &!tw in {
+                    borrow mut core as &!cw in {
+                        expire(tw, cw);
+                        send_cancels(net, cw);
+                    }
+                }
             }
             conns.drop(heap, tab);
-            let Core { poller, events, state, meta, idle, queue, inbuf, rbuf, pends, hello, scratch, config, keys, rand, authbuf } = core;
+            let Core { poller, events, state, meta, idle, queue, inbuf, rbuf, pends, hello, scratch, config, keys, rand, authbuf, cancels } = core;
             poller_close(poller);
             unbox_slice(heap, events);
             unbox_slice(heap, state);
@@ -1316,6 +1473,7 @@ fn run[&h, &l, &n, &z, &g](heap: &!h Heap, listener: &!l Listener, net: &n Net("
             unbox_slice(heap, keys);
             unbox_slice(heap, rand);
             unbox_slice(heap, authbuf);
+            unbox_slice(heap, cancels);
             return 0;
         }
         Polling::Failed(e) => {
@@ -1344,13 +1502,12 @@ fn number_of[&t](text: &t [byte]) -> [] int {
 fn main(world: World) -> [] int {
     let Split { io, ffi, fs, heap, args, net, clock } = split(world);
     release(ffi);
-    release(clock);
     let rng = narrow(fs, "/dev/urandom");
     var listen_port = 0 - 1;
     var pool = 0 - 1;
     var server_port = 0 - 1;
     borrow args as &g in {
-        if arg_count(g) == 8 || arg_count(g) == 9 {
+        if arg_count(g) >= 8 && arg_count(g) <= 12 {
             listen_port = number_of(arg(g, 1));
             server_port = number_of(arg(g, 3));
             pool = number_of(arg(g, 7));
@@ -1368,7 +1525,9 @@ fn main(world: World) -> [] int {
                             borrow mut listener as &!lh in {
                                 listener_nonblocking(lh);
                                 borrow mut heap as &!h in {
-                                    status = run(h, lh, nn, z, g);
+                                    borrow clock as &ck in {
+                                        status = run(h, lh, nn, z, g, ck);
+                                    }
                                 }
                             }
                             listener_close(listener);
@@ -1382,6 +1541,7 @@ fn main(world: World) -> [] int {
         }
     }
     release(rng);
+    release(clock);
     release(net);
     release(args);
     release(io);

@@ -1,8 +1,8 @@
 # A PostgreSQL connection pooler in lex-sys
 
-> **Status: P0, P1 and P2 built (sections 7, 8 and 9); P3 designed, not built.** Sections 1-6 were written before the code
+> **Status: P0 to P3 built (sections 7 to 10); what is still not here is in section 10.** Sections 1-6 were written before the code
 > and say what is built, in what order, what each step must show to be kept, and what would make the whole project not
-> worth continuing, so that the gate could not move to fit the result. Sections 7, 8 and 9 are what P0, P1 and P2 showed.
+> worth continuing, so that the gate could not move to fit the result. Sections 7 to 10 are what P0 to P3 showed.
 
 ## 1. What it is, and why it is a candidate at all
 
@@ -270,3 +270,31 @@ It works over plain slices, with no heap, because the request loop has none; the
 **What it costs and what it does not do.** The login is one extra round trip pair and two HMACs; the pooler's request path is untouched after it. **The password is a command-line argument**, which any user on the machine can read from the process list: it is for tests and for a network of one. Reading it from a file needs
 a file capability the pooler does not hold (`lex-sys authority` shows exactly what it holds, which is the point), and that is the next thing to design, not done. One user, one secret: the client password is separate from the password the pooler logs in to the server with, and there is no per-user list (a second pool is a second process). The password is used as the bytes given, not run through SASLprep (so an ASCII
 password is correct and a non-ASCII one that needs normalising is not). Cleartext and MD5 authentication are not offered, only SCRAM; and an unauthenticated client holds one of the 200 client slots until it is cut off, because there are no timeouts yet (P3): fifty half-open exchanges are survived, 200 would fill the slots.
+
+## 10. P3, built: timeouts and cancel
+
+`pooler <listen> <host> <port> <user> <database> <server password | -> <pool size> [<client password | -> [<login ms> [<idle in transaction ms> [<queue wait ms>]]]]`.
+
+**Timeouts** (milliseconds, 0 for none), each ending in the PostgreSQL error for it and the client cut off: a client that has not finished its startup and login in `login` ms (default 60,000; this is what closes the half-open-login hole of section 9: a client that connects and
+says nothing, or stops half way through the password exchange, is cut and its slot freed), one that holds a server connection in a transaction and says nothing for `idle in transaction` ms (default none; `25P03`), one that waits for a server connection for `queue wait` ms (default 120,000; `53000`). A client that
+was idle in a transaction takes its server connection with it, which is dropped and replaced, because what state it left it in is not known. The loop reads the clock once per turn and wakes every 100 ms when any timeout is set.
+
+**Cancel.** A client's `BackendKeyData` is the pooler's own: a number for the client and 31 random bits as its secret, never the server's. A `CancelRequest` that quotes them is answered with nothing and the connection closed, as PostgreSQL does; if the client holds a server connection at that moment, the pooler opens a connection to the server
+and sends a cancel with *that connection's* own process id and secret (kept from its login), which the loop does once per turn. A cancel with the wrong secret or process id, for a client that holds no server connection, or a malformed one does nothing. What a cancel can hit is whatever the client's server connection is running when the cancel arrives, which is
+what PgBouncer does too; a cancel that arrives just after the client's transaction ended and another client began on the same connection can cancel the other client's statement, and nothing here narrows that window.
+
+**Checked** (`Timeouts`, 8 tests, and `Cancel`, 5, in `pooler/tests/pooler_e2e.py`): the startup left unfinished, the password exchange left unfinished, and the idle in a transaction, waiting for a connection, each cut within the time and with the right code; an idle client that is not in a transaction is *not* cut; a client that keeps working in a
+transaction is not cut; **a query that runs longer than the idle-in-transaction timeout is not idle** and **a client that waited for a connection is not cut off while it runs** (the two stale-deadline cases the first version of the tests missed); a real cancel stops `pg_sleep(20)` with `57014` and the connection goes on; wrong secret, wrong process, process zero, a client with no
+server connection, and malformed cancels do nothing; each client's key is the pooler's own and different. Of 15 mutants of the new code the first run killed 11, **let 2 survive and could not match 1**: the survivors were the two stale-deadline cases above (a deadline set by the previous answer, or by queueing, firing during the work the client was waiting for); both now have a test, and
+the unmatched one (cancels never sent) is killed. **One mutant still survives and is equivalent**: not clearing a client's queue deadline when it is given a server connection, because a queued client always has bytes held back, and forwarding them clears the deadline in the same step; the line is kept as the one that says what is meant.
+Running two test runs at once on the same ports made eight tests error at once; that was the runs colliding, not the code, and on a quiet machine all pass.
+
+**Still not here, and why.**
+
+* **A server connection is made with a blocking connect.** When one dies it is replaced by logging in while the loop waits; that is a millisecond to a local server and the connect's timeout to one that is not answering, during which no client is served. lex-sys has no non-blocking connect (`tcp_connect` waits), so this needs a language change, as `conn_nodelay` and `copy_within` did: a `tcp_connect` that
+  returns when the connection is started and says when it is complete through the poller.
+* **No shutdown that drains.** lex-sys has no signal handling, so a stop is a kill: clients are cut, which is what a restart of the pooler costs now.
+* **The password is a command-line argument** (section 9), the same for the timeouts' arguments being positional, which is awkward and will be replaced by a configuration read from a file once there is a file capability to hold for it.
+* **One pool**: one user, one database, one server, and 200 clients at most (fixed at build); a second pool is a second process.
+* **No TLS** on either side, no `LISTEN`/`NOTIFY` (messages to an idle server connection are dropped), no session pooling mode (a client that needs session state needs a server connection of its own).
+* **Not measured since P1:** the cost of the timeout scan (464 slots a turn, every 100 ms) and of the cancel path are not in section 8's benchmark; the benchmark was run before them.
