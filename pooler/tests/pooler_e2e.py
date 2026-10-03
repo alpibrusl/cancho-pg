@@ -148,6 +148,8 @@ class Client:
                 errors.append(fields)
             elif k == b"C":
                 tags.append(body.rstrip(b"\0").decode())
+            elif k == b"K":
+                self.key = struct.unpack("!II", body[:8])
             elif k == b"Z":
                 statuses.append(chr(body[0]))
         return rows, errors, tags, statuses, kinds
@@ -189,11 +191,11 @@ _next_port = [6500]
 
 
 class Pooler:
-    def __init__(self, size, db=DB, client_password=None):
+    def __init__(self, size, db=DB, client_password=None, timeouts=None):
         _next_port[0] += 1
         self.port = _next_port[0]
         self.client_password = client_password
-        self.p = subprocess.Popen([BIN, str(self.port), HOST, str(PORT), USER, db, "-", str(size)] + ([client_password] if client_password else []), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.p = subprocess.Popen([BIN, str(self.port), HOST, str(PORT), USER, db, "-", str(size)] + ([client_password or "-"] + [str(t) for t in timeouts] if timeouts else ([client_password] if client_password else [])), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(100):
             try:
                 socket.create_connection(("127.0.0.1", self.port), 0.2).close()
@@ -669,6 +671,157 @@ class Authentication(unittest.TestCase):
         c = Client(p.port)
         self.assertEqual(c.one("select 5"), "5")
         c.close()
+
+
+def cancel_request(port, pid, secret):
+    s = socket.create_connection(("127.0.0.1", port), 5)
+    s.sendall(struct.pack("!iiII", 16, 80877102, pid, secret))
+    s.settimeout(0.5)
+    try:
+        s.recv(100)  # nothing is answered; the connection is closed
+    except OSError:
+        pass
+    s.close()
+
+
+class Timeouts(unittest.TestCase):
+    def read_error(self, sock_or_client, within):
+        c = sock_or_client
+        c.s.settimeout(within)
+        k, body = c.read_message()
+        self.assertEqual(k, b"E")
+        return Client.parse_error(body)
+
+    def test_a_client_that_does_not_finish_the_startup_is_cut_off(self):
+        p = Pooler(1, timeouts=(500, 0, 120000))
+        self.addCleanup(p.stop)
+        s = socket.create_connection(("127.0.0.1", p.port), 5)
+        c = Client.__new__(Client)
+        c.s, c.buf = s, b""
+        t = time.time()
+        err = self.read_error(c, 3)
+        self.assertEqual(err["C"], "08P01")
+        self.assertGreaterEqual(time.time() - t, 0.4)
+        self.assertLess(time.time() - t, 2.0)
+        s.settimeout(2)
+        self.assertEqual(s.recv(10), b"")
+        self.assertEqual(Client(p.port).one("select 1"), "1")
+
+    def test_a_client_that_does_not_finish_the_password_exchange_is_cut_off(self):
+        p = Pooler(1, client_password="pw", timeouts=(500, 0, 120000))
+        self.addCleanup(p.stop)
+        s = socket.create_connection(("127.0.0.1", p.port), 5)
+        body = struct.pack("!i", 196608) + b"user\0" + USER.encode() + b"\0database\0" + DB.encode() + b"\0\0"
+        s.sendall(struct.pack("!i", len(body) + 4) + body)
+        c = Client.__new__(Client)
+        c.s, c.buf = s, b""
+        k, _ = c.read_message()
+        self.assertEqual(k, b"R")
+        err = self.read_error(c, 3)
+        self.assertEqual(err["C"], "08P01")
+        self.assertEqual(Client(p.port, password="pw").one("select 2"), "2")
+
+    def test_a_client_that_logged_in_is_not_cut_off_for_being_idle(self):
+        p = Pooler(1, timeouts=(500, 0, 120000))
+        self.addCleanup(p.stop)
+        c = Client(p.port)
+        time.sleep(1.3)
+        self.assertEqual(c.one("select 3"), "3")
+
+    def test_idle_in_a_transaction_is_cut_off_and_the_connection_is_not_reused(self):
+        p = Pooler(1, timeouts=(60000, 500, 120000))
+        self.addCleanup(p.stop)
+        a, b = Client(p.port), Client(p.port)
+        pid = a.one("select pg_backend_pid()")
+        a.query("begin")
+        t = time.time()
+        err = self.read_error(a, 3)
+        self.assertEqual(err["C"], "25P03")
+        self.assertGreaterEqual(time.time() - t, 0.3)
+        time.sleep(0.3)
+        self.assertNotEqual(b.one("select pg_backend_pid()"), pid)
+        self.assertEqual(admin("select count(*) from pg_stat_activity where datname = '%s' and state like 'idle in transaction%%'" % DB), "0")
+
+    def test_a_client_that_keeps_working_in_a_transaction_is_not_cut_off(self):
+        p = Pooler(1, timeouts=(60000, 600, 120000))
+        self.addCleanup(p.stop)
+        a = Client(p.port)
+        a.query("begin")
+        for _ in range(8):
+            time.sleep(0.25)
+            self.assertEqual(a.one("select 1"), "1")
+        a.query("commit")
+
+    def test_a_client_that_waits_too_long_for_a_connection_is_told_and_the_holder_is_not_touched(self):
+        p = Pooler(1, timeouts=(60000, 0, 500))
+        self.addCleanup(p.stop)
+        a, b = Client(p.port), Client(p.port)
+        a.query("begin")
+        t = time.time()
+        b.raw(msg(b"Q", b"select 1\0"))
+        err = self.read_error(b, 3)
+        self.assertEqual(err["C"], "53000")
+        self.assertGreaterEqual(time.time() - t, 0.4)
+        self.assertLess(time.time() - t, 2.0)
+        self.assertEqual(a.one("select 4"), "4")
+        a.query("commit")
+        self.assertEqual(Client(p.port).one("select 5"), "5")
+
+
+class Cancel(PoolerCase):
+    size = 2
+
+    def test_a_cancel_stops_the_query_the_client_is_running_and_the_connection_goes_on(self):
+        a = self.client()
+        pid, secret = a.key
+        a.raw(msg(b"Q", b"select pg_sleep(20)\0"))
+        time.sleep(0.3)
+        t = time.time()
+        cancel_request(self.pooler.port, pid, secret)
+        a.s.settimeout(5)
+        rows, errors, tags, statuses, _ = a.until_ready()
+        self.assertLess(time.time() - t, 3)
+        self.assertEqual(errors[0]["C"], "57014")
+        self.assertEqual(statuses, ["I"])
+        self.assertEqual(a.one("select 6"), "6")
+
+    def test_a_cancel_that_quotes_the_wrong_secret_or_process_does_nothing(self):
+        a = self.client()
+        pid, secret = a.key
+        a.raw(msg(b"Q", b"select pg_sleep(1.2)\0"))
+        time.sleep(0.2)
+        cancel_request(self.pooler.port, pid, (secret + 1) % 2**31)
+        cancel_request(self.pooler.port, pid + 1000, secret)
+        cancel_request(self.pooler.port, 0, 0)
+        t = time.time()
+        rows, errors, tags, statuses, _ = a.until_ready()
+        self.assertEqual(errors, [])
+        self.assertGreaterEqual(time.time() - t, 0.8)
+
+    def test_a_cancel_for_a_client_that_holds_no_server_connection_does_nothing(self):
+        a = self.client()
+        pid, secret = a.key
+        cancel_request(self.pooler.port, pid, secret)
+        self.assertEqual(a.one("select 7"), "7")
+
+    def test_the_key_a_client_is_given_is_the_poolers_own_and_each_is_different(self):
+        a, b = self.client(), self.client()
+        real = int(a.one("select pg_backend_pid()"))
+        self.assertNotEqual(a.key[0], real)
+        self.assertNotEqual(a.key, b.key)
+        self.assertNotEqual(a.key[1], b.key[1])
+
+    def test_garbage_cancel_requests_leave_the_pooler_answering(self):
+        for data in [struct.pack("!ii", 16, 80877102), struct.pack("!iiI", 12, 80877102, 1), struct.pack("!iiIII", 20, 80877102, 1, 2, 3), struct.pack("!iiII", 16, 80877102, 2**32 - 1, 2**32 - 1), struct.pack("!iiII", 8, 80877102, 0, 0)]:
+            s = socket.create_connection(("127.0.0.1", self.pooler.port), 5)
+            s.sendall(data)
+            s.settimeout(0.3)
+            try:
+                s.recv(100)
+            except OSError:
+                pass
+            s.close()
+        self.assertEqual(self.client().one("select 8"), "8")
 
 
 if __name__ == "__main__":
