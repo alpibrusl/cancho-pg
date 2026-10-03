@@ -79,6 +79,20 @@ jobs:
           PGPORT=6433 python3 tests/e2e.py
           kill %1
 
+      # P1 (docs/pooler.md section 8): the transaction pooler. The framing state machines from bytes, then the pooler against the same PostgreSQL over the
+      # raw protocol: transaction boundaries, queueing, pipelining, refusals, server failures, volume, hostile bytes.
+      - name: Pooler framing tests (every cut of every message)
+        working-directory: pg
+        run: ../lex-sys/target/release/lex-sys test tests/frame_test.ls pooler/frame.ls --std
+
+      - name: Pooler end-to-end tests (P1)
+        working-directory: pg
+        run: |
+          mkdir -p build
+          ../lex-sys/target/release/lex-sys build --std pooler/pooler.ls pooler/frame.ls src/pg.ls -o build/pooler
+          eval "$(cat /tmp/pg.env.sh)"
+          PGDATABASE=postgres python3 pooler/tests/pooler_e2e.py build/pooler
+
       # A consumer locks names from the checked-in store; it must be the store of this source.
       - name: The published store is the store of src/pg.ls
         working-directory: pg

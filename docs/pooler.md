@@ -1,8 +1,8 @@
 # A PostgreSQL connection pooler in lex-sys
 
-> **Status: P0 built and measured (section 7); P1-P3 designed, not built.** Sections 1-6 were written before the code
+> **Status: P0 and P1 built and measured (sections 7 and 8); P2-P3 designed, not built.** Sections 1-6 were written before the code
 > and say what is built, in what order, what each step must show to be kept, and what would make the whole project not
-> worth continuing, so that the gate could not move to fit the result. Section 7 is what P0 showed.
+> worth continuing, so that the gate could not move to fit the result. Sections 7 and 8 are what P0 and P1 showed.
 
 ## 1. What it is, and why it is a candidate at all
 
@@ -185,3 +185,63 @@ if the difference in PostgreSQL's cost per transaction persists there it is a fi
 
 **Not built in P0, as designed:** the connection to the server is opened with a blocking `tcp_connect` when a client is accepted; there is no limit on connection attempts, no timeout, and a client that connects and
 says nothing holds a server connection (P1 and P3).
+
+**A correction found while building P1 (section 8): P0 stalls for 44 ms on any result of more than one TCP segment.** P0's benchmark used one-row lookups and a 200 MB stream, and
+neither shows it: a stream is not latency-bound and a lookup is one segment. Measured with one request outstanding, a 70,000-byte result takes 0.48 ms directly and **44.0 ms through the P0 proxy** (Nagle's algorithm
+holds a small write while an earlier one is unacknowledged, and the peer's delayed acknowledgement answers 40 ms later). The cause is that lex-sys had no way to set `TCP_NODELAY`; `conn_nodelay` (lex-sys #187) is the fix, and with it P0 takes 0.55 ms. The
+"throughput" numbers above are the proxy before this fix, for results that fit one segment, and are not wrong, but "the proxy is transparent" was true only for those.
+
+## 8. P1, built and measured
+
+`pooler/pooler.ls` is transaction pooling: a pool of logged-in server connections (`pg.login`, so trust, cleartext and SCRAM), clients answered by the pooler itself at startup (the parameters come from the first server connection;
+`BackendKeyData` is the pooler's own), a server connection lent for one transaction and taken back when `ReadyForQuery` arrives with status idle and the client is owed no more, and clients that find none free queued in order with what
+they sent held back. `pooler/frame.ls` is the two state machines it rests on: what to do with a client's next message (`client_step`: forward, drop, terminate, refuse a named `Parse`, count the `Query` and `Sync` that each owe a
+`ReadyForQuery`) and a scan of the server's stream for `ReadyForQuery` and its status (`scan`). Neither copies a message body.
+
+**Not in P1** (as designed in section 2, and what that costs): clients are not authenticated (P2: it is for a trusted network); a client's user and database must be the pool's (one pool); `CancelRequest` is not mapped and the
+`BackendKeyData` a client gets is a number and a zero (P3); there are no timeouts (P3); a server connection that is replaced is logged in with a blocking connect while the loop waits (a millisecond on localhost; P3); a named `Parse` is refused
+with `0A000`, which is correct and also means `pgbench -M prepared` and any driver that names its statements does not work through it; a refusal inside a pipeline answers before the replies to what came before it (a client that starts a batch with the named statement, as drivers do, is not affected); asynchronous messages
+(`NOTIFY`, a changed parameter) that the server sends to an idle connection are discarded.
+
+**Correctness.**
+
+* `tests/frame_test.ls`: 6 tests that feed generated streams to both machines cut at every chunk size from one byte up (a clean stream, a stream with a refused statement and the `Sync` that ends it, bodies of every length, messages that cannot be the protocol,
+  runs of empty messages, three `ReadyForQuery`s in one look). 13 mutants of `frame.ls` (a refusal inverted, `Sync` not owed, the length limit gone, the status read from the wrong byte, ...) are each killed.
+* `pooler/tests/pooler_e2e.py`: 25 tests against a real PostgreSQL over the raw protocol, each starting its own pooler: the startup looks like a server's; clients take turns on one connection; an open transaction keeps its connection and the others wait; a rolled-back one is not seen; **a client that leaves in a transaction leaves nothing open** (the connection
+  is dropped, not reused, and `pg_stat_activity` shows no idle-in-transaction); a failed transaction holds until `ROLLBACK`; waiting clients are served in arrival order; pipelined queries and two `Sync`s in one write release only after the last; the unnamed extended protocol works with hostile parameters; a named statement is refused in the server's
+  words (`0A000`), also inside a transaction (where the answer is `E`), and the connection goes on; wrong user, wrong database, `SSLRequest`; a server connection that dies idle is replaced, and one that dies mid-transaction closes its client and no one else's; a client that never reads does not stop the others; a 50,000-row result and a 5 MB query arrive whole; **a busy server that does
+  not read while the client keeps sending 6 MB (backpressure through every buffer) loses nothing**; 60 clients on 4 connections each get their own answers; and hostile bytes (garbage startups and messages, lengths of 0, 3 and 2^31-1, 500 connections that open and close, 50 that say nothing, more clients than the limit) leave it answering.
+* Mutation testing of `pooler.ls`: 16 mutants (release on any `ReadyForQuery`, the owed count ignored, a dirty server kept when its client leaves, no skip to `Sync` after a refusal, the wrong status after it, the user or database unchecked, waiting clients not served on release, last-in-first-out, reads not resumed after a drain, held-back input not sent after a drain,
+  no capacity check towards the server, a dead server not uncounted, no parameters in the startup, `Terminate` keeping the server, a server's end of stream leaving its client hanging). **The first version of the tests let four survive** (the two backpressure mutants, the end-of-stream one, and a dirty-server mutant that did not compile and had to be written another way); the slow-server test was added for the first two, the death test was
+  changed to require the connection to be *closed* (it had passed on a read that timed out), and all 16 are now killed.
+* `pgbench` select-only and TPC-B, simple and extended, run through it with no failed transactions; `psql` is the same server on every connection.
+
+**What building it found.** Writing a message per write is what Nagle's algorithm punishes: forwarding the extended protocol message by message (Parse, Bind, Execute, Sync as four writes) gave **90 transactions a second at fifty clients, against 25,700 with `TCP_NODELAY` and
+33,300 when the messages that arrived together are sent in one write** (the pooler now does both: one write per run of consecutive messages, and `TCP_NODELAY` on every socket). And the result larger than a segment (above) needs the option whatever the pooler does.
+
+**Performance** (`pooler/bench/p1.py`, 5 rounds interleaved pooler / PgBouncer 1.22 in transaction mode / direct; a pool of 8 on each; same cores, same PostgreSQL 16.15 as section 7; PgBouncer with server TLS off). Medians; every run is in the script's output.
+
+| cell | tps direct / pooler / PgBouncer | PostgreSQL cores busy % | pooler over PgBouncer | pooler CPU per transaction, pooler / PgBouncer |
+|---|---|---|---|---|
+| `-S` 1 client | 13,172 / 9,655 / 9,392 | 34 / 24 / 24 | **1.03** | 33.1 / 35.2 us (0.94) |
+| `-S` 10 clients | 38,785 / 50,028 / 46,444 | 98 / 93 / 90 | PostgreSQL-bound (raw 1.08) | 17.9 / 20.4 (0.88) |
+| `-S` 50 clients | 27,869 / 51,454 / 43,213 | 97 / 96 / 87 | **1.19** | 16.3 / 22.1 (0.74) |
+| `-S` 100 clients | 26,915 / 51,216 / 48,995 | 94 / 97 / 93 | PostgreSQL-bound (raw 1.05) | 15.7 / 19.0 (0.83) |
+| `-S` 10 clients, extended | 30,758 / 43,510 / 42,050 | 98 / 96 / 94 | PostgreSQL-bound (raw 1.03) | 19.2 / 22.0 (0.87) |
+| `-S` 100 clients, extended | 23,425 / 43,716 / 42,105 | 95 / 98 / 95 | PostgreSQL-bound (raw 1.04) | 16.7 / 20.5 (0.81) |
+| 10,000 tps offered, 10 clients | 10,012 / 10,013 / 10,000 | 49 / 40 / 40 | 1.00 (latency 0.28 / 0.27 ms) | 29.5 / 32.0 (0.92) |
+| 20,000 tps offered, 100 clients | 19,813 / 20,063 / 20,000 | 82 / 60 / 59 | 1.00 (latency 0.38 / 0.29 ms) | 24.7 / 26.8 (0.92) |
+| a 200 MB result | 0.53 s / 0.45 s / 0.54 s | | | **0.60 / 1.45 ms per MB (0.41)** |
+
+**Against the gate.** Throughput at least 0.9x PgBouncer's in every cell where it can be judged (1.03, 1.19, 1.00, 1.00), and the pooler's CPU per transaction below PgBouncer's in every cell (0.74 to 0.94; the gate allowed 1.5x and the stop
+condition was 2x). **The gate is met.** Both poolers beat a direct connection to PostgreSQL at 50 and 100 clients (51,000 against 27,000 transactions a second) because PostgreSQL has eight busy backends instead of a hundred, which is what a pooler is for.
+
+**How firmly.** Not as "faster than PgBouncer". An earlier run of the same script, four cells of which finished before the machine was restarted, read **0.93, 0.95 and 0.94** at 10, 50 and 100 clients (47,400 against 51,200, 47,000 against 49,600, 45,300 against 48,200) where this one reads 1.08,
+1.19 and 1.05: the sign of the difference at saturation changed between two sessions on this noisy VM, and the cells are PostgreSQL-bound, so what the data supports is **parity within about ten percent in either direction**, the CPU advantage (which did not change sign), and the 200 MB result's
+2.4x lower CPU per megabyte. The one latency that is not parity is the 100-client cell at an offered 20,000 a second (median 0.38 against 0.29 ms, rounds from 0.27 to 0.57): it is what the CPU ratio does not show, and it is not explained.
+
+**Section 7's open question** (PostgreSQL spending a quarter less CPU per transaction behind PgBouncer than behind the P0 proxy, with one connection per client on each) has a candidate answer here and is not settled by it: with a pool of eight both poolers show the same PostgreSQL cost per transaction, which says the cost followed the number of busy backends and not the pooler's
+write pattern; P0 had a backend per client and PgBouncer in session mode had the same, and there the gap was 20 to 25% for reasons still not found.
+
+**Decision.** P1 is kept. The stop conditions of section 5 did not fire: transaction boundaries needed no SQL parsing, the CPU per transaction is below PgBouncer's, and no client-reachable crash survived the mutants and the hostile-bytes tests. What is between this and something to run in front of a database is P2 (clients that are
+authenticated) and P3 (cancel, timeouts, limits, a connection that is replaced without waiting).
