@@ -8,7 +8,7 @@ on:
 env:
   # The compiler these sources are built and tested with. A package store records no hash
   # of the `std` it was published against, so the revision is part of the contract.
-  LEX_SYS_REV: 25a954521a4fd3e832d14a6caf5983d56b3c5d40
+  LEX_SYS_REV: 2704d427224c789fa15e0e5ded4318fafceb5bc5
 
 jobs:
   test:
