@@ -1,9 +1,9 @@
 # lexsys-pg: a PostgreSQL client in lex-sys
 
-> **Status: slices 1-4 built; the non-blocking connection is designed ([`nonblocking.md`](nonblocking.md))** -- the v3 wire protocol (startup, trust, cleartext-password and
+> **Status: slices 1-4 built; the non-blocking connection is built ([`nonblocking.md`](nonblocking.md)) and reconnects by itself ([`reconnect.md`](reconnect.md))** -- the v3 wire protocol (startup, trust, cleartext-password and
 > SCRAM-SHA-256 login, simple and extended queries with parameters, describe), checked against
-> a real PostgreSQL 16 and the stock `psql` client, the typed-query generator `tools/pgen.ls` (§8), and prepared statements (§4, §9). Not built: MD5 login, TLS, a non-blocking
-> connection, binary result formats, `COPY`. §5 says what comes after, in
+> a real PostgreSQL 16 and the stock `psql` client, the typed-query generator `tools/pgen.ls` (§8), and prepared statements (§4, §9). Not built: MD5 login, TLS,
+> binary result formats, `COPY`. §5 says what comes after, in
 > order, and §6 answers *what sits on top of a driver in a language without reflection*.
 
 ## 1. What it is

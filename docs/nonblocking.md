@@ -1,7 +1,7 @@
 # A connection that does not block the loop
 
 > **Status: built (`src/pool.ls`, package `pg.pool`), measured, and the design's own criteria checked in
-> section 9.** Sections 1-8 are the design as written before it was built, with the places where a
+> section 9. Reconnecting, which sections 4.2 and 9.3 left for later, is built: [`reconnect.md`](reconnect.md).** Sections 1-8 are the design as written before it was built, with the places where a
 > measurement afterwards showed the text to be wrong **corrected in place** (marked *Corrected*). The case
 > for building it was said to be "not throughput", and the first measurement of the finished thing
 > disagreed: see section 9.1.
@@ -135,6 +135,10 @@ parsing beyond finding the next `Z` message (`pg.size` and `pg.kind`, which exis
 application turns into a 503, is closed, and is marked dead. Reconnecting is the pool's job on a timer
 (`pool.revive`, run from the loop's own tick: a blocking connect and login, bounded, with a back-off, preparing the
 statements again). The first version does not revive and says so; a restart of the service is the answer until it does.
+
+> **Corrected ([`reconnect.md`](reconnect.md)).** Built, and not as written here: a blocking connect and login, "bounded", is exactly what the
+> single loop cannot afford (a connect to a host that drops packets waits minutes; a SCRAM login is 9 ms of computing on top of the server's
+> answer). The attempt is a state machine on the poller's events and the loop's clock, with the key derivation in pieces, so that nothing waits.
 
 ### 4.3 The loop
 
@@ -297,9 +301,9 @@ how requests are batched on the wire, or in the cost of waking a blocked client.
 * **A slow query holds up what is queued behind it on its own connection.** Pipelining is in order. In a test, with two
   connections and the first request sleeping 0.4 s, the requests queued behind it on its connection waited and the ones
   on the other did not. More connections, or a smaller `depth`, bound it; nothing routes around it.
-* **No reconnecting (`revive`) and no deadline.** After the database restarts, routes that need it answer 503 until the
-  service is restarted; a request the database never answers is held until its connection fails. Both were listed in
-  section 4.2 as later and are still later.
+* **~~No reconnecting (`revive`) and no deadline.~~ Built since: [`reconnect.md`](reconnect.md).** With `pool.reconnect` a lost connection is
+  replaced (statements prepared again) without the loop ever waiting, and `request_ms` gives up a connection whose request is never answered
+  (status 12). Without `reconnect` the pool is as measured here: after the database restarts the routes that need it answer 503 until the service is restarted.
 * **A reply larger than the input slab** (`in_cap`, 128 KiB in `users_pg`) fails its connection (status 8) rather than
   growing; the slab sizes are fixed when the pool is made. A page of 100 users is about 9 KiB.
 * **Cancellation** (section 8) is not done: a client that disconnects while its query is pending leaves the query

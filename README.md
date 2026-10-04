@@ -20,12 +20,15 @@ without reflection is [`docs/design.md`](docs/design.md) §6.
 PostgreSQL 16 and the stock `psql` client. **Not yet:** MD5 login
 (answered with status 5), TLS, binary result formats, `COPY`. The helpers of layer 3 wait for the
 server; **`pg.pool`** ([below](#a-pool-that-does-not-wait)) is the connection that does not, and
-[`docs/nonblocking.md`](docs/nonblocking.md) has what it measured. [`docs/design.md`](docs/design.md)
+[`docs/nonblocking.md`](docs/nonblocking.md) has what it measured. **The pool also reconnects without ever waiting**
+(`pool.reconnect`, `tick`, `revive`: a lost connection is replaced, with its statements prepared again, by a login that is a state machine on the
+poller's events; [below](#a-pool-that-comes-back) and [`docs/reconnect.md`](docs/reconnect.md)). [`docs/design.md`](docs/design.md)
 §4-§5 says why the blocking ones are what they are.
 
 ## Requirements
 
-- The **lex-sys** compiler at the revision this repository's CI builds with (below). A package store records no hash of the `std`
+- The **lex-sys** compiler at the revision this repository's CI builds with (below; `a87f666`, which has `tcp_connect_start`, the dial that
+  does not wait, that the reconnecting pool needs: a pool that is only given connections with `add` works with older ones). A package store records no hash of the `std`
   it was published against, so the compiler revision is part of the contract.
 - Rust, to build that compiler (its `rust-toolchain.toml` pins the toolchain).
 - A **PostgreSQL** to talk to (any version; the tests use 16), and for the tests `docker` and the stock `psql` client.
@@ -195,6 +198,32 @@ not 0, in its place in the order. `examples/` has no program for it: `lexsys-web
 `lex-sys`'s `http.server` (`hold`/`answer`). The package is a store of its own,
 `.lex-sys-vcs-pool`, requiring `size` and `kind` from `.lex-sys-vcs`.
 
+### A pool that comes back
+
+A connection that is lost (a restart, a cut network, an idle timeout, `pg_terminate_backend`) is **not** replaced by the pool above unless it is
+asked to: give it the login and the statements once, and it makes the connections itself, never waiting for the server, the network or the key
+derivation of a SCRAM login. The requests that were on the connection are answered with a status that says the connection was lost
+(`pool.lost(status)`: the outcome is unknown), nothing is lost or answered twice, the next request after the new connection is up runs on a
+connection that has the statements prepared, and a database that is down, silent, or refuses the password is retried after 100 ms, 200 ms, 400 ms ...
+up to a longest wait you choose, never faster.
+
+```
+var pl = pool.empty(heap, 4, 64, 131072, 131072);
+let (made, rc) = pool.reconnect(heap, pl, user, password, database, seed, setup, statements,
+                                100, 5000, 5000, 0);     // waits 100 ms .. 5 s; an attempt may take 5 s; no request timeout
+pl = made;                                               // seed: 16+ bytes from /dev/urandom; setup, statements: queries.prepare_script(heap)
+pool.start(pl, poller, first_token);                     // no connection yet, and nothing waited for
+...                                                      // each turn of the loop:
+pl = pool.revive(heap, pl, net, "127.0.0.1", 5432, poller, clock_ms(clock));   // tick + a dial and adopt for each connection due
+let wait = pool.next_wake(pl, now);                      // -1, or the ms until the pool needs a turn: poller_wait(..., min(wait, mine))
+...                                                      // pump / submit / flush / next_done as before; pool.live(pl), pool.reconnects(pl) ...
+```
+
+`revive` is for a program that holds the whole network (`Net("")`). One that narrowed its network to the database calls `tick`, `tcp_connect_start`
+and `adopt` (or `dial_failed`) itself, so that `lex-sys authority` still says `net_out("127.0.0.1:5432")` and not more (`tests/narrow_use.ls` is
+that program, and the test reads its authority): the pool never dials. A host *name* is resolved by a call that waits (the compiler's, in
+`tcp_connect_start`); give an address. [`docs/reconnect.md`](docs/reconnect.md) has the states, the status codes, every measurement and what is not done.
+
 ## Using it from your program
 
 `pg` is a package: lock the names you call and fetch them, no copy of `pg.ls` in your tree
@@ -307,9 +336,11 @@ every measurement with its caveats, is [`docs/pooler.md`](docs/pooler.md).
 ## Tests
 
 ```
-lex-sys test tests/pg_test.ls src/pg.ls --std                     # 20 unit tests, no server
+lex-sys test tests/pg_test.ls src/pg.ls --std                     # 23 unit tests, no server
 eval "$(sh tests/postgres.sh)"                                    # a throwaway postgres:16 with a role of each login kind
-python3 tests/e2e.py                                              # 28 tests against it (and a mock server)
+python3 tests/e2e.py                                              # 46 tests against it (and a mock server)
+lex-sys test tests/pool_test.ls src/pool.ls src/pg.ls tests/generated/queries.ls --std   # 8 pool tests, no server
+python3 tests/reconnect_test.py                                   # 34 tests of the reconnecting pool: PostgreSQL behind a proxy, and mocks
 ```
 
 The unit tests encode and decode with no server, from replies built here from the protocol's documented
@@ -344,6 +375,12 @@ name allowed, a server error ignored, an integer read or written without its sig
 row visited twice, the column number off by one -- each fail at least one suite; the two sign bugs only the unit
 tests catch, since the scenario has no negative numbers.
 
+The reconnecting pool is checked on its own (`tests/reconnect_test.py`, [`docs/reconnect.md`](docs/reconnect.md) §6): a backend killed while the
+pool is idle and with requests in flight, a server that goes away and comes back (a proxy, `tests/tcpproxy.py`, cuts and restores the network so the
+server is left alone), a database that drops every packet, one that accepts and never answers, a wrong password, SCRAM and cleartext logins, one
+connection of four killed, a connection that dies the moment it is made, and mock servers that answer the login in pieces, badly or hostilely; the
+loop reports the longest it was kept from waiting. NN deliberate bugs in the pool and the SCRAM pieces (`tests/mutants.py`) each fail a test.
+
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds the pinned compiler and runs all of it
 against a `postgres:16` service, and checks that the checked-in package store is the store of `src/pg.ls`.
 
@@ -352,24 +389,26 @@ against a `postgres:16` service, and checks that the checked-in package store is
 - [`docs/design.md`](docs/design.md): the layers (driver, typed queries, helpers), why the blocking calls are what they are, and
   what each slice found.
 - [`docs/nonblocking.md`](docs/nonblocking.md): the non-blocking connection and `pg.pool`, with what they measured.
+- [`docs/reconnect.md`](docs/reconnect.md): the pool that makes its own connections: the login as a state machine, the backoff, what a caller sees, and every measurement.
 - [`docs/pooler.md`](docs/pooler.md): the connection pooler, what it does and does not do, and every measurement with its caveats.
 
 ## Layout
 
 ```
 src/pg.ls          the driver: login (trust, cleartext, SCRAM-SHA-256), simple and extended queries, describe, prepared statements
-src/pool.ls        pg.pool: a few non-blocking connections, pipelined, for a loop that must not wait
+src/pool.ls        pg.pool: a few non-blocking connections, pipelined, for a loop that must not wait, and that makes its own
 tools/pgen.ls      the generator of typed query functions from .sql files
 examples/          psql.ls and describe.ls: small command-line clients
 pooler/            the connection pooler (PgBouncer's transaction mode)
 tests/             unit tests (lex-sys), end-to-end tests against PostgreSQL 16 and a mock server (Python)
-docs/              design, non-blocking, pooler
+docs/              design, non-blocking, reconnect, pooler
 ```
 
 ## Limitations
 
 Not yet: MD5 login (answered with status 5), TLS (so no channel binding), binary result formats, `COPY`. The password is not
-SASLprep-normalised. The blocking helpers wait for the server; `pg.pool` is the connection that does not.
+SASLprep-normalised. The blocking helpers wait for the server; `pg.pool` is the connection that does not, and with `reconnect` it comes back
+by itself (a host *name* is still resolved by a call that waits; a connection that goes silent without a close is found only by the request timeout).
 
 ## Contributing
 

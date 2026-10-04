@@ -8,7 +8,7 @@ on:
 env:
   # The compiler these sources are built and tested with. A package store records no hash
   # of the `std` it was published against, so the revision is part of the contract.
-  LEX_SYS_REV: 2704d427224c789fa15e0e5ded4318fafceb5bc5
+  LEX_SYS_REV: a87f66615aff5817e7e9cbc317ae0d88c1785490
 
 jobs:
   test:
@@ -48,6 +48,12 @@ jobs:
         working-directory: pg
         run: ../lex-sys/target/release/lex-sys test tests/pg_test.ls src/pg.ls --std
 
+      # What the pool decides with no server (the arguments of `reconnect`, what is due when, the waits), and that the script
+      # `pgen` writes is a Parse and a Sync for each statement.
+      - name: Pool unit tests (no server)
+        working-directory: pg
+        run: ../lex-sys/target/release/lex-sys test tests/pool_test.ls src/pool.ls src/pg.ls tests/generated/queries.ls --std
+
       - name: Formatting
         working-directory: pg
         run: ../lex-sys/target/release/lex-sys fmt --check src tests tools examples pooler
@@ -63,6 +69,18 @@ jobs:
         run: |
           eval "$(cat /tmp/pg.env.sh)"
           python3 tests/e2e.py
+
+      # The pool that makes its own connections (docs/reconnect.md): backends killed idle and mid-request, a server that goes
+      # away and comes back, a database that is black-holed, silent, or refuses the password; against PostgreSQL behind
+      # tests/tcpproxy.py, and against mock servers that answer the login badly. Each run reports the longest the loop
+      # was kept from waiting.
+      - name: Reconnecting pool tests (kill, cut, restore)
+        working-directory: pg
+        env:
+          LEX_SYS: ${{ github.workspace }}/lex-sys/target/release/lex-sys
+        run: |
+          eval "$(cat /tmp/pg.env.sh)"
+          python3 tests/reconnect_test.py
 
       # The pooler's first slice (docs/pooler.md, P0): a transparent proxy. The whole end-to-end suite
       # again, with every client and every test going through it to the same PostgreSQL.
@@ -105,8 +123,8 @@ jobs:
           ../lex-sys/target/release/lex-sys vcs publish --std --store /tmp/store src/pg.ls > /dev/null
           diff -r /tmp/store .lex-sys-vcs
 
-      # `pg.pool` is a package of its own, published beside `pg` and requiring the two names it uses
-      # (`size`, `kind`) from `pg`'s store; the same rule: the checked-in store is the store of the source.
+      # `pg.pool` is a package of its own, published beside `pg` and requiring the names it uses
+      # (`size`, `kind`, the login's messages and SCRAM's pieces) from `pg`'s store; the same rule: the checked-in store is the store of the source.
       - name: The published store is the store of src/pool.ls
         working-directory: pg
         run: |
@@ -114,6 +132,6 @@ jobs:
           # relative to itself, so a copy elsewhere would differ in that one line
           rm -rf .lex-sys-vcs-pool-check
           lex=../lex-sys/target/release/lex-sys
-          $lex vcs lock --store .lex-sys-vcs -o /tmp/pg-for-pool.lock size kind > /dev/null
+          $lex vcs lock --store .lex-sys-vcs -o /tmp/pg-for-pool.lock auth_code base64_encode error_field hmac_sha256 kind parse_append password pbkdf2_begin pbkdf2_more sasl_initial sasl_response scram_client_final_with scram_client_first scram_iterations scram_salt size startup > /dev/null
           $lex vcs publish --std --store .lex-sys-vcs-pool-check --requires /tmp/pg-for-pool.lock:.lex-sys-vcs src/pool.ls > /dev/null
           diff -r .lex-sys-vcs-pool-check .lex-sys-vcs-pool
