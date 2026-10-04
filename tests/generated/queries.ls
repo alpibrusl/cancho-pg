@@ -3,7 +3,7 @@
 // Each query is a function that runs it (`<name>`: the whole reply and a status, 0 for ok), one that only
 // encodes the request for `pg.pool.submit` (`<name>_start`), and one accessor per result column
 // (`<name>_<column>`, read from a row as `pg.first_row`/`pg.next_row` give it; `_is_null` where the
-// column can be NULL). Call `prepare_all` once after login, before the first query.
+// column can be NULL). Call `prepare_all` once after login, before the first query (or give `prepare_script` to `pg.pool.reconnect`).
 edition 5;
 
 module queries;
@@ -512,4 +512,23 @@ pub fn prepare_all[&h, &c](heap: &!h Heap, conn: &!c Conn) -> [heap, conn_read, 
     reply = r10;
     status = s10;
     return (reply, status);
+}
+
+// The same statements as the bytes to send after a login (Parse and Sync for each, in order) and how many there are,
+// for a pool that logs in by itself: `pg.pool.reconnect` takes them, and prepares them again on every connection
+// it makes.
+pub fn prepare_script[&h](heap: &!h Heap) -> [heap] (buffer.Buffer, int) {
+    var script = buffer.empty(heap, 256);
+    script = pg.parse_append(heap, script, "user_by_id", "select id, name, age, active, nickname from gen_users where id = $1");
+    script = pg.parse_append(heap, script, "users_older_than", "select id, name from gen_users where age > $1 order by id");
+    script = pg.parse_append(heap, script, "add_user", "insert into gen_users (name, age) values ($1, $2) returning id");
+    script = pg.parse_append(heap, script, "rename_user", "update gen_users set name = $2 where id = $1");
+    script = pg.parse_append(heap, script, "posts_with_authors", "select p.title, u.name as author from gen_posts p left join gen_users u on u.id = p.user_id order by p.id");
+    script = pg.parse_append(heap, script, "count_users", "select count(*) as n from gen_users");
+    script = pg.parse_append(heap, script, "find_by_nickname", "select id from gen_users where nickname = $1");
+    script = pg.parse_append(heap, script, "add_post", "insert into gen_posts (user_id, title) values ($1, $2)");
+    script = pg.parse_append(heap, script, "user_details", "select balance, joined, (age + 1) as next_age from gen_users where id = $1");
+    script = pg.parse_append(heap, script, "tricky", "select 'say \"hi\" \\ back' as quoted, 'two\nlines' as two");
+    script = pg.parse_append(heap, script, "add_user_partial", "insert into gen_users (name, age, nickname) values ($1, $2, $3) returning id");
+    return (script, 11);
 }

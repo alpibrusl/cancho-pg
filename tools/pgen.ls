@@ -473,16 +473,17 @@ fn parameter_names[&h, &i, &n, &d](heap: &!h Heap, io: &!i Io, name: &n [byte], 
 
 // One query: describe it, append its runner and accessors to `out`. Answers the output, the names
 // taken so far, and 0 -- or a nonzero code after a message on standard error.
-fn generate[&h, &c, &i, &n, &d, &s](heap: &!h Heap, conn: &!c Conn, io: &!i Io, out: buffer.Buffer, seen: buffer.Buffer, prep: buffer.Buffer, index: int, name: &n [byte], given: &d [byte], sql: &s [byte]) -> [heap, conn_read, conn_write, err_write] (buffer.Buffer, buffer.Buffer, buffer.Buffer, int) {
+fn generate[&h, &c, &i, &n, &d, &s](heap: &!h Heap, conn: &!c Conn, io: &!i Io, out: buffer.Buffer, seen: buffer.Buffer, prep: buffer.Buffer, scr: buffer.Buffer, index: int, name: &n [byte], given: &d [byte], sql: &s [byte]) -> [heap, conn_read, conn_write, err_write] (buffer.Buffer, buffer.Buffer, buffer.Buffer, buffer.Buffer, int) {
     if !ident_ok(name) {
         complain(io, name, "a query name is lower-case letters, digits and underscores, not starting with a digit");
-        return (out, seen, prep, 1);
+        return (out, seen, prep, scr, 1);
     }
     let joins = contains_word(heap, sql, "join");
     let (reply, status) = pg.describing(heap, conn, sql);
     var o = out;
     var sn = seen;
     var pp = prep;
+    var sc = scr;
     var code = 0;
     borrow reply as &rr in {
         let m = buffer.bytes(rr);
@@ -523,6 +524,12 @@ fn generate[&h, &c, &i, &n, &d, &s](heap: &!h Heap, conn: &!c Conn, io: &!i Io, 
                     pp = buffer.append(heap, pp, "\", ");
                     borrow sql_literal as &lr in {
                         pp = buffer.append(heap, pp, buffer.bytes(lr));
+                        // and the same statement in the script `prepare_script` builds
+                        sc = buffer.append(heap, sc, "    script = pg.parse_append(heap, script, \"");
+                        sc = buffer.append(heap, sc, name);
+                        sc = buffer.append(heap, sc, "\", ");
+                        sc = buffer.append(heap, sc, buffer.bytes(lr));
+                        sc = buffer.append(heap, sc, ");\n");
                     }
                     pp = buffer.append(heap, pp, ");\n    reply = r");
                     pp = buffer.push_nat(heap, pp, index);
@@ -582,7 +589,7 @@ fn generate[&h, &c, &i, &n, &d, &s](heap: &!h Heap, conn: &!c Conn, io: &!i Io, 
         }
     }
     buffer.drop(heap, reply);
-    return (o, sn, pp, code);
+    return (o, sn, pp, sc, code);
 }
 
 // The line of `text` that starts at `at`: where it ends (at its newline, or the end of the text).
@@ -645,7 +652,7 @@ fn generate_all[&h, &c, &i, &t, &f](heap: &!h Heap, conn: &!c Conn, io: &!i Io, 
     out = buffer.append(heap, out, file);
     out = buffer.append(heap, out, " against ");
     out = buffer.append(heap, out, database);
-    out = buffer.append(heap, out, ". Do not edit: change the SQL and run pgen again.\n//\n// Each query is a function that runs it (`<name>`: the whole reply and a status, 0 for ok), one that only\n// encodes the request for `pg.pool.submit` (`<name>_start`), and one accessor per result column\n// (`<name>_<column>`, read from a row as `pg.first_row`/`pg.next_row` give it; `_is_null` where the\n// column can be NULL). Call `prepare_all` once after login, before the first query.\nedition 5;\n\nmodule ");
+    out = buffer.append(heap, out, ". Do not edit: change the SQL and run pgen again.\n//\n// Each query is a function that runs it (`<name>`: the whole reply and a status, 0 for ok), one that only\n// encodes the request for `pg.pool.submit` (`<name>_start`), and one accessor per result column\n// (`<name>_<column>`, read from a row as `pg.first_row`/`pg.next_row` give it; `_is_null` where the\n// column can be NULL). Call `prepare_all` once after login, before the first query (or give `prepare_script` to `pg.pool.reconnect`).\nedition 5;\n\nmodule ");
     out = buffer.append(heap, out, stem(file));
     out = buffer.append(heap, out, ";\n\nimport std.buffer;\nimport pg;\n");
     var seen = buffer.push(heap, buffer.empty(heap, 256), byte_of(10));
@@ -654,6 +661,7 @@ fn generate_all[&h, &c, &i, &t, &f](heap: &!h Heap, conn: &!c Conn, io: &!i Io, 
         code = complain(io, file, "the file name, without its extension, becomes the module name: lower-case letters, digits and underscores");
     }
     var prep = buffer.empty(heap, 512);
+    var script = buffer.empty(heap, 512);
     var queries = 0;
     var h = next_header(text, 0);
     while h >= 0 && code == 0 {
@@ -674,10 +682,11 @@ fn generate_all[&h, &c, &i, &t, &f](heap: &!h Heap, conn: &!c Conn, io: &!i Io, 
             if len(sql) == 0 {
                 code = complain(io, header[nf..nt], "no statement after the name");
             } else {
-                let (o, s, pr, c) = generate(heap, conn, io, out, seen, prep, queries, header[nf..nt], rest, sql);
+                let (o, s, pr, sr, c) = generate(heap, conn, io, out, seen, prep, script, queries, header[nf..nt], rest, sql);
                 out = o;
                 seen = s;
                 prep = pr;
+                script = sr;
                 code = c;
                 queries = queries + 1;
             }
@@ -693,7 +702,15 @@ fn generate_all[&h, &c, &i, &t, &f](heap: &!h Heap, conn: &!c Conn, io: &!i Io, 
             out = buffer.append(heap, out, buffer.bytes(pr));
         }
         out = buffer.append(heap, out, "    return (reply, status);\n}\n");
+        out = buffer.append(heap, out, "\n// The same statements as the bytes to send after a login (Parse and Sync for each, in order) and how many there are,\n// for a pool that logs in by itself: `pg.pool.reconnect` takes them, and prepares them again on every connection\n// it makes.\npub fn prepare_script[&h](heap: &!h Heap) -> [heap] (buffer.Buffer, int) {\n    var script = buffer.empty(heap, 256);\n");
+        borrow script as &sr in {
+            out = buffer.append(heap, out, buffer.bytes(sr));
+        }
+        out = buffer.append(heap, out, "    return (script, ");
+        out = buffer.push_nat(heap, out, queries);
+        out = buffer.append(heap, out, ");\n}\n");
     }
+    buffer.drop(heap, script);
     buffer.drop(heap, prep);
     buffer.drop(heap, seen);
     return (out, code);

@@ -428,6 +428,96 @@ fn test_pbkdf2_sha256_vectors[&h](heap: &!h Heap) -> [heap] int {
     return 0;
 }
 
+// The same key in pieces (`pbkdf2_begin`, then `pbkdf2_more` in chunks of any size, with a fresh state's
+// worth of work between) must be the key `pbkdf2_sha256` answers, for every way of cutting the iterations.
+fn pieces_of[&h, &w](heap: &!h Heap, iterations: int, chunk: int, want: &w [byte]) -> [heap] int {
+    let state = box_slice(heap, 64, byte_of(0));
+    borrow mut state as &!sw in {
+        test.assert_eq(pg.pbkdf2_begin(heap, "password", "salt", contents(sw)), 0);
+        var left = iterations - 1;
+        while left > 0 {
+            var now = chunk;
+            if left < chunk {
+                now = left;
+            }
+            test.assert_eq(pg.pbkdf2_more(heap, "password", contents(sw), now), now);
+            left = left - now;
+        }
+    }
+    borrow state as &sr in {
+        expect_hex(heap, contents(sr)[32..64], want);
+    }
+    unbox_slice(heap, state);
+    return 0;
+}
+
+fn test_pbkdf2_in_pieces_is_pbkdf2[&h](heap: &!h Heap) -> [heap] int {
+    pieces_of(heap, 1, 7, "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
+    pieces_of(heap, 4096, 1, "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a");
+    pieces_of(heap, 4096, 128, "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a");
+    pieces_of(heap, 4096, 4095, "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a");
+    pieces_of(heap, 4096, 5000, "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a");
+    // a state too small to hold it is refused, not written past
+    let small = box_slice(heap, 63, byte_of(0));
+    borrow mut small as &!w in {
+        test.assert_eq(pg.pbkdf2_begin(heap, "password", "salt", contents(w)), 0 - 1);
+        test.assert_eq(pg.pbkdf2_more(heap, "password", contents(w), 3), 0 - 1);
+    }
+    unbox_slice(heap, small);
+    return 0;
+}
+
+// The exchange of RFC 7677 section 3 by the parts a pool uses: the challenge checked, the key computed in
+// pieces, the rest from the key.
+fn test_scram_in_parts_is_scram[&h](heap: &!h Heap) -> [heap] int {
+    let server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+    let (iterations, checked) = pg.scram_iterations(server_first, "rOprNGfwEbeRWgbNEkqO");
+    test.assert_eq(checked, 0);
+    test.assert_eq(iterations, 4096);
+    let (salt, ok) = pg.scram_salt(heap, server_first);
+    test.assert(ok);
+    let state = box_slice(heap, 64, byte_of(0));
+    borrow salt as &sr in {
+        borrow mut state as &!sw in {
+            pg.pbkdf2_begin(heap, "pencil", buffer.bytes(sr), contents(sw));
+            pg.pbkdf2_more(heap, "pencil", contents(sw), 1000);
+            pg.pbkdf2_more(heap, "pencil", contents(sw), iterations - 1 - 1000);
+        }
+    }
+    buffer.drop(heap, salt);
+    borrow state as &str in {
+        let (final, expected, status) = pg.scram_client_final_with(heap, contents(str)[32..64], "user", "rOprNGfwEbeRWgbNEkqO", server_first);
+        test.assert_eq(status, 0);
+        borrow final as &fr in {
+            expect_bytes(buffer.bytes(fr), "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=");
+        }
+        borrow expected as &er in {
+            expect_bytes(buffer.bytes(er), "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
+        }
+        buffer.drop(heap, final);
+        buffer.drop(heap, expected);
+    }
+    unbox_slice(heap, state);
+    return 0;
+}
+
+fn test_scram_iterations_refuses_what_the_whole_refuses[&h](heap: &!h Heap) -> [heap] int {
+    let nonce = "rOprNGfwEbeRWgbNEkqO";
+    test.assert_eq(pg.scram_iterations("r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==", nonce).1, 1);
+    test.assert_eq(pg.scram_iterations("r=otherNonceXXXXXXXXXXabc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", nonce).1, 2);
+    test.assert_eq(pg.scram_iterations("r=rOprNGfwEbeRWgbNEkqO,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", nonce).1, 2);
+    test.assert_eq(pg.scram_iterations("r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=0", nonce).1, 4);
+    test.assert_eq(pg.scram_iterations("r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1000001", nonce).1, 4);
+    test.assert_eq(pg.scram_iterations("r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1000000", nonce).0, 1000000);
+    let (salt, ok) = pg.scram_salt(heap, "r=rOprNGfwEbeRWgbNEkqOabc,s=!!notbase64!!,i=4096");
+    test.assert(!ok);
+    buffer.drop(heap, salt);
+    let (none, found) = pg.scram_salt(heap, "r=rOprNGfwEbeRWgbNEkqOabc,i=4096");
+    test.assert(!found);
+    buffer.drop(heap, none);
+    return 0;
+}
+
 fn test_scram_client_first_message[&h](heap: &!h Heap) -> [heap] int {
     let m = pg.scram_client_first(heap, "user", "rOprNGfwEbeRWgbNEkqO");
     borrow m as &mr in {
