@@ -1,8 +1,9 @@
 # TLS to the server, with lex-sys's own TLS client
 
-> **Status: design, written before the code.** Sections 1 to 10 are the design, with the gates the work must meet (section 10) stated
-> before any number. What building it found is recorded in section 11 when it is, and a claim here that a measurement shows wrong is
-> corrected in place (marked *Corrected*). The things a person has to decide are section 12, each with a proposed answer.
+> **Status: built** (`src/ssl.ls`, `pool.secure`), tested against PostgreSQL 16 with TLS on and against mock servers, and measured
+> (section 11). Sections 1 to 10 are the design as written before the code, with the gates (section 10) stated before any number; where
+> building it showed the text wrong it is corrected in place (marked *Corrected*). The things a person has to decide are section 12,
+> each with a proposed answer. **The TLS engine is not independently reviewed (lex-sys #209).**
 
 ## 1. What asked for it
 
@@ -238,7 +239,8 @@ Every status has a stable tag, `pg.status_tag(status)`, and a TLS refusal has th
 example and the narrowed pool program, and asserts it.
 
 **Memory.** Per TLS connection the engine's slot, about 184 KiB once used, and in the pool 24 KiB of buffers per lane (the ciphertext
-waiting for the kernel, and a read). The roots: what the bundle's DER takes. A plain pool or a `disable` link: an engine of one slot that is
+waiting for the kernel, and a read). *Corrected (section 11.2):* resident, about 140 KiB a connection: the slot's pages that a handshake
+and a few queries never touch are not resident. The roots: what the bundle's DER takes. A plain pool or a `disable` link: an engine of one slot that is
 never written (address space only, section 3). Measured in section 11.
 
 **Time.** A full TLS 1.3 handshake on every connection (no resumption: the server issues no tickets, section 2). `lexsys-hooks` measured the
@@ -306,7 +308,152 @@ secure pool. Each must fail a test.
 
 ## 11. What was built, and what it measured
 
-*(Filled in when it is.)*
+Everything below ran on one machine: an Apple M4 Max, with Linux (Ubuntu 24.04 userland, aarch64, 6 vCPUs) in a VM under colima, where the
+servers, the client and the tests each ran in a container on the VM's network; the VM had other containers running (a load average of 1.6 to
+1.9). Compiler `653bdd1`. The macOS host ran the same suites natively as a second platform (section 11.4).
+
+### 11.1 What was built
+
+| | |
+|---|---|
+| `src/pg.ls` | `ssl_request`, `ssl_request_code`, `ssl_answer` (exactly one byte `S` or `N`), `sslmode` and its two modes, `status_tag` for every status, and `login_asks`, `scram_challenge`, `scram_verdict`: the decisions of `pg.login`, now pure functions that `pg.login` and `ssl.login` both call. `pg.login`'s signature and behaviour are what they were (the suites below). `pg` imports no TLS |
+| `src/ssl.ls`, `pg.ssl` | the `Link` of section 6: `open`, `close`, `secure`, `failure`, `reason`, `send`, `receive`, `request`, `login`, `simple`, `describing`, `extended`, `prepare`, `prepare_after`, `run_named`, `prepare_script` |
+| `src/pool.ls` | `secure`, `wall`, `tls_failure`, `secured`; three login phases (the answer, the handshake's start in `tick`, the handshake on events); the live lane's reads and writes through the engine; what the engine holds when the input is full, drained by `tick`; status 15, `lost`; `add` refused on a secure pool; the slot dropped whenever a lane's connection ends. No existing signature changed |
+| `examples/psql_tls.ls` | `psql` with `sslmode`, a CA file and a server name; `ERROR <tag>` and the status on a refusal |
+| `lex-sys.toml` | the compiler and `[dependencies.tls]` at `653bdd1`; `lex-sys install` writes nine modules (`tls`, its five parts, `x509`'s three) into `build/deps` |
+| stores | `.lex-sys-vcs` (pg, as before), `.lex-sys-vcs-pool` (requires 19 names of pg, 18 of `tls`, 2 of `tls_record`, the last two by origin), `.lex-sys-vcs-ssl` (new); `tests/stores.sh` publishes the three and compares. A consumer that locks the pool store and fetches it gets 11 files (pool, pg and the nine), and `tests/narrow_tls.ls` builds from them alone |
+| CI | `LEX_SYS_REV` `653bdd1`, checked against `lex-sys.toml`; `lex-sys install`; the server with TLS on and certificates made in the job (`tests/tls_certs.sh`, `tests/postgres.sh`); the pool unit tests with the dependency; `tests/stores.sh` in place of the two store steps; `tests/tls_test.py` last (it restarts the job's server) |
+
+### 11.2 The gates
+
+| gate | evidence |
+|---|---|
+| 1. every CI check | on Linux, every step of `ci.yml` in a container: unit tests 29 of 29, pool unit tests 12 of 12, `fmt --check` clean, `tests/e2e.py` 46 of 46 (against the TLS-enabled server, `disable`), through the proxy 46 of 46, `reconnect_test.py` 34 of 34, frame 6 of 6, SCRAM 6 of 6, the three stores. The pooler suite: 51 of 52 in that container, which has no `pgbench`; 52 of 52 on the macOS host, which has. Not run on GitHub's runner (section 11.5) |
+| 2. the TLS tests, in CI | `tests/tls_test.py`, 38 of 38 on Linux and on macOS (below), and a step of `ci.yml` |
+| 3. authority | `examples/psql_tls.ls`: `bounded`, no foreign symbol, `fs_read("")` (its CA file is named at run time). `tests/narrow_tls.ls` (a secure pool): `bounded`, no foreign symbol, `net_out("127.0.0.1:5432")`, `fs_read("/dev/urandom")`, `io_read`. Both asserted by the suite |
+| 4. mutants | 26 TLS mutants: 24 killed, 2 survive, both explained (11.3) |
+| 5. the cost measured | 11.2's tables |
+| 6. the loop not held | the longest turn while 8 TLS connections are made at once and then carry a request a millisecond: 4 to 13 ms in five runs (the bound is 50); `test_many_connections_over_one_engine` asserts it every run |
+
+**The tests** (`tests/tls_test.py`, 38): verify-full by `localhost`, `pg.test` and `127.0.0.1` (`pg_stat_ssl` says TLS 1.3); the reference
+client's rows over TLS (a 100,000-character value, 20,000 rows, a 300-column row, an error mid-string) and hostile parameters; trust,
+cleartext and SCRAM logins over TLS, and a wrong password (`28P01`); four wrong names (`x509-name-mismatch`, 15), another CA
+(`x509-unknown-issuer`), an empty trust store and a file with no certificate (`pg-ssl-setup`, 16); `require`, `verify-ca`, `prefer`, `allow`
+and two misspellings refused before dialling; the `ssl=off` server refused by `verify-full` (`pg-ssl-not-offered`, 13) and used by `disable`;
+`hostssl` and `hostnossl` both ways (the server's `28000`); mocks: bytes after the `S` (14, for the link and the pool), an ErrorResponse and
+a stray byte (14), a close after `S` (`tls-peer-closed`), an HTTP answer to the ClientHello (a `tls-` tag); a Python `ssl` server with the
+real certificate: a control, a live record that does not authenticate (`tls-bad-record-mac`, the pool's loss 15, and the link's status
+15), a `close_notify` (loss 1), a server that reads nothing for 1.5 s and then slowly (the pool's kernel full: requests answered, the
+server never kept waiting), and a server that answers in one record what the pool's input cannot hold (what the engine holds, delivered
+with nothing left in the kernel); the pool: 8 lanes on one engine (1,500+ requests right), the server's own view (`pg_stat_ssl`), every
+backend ended and every connection remade over TLS, **a real `docker restart` of the server** (down at 1.06 s, both lanes live again at
+1.50 s, before `psql` could reach it at 1.58 s; losses 2, no request answered wrong), a wrong name and another CA never live and retried at
+the backoff, the `ssl=off` server (13), cleartext and SCRAM logins, a `hostssl` role, a plain pool and `add` on a secure pool; and the two
+authority reports. The unit tests add 6 to `pg_test` (the SSLRequest bytes, the answer, `sslmode`, the tags, the shared login decisions)
+and 4 to `pool_test` (`lost(15)`, `secure`'s refusals, `secure` after `start`, a secure pool due at `start`).
+
+**Opening a connection** (`tests/tls_measure.py 200 7`: 200 connections one after the other, dial, `ssl.open`, `ssl.login` with trust,
+`select 1`, Terminate, close; 7 batches of each, alternating; per connection, median (least to most)):
+
+| mode | wall time | client CPU | of it, `ssl.open` (wall) | server CPU |
+|---|---:|---:|---:|---:|
+| `disable` | 1.00 ms (0.81 to 1.30) | 0.07 ms (0.06 to 0.09) | 0.01 ms | 1.40 to 1.43 ms |
+| `verify-full` | 5.87 ms (5.26 to 6.12) | 4.09 ms (3.91 to 4.16) | 4.88 ms (4.52 to 5.04) | 2.14 to 2.80 ms |
+
+**A TLS connection costs about 4.9 ms more to open, of which 4.0 ms is the client's CPU** (the handshake: X25519, the server's ECDSA P-256
+signature and its certificate's, the key schedule), and 0.7 to 1.4 ms more of the server's CPU (OpenSSL's side; the server's CPU is the
+container's cgroup `usage_usec` around three batches of 500, so it includes the postmaster's fork of each backend, the same in both rows).
+The certificates are P-256; RSA chains were not measured. For a pool this is paid once per connection, not per query; a query on an open
+TLS connection was not measured apart from the plain one (the `select 1` of each connection in the server-CPU batches: 0.17 to 0.19 ms with TLS, 0.12 to 0.13 without, from the
+program's own clock, which reads milliseconds).
+
+*Corrected, by this measurement:* the first run of it said **53.7 ms** for a TLS connection, of which the handshake was 10 ms. The rest was
+**Nagle's algorithm**: the engine writes a record at a time, so the client's Finished and the StartupMessage went out as two writes with no
+read between, and the second waited for the server's delayed acknowledgement of the first, 40 ms on Linux. (On macOS the same run said
+10.6 ms: its delayed acknowledgement is shorter.) Both the link and the pool now set `TCP_NODELAY` on a TLS connection (`conn_nodelay`), as
+libpq and PgBouncer do on every connection; the table is after the change. A plain connection is unchanged, and was not affected: its
+writes do not follow each other without a read.
+
+**Memory** (the pool driver holding idle live connections, its resident set):
+
+| lanes | plain | TLS | TLS, more per lane |
+|---:|---:|---:|---:|
+| 1 | 1,800 KiB | 2,420 KiB | 620 KiB (the engine's code and the roots' pages, once) |
+| 8 | 1,828 KiB | 3,236 KiB | 176 KiB |
+| 32 | 2,060 KiB | 6,620 KiB | 142 KiB |
+
+So about **140 KiB a TLS connection** once there are a few, less than the 184 KiB of the slot because pages that a handshake and a few
+queries never write stay untouched. Whether a plain pool's unused engine of one slot costs anything resident was not measured against a
+build without it; section 3's `statm` check is the evidence that it costs address space only.
+
+**The loop** (8 TLS connections made at once, then a request a millisecond for 3 s; five runs): all 8 live after 36 to 59 ms; the longest
+turn 4 to 13 ms (a turn that feeds the server's flight verifies its certificate and signature, about 4 ms of CPU, so two connections whose
+flights arrive together make a turn of 8 ms or more); 4 to 7 turns of 1 ms or more, 0 or 1 of 5 ms or more, in about 3,180. Under the 50 ms
+bound, and an order above the plain pool's (1 to 2 ms): **a pool that makes many TLS connections at once holds its loop about 4 ms per
+connection whose server flight arrives in that turn**. Spreading the certificate check over turns would need the engine to verify in
+pieces, which it does not.
+
+### 11.3 What building it found
+
+* **The stores did not change with the compiler.** The brief expected `653bdd1` to change static signatures and so the stores; published
+  with it before any source changed, `.lex-sys-vcs` and `.lex-sys-vcs-pool` were byte for byte the committed ones. They change here because
+  the sources do.
+* **Nagle** (11.2), found by the measurement, not by a test: no test asserted the time to open a connection. The pool's TLS tests passed
+  with 40 ms more per connection.
+* **Answers `tick` completes are announced by no event** (section 7, corrected): found by making the loop of the held-plaintext test
+  sleep up to 3 s once the requests stop. `next_wake` answers 0 in a turn whose `tick` completed answers.
+* **An `Fs` is narrowed once** (section 5, corrected): a program that reads `/dev/urandom` and a CA file holds `fs_read("")`. A lex-sys
+  gap: a capability that can be split into two narrowed ones.
+* **A region is one 64 KiB arena**: the prototype read a PEM bundle into a 64 KiB region slice next to 32 bytes of entropy and trapped
+  (SIGILL, no message). The library allocates per call well under it; programs read a bundle into a box (`psql_tls`, `tls_drive`).
+* **Owning a `Conn` discharges `conn_read` and `conn_write`**, so `ssl.open`'s row is `[heap]` although it reads and writes; the rows of
+  the functions over a borrowed `Link` carry them. Documented lex-sys behaviour (`threads.md` #129), surprising at the first refusal.
+* **The pool spins when its input is full and the kernel holds more** (plain and TLS alike, found with a 16 KiB input whose answers are
+  taken every 300 ms: 7 million turns in 3 s): a full input stops the reads but the socket stays watched for reading, and a level-triggered
+  poller reports it ready every turn. Not changed here (it is the existing pool's, and a caller sizes the input above its replies);
+  recorded for the pool's own backlog.
+* **`lexsys-hooks`' default build cannot take this pool as it is** (section 12, question 1): checked with `lex-sys check` of its `src/`, its
+  other dependencies and this `pg` and pool: `function open is defined twice` (its `tls` module and lex-sys's). The previous pool checks
+  clean against the same sources with `653bdd1`.
+
+**The mutants** (`python3 tests/mutants.py --tls`, Linux; each killed by the first test that failed, the suspicious ones checked by hand):
+the bytes after the `S` accepted; `N` taken for `S`; two tags swapped; a `disable` link sending SSLRequest; the answer read a byte at a time;
+the link verifying a name of its own, keeping no engine code, writing or reading in the clear; a live TLS failure not `lost`; a bundle with no
+root accepted; the wall clock's sign; certificates checked at the monotonic time; the pool verifying a name of its own; the wrong request code;
+the handshake begun before the answer is read; the answer left in the input; the handshake's end not switching the lane to the engine; a slot
+not dropped; what the engine holds never drained; a record that does not authenticate ignored; `add` accepted on a secure pool; answers `tick`
+completed not waking the loop; a failed handshake not failing the attempt. **24 killed. Two survive:**
+
+* *The loop is not woken for what the engine holds* (`next_wake`'s check of a lane that stopped for room and has room again). Equivalent in
+  every loop that runs `tick` (or `revive`) after taking its answers and before sleeping, which is the README's loop and the tests': the room
+  is made by `next_done`, and the next `tick` drains before the next wait. It guards a loop that takes answers after `tick` and then sleeps.
+* *Ciphertext the kernel did not take is not watched for* (the lane watched for reading alone when its plaintext is all with the engine but
+  the last record's ciphertext is not all written). The test that should catch it holds the kernel full (`full` over 10: the pool waits for the
+  kernel) and checks the server is never left waiting, and passes with the mutant on Linux and macOS: the state needs the kernel to refuse
+  part of the *last* record of what is queued, and on these machines a writable event comes with more room free than the pool's whole output
+  slab (64 KiB), so the last record always fits (an explanation, not measured). Reachable with a small send buffer, which no test here can set.
+
+A first run of these mutants found three tests that checked less than they said: the held-plaintext test against the real server did not
+reach the state (the server's later answers rescued it), so the one-record mock was added; the kernel-full test's server answered after
+0.5 s of silence, which rescued a stalled write, so it measures the server's waits instead; and the mock's own read timeout closed the
+connection, which also rescued it.
+
+### 11.4 macOS
+
+The same suites on the macOS host (Darwin, arm64), the servers in the VM: `tls_test.py` 38 of 38, `e2e.py` 46 of 46, the pooler 52 of 52.
+`reconnect_test.py` 32 of 34: `test_a_server_that_goes_away_and_comes_back` expects Linux's `ECONNREFUSED` (111; Darwin's is 61), and the
+blocking baseline failed once and passed three times after (a freshly built binary's first start is slow on macOS). Both are the existing
+tests' Linux assumptions (`reconnect.md` §6.6 ran Linux only), unchanged by this work.
+
+### 11.5 Not verified
+
+* **GitHub's runner.** Every CI step ran in a Linux container shaped like it; the workflow itself ran nowhere but in review. In particular
+  `docker restart` from a step, the job's `openssl`, and `lex-sys install` fetching from GitHub inside the job.
+* **x86-64.** Only arm64 (Linux and Darwin). The engine's AES-GCM is on the hardware instructions of both since `e59db18`.
+* **RSA certificate chains, a real CA's chain, a managed PostgreSQL.** The test CA is P-256 and one level.
+* **PostgreSQL other than 16**, and a server that offers only TLS 1.2 (the engine does 1.2 with the extended master secret).
+* **`lexsys-hooks` over TLS.** Its default build collides (above); its pure build was not tried with this pool.
+* **The long run.** No soak; the restart test is one restart.
 
 ## 12. Open questions, each with a proposed answer
 

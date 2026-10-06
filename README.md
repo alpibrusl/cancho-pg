@@ -385,7 +385,7 @@ eval "$(sh tests/postgres.sh)"                                    # a throwaway 
 python3 tests/e2e.py                                              # 46 tests against it (and a mock server)
 lex-sys test tests/pool_test.ls src/pool.ls src/pg.ls tests/generated/queries.ls build/deps/*.ls --std   # 12 pool tests, no server
 python3 tests/reconnect_test.py                                   # 34 tests of the reconnecting pool: PostgreSQL behind a proxy, and mocks
-python3 tests/tls_test.py                                         # 37 TLS tests: the server with verify-full, refusals, mocks, a restart
+python3 tests/tls_test.py                                         # 38 TLS tests: the server with verify-full, refusals, mocks, a restart
 sh tests/stores.sh                                                # the three published stores are the stores of the sources
 ```
 
