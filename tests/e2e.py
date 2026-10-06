@@ -35,6 +35,15 @@ GEN_USE = None
 POOL_DRIVE = None
 
 
+def deps():
+    """The sources `lex-sys install` wrote for lex-sys.toml's dependencies (the `tls` package and what it requires)."""
+    d = os.path.join(ROOT, "build", "deps")
+    files = sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".ls")) if os.path.isdir(d) else []
+    if not files:
+        raise SystemExit("build/deps is empty: run `lex-sys install` first")
+    return files
+
+
 def build():
     global BIN, DESCRIBE, PGEN, GEN_USE, POOL_DRIVE
     lex = os.environ.get("LEX_SYS", "lex-sys")
@@ -54,7 +63,8 @@ def build():
     GEN_USE = os.path.join(ROOT, "build", "gen_use")
     lex_files(GEN_USE, os.path.join(ROOT, "tests", "gen_use.ls"), os.path.join(ROOT, "tests", "generated", "queries.ls"))
     POOL_DRIVE = os.path.join(ROOT, "build", "pool_drive")
-    lex_files(POOL_DRIVE, os.path.join(ROOT, "tests", "pool_drive.ls"), os.path.join(ROOT, "src", "pool.ls"))
+    # `pg.pool` takes lex-sys's `tls` package (docs/tls.md): `lex-sys install` puts its sources in build/deps
+    lex_files(POOL_DRIVE, os.path.join(ROOT, "tests", "pool_drive.ls"), os.path.join(ROOT, "src", "pool.ls"), *deps())
 
 
 def describe(sql, user=USER, db=DB):

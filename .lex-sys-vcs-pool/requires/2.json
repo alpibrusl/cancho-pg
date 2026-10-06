@@ -1,0 +1,22 @@
+{
+  "store": "",
+  "lock": {
+    "origin": {
+      "git": "https://github.com/alpibrusl/lex-sys",
+      "rev": "653bdd1e9d7bbf032f1b03b62db91abcd18d83a1",
+      "path": "packages/tls/.lex-sys-vcs/tls_record"
+    },
+    "entries": {
+      "peer_closed": {
+        "sig_id": "bcd6aad43165687ca2fcad0341d01519a9fd8d949ef0162e11ac6010a2d089db",
+        "stage_id": "e140afc55c706cc6c15041e6ca23371d26462281e799e0cc3be2e41e32f66cbe",
+        "source_hash": "47422cfc78e9d5b977cb34b2f7fc0d127c34a3dc91d67302360219d3a14b7126"
+      },
+      "too_many_messages": {
+        "sig_id": "750fc1f1f4ca07c99087a60b83a386aa0d6da9504c52e9e310c3049cd74b024b",
+        "stage_id": "492231889b77780ee7950cf3ea8651422f6ffb74b133e8930cf595a08dca0931",
+        "source_hash": "47422cfc78e9d5b977cb34b2f7fc0d127c34a3dc91d67302360219d3a14b7126"
+      }
+    }
+  }
+}

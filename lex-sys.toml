@@ -1,0 +1,14 @@
+# lexsys-pg's project file: the compiler these sources are written for and the one library they take from elsewhere.
+# `lex-sys install` writes the dependency's sources (and those it requires: `x509`) into build/deps; the commands of the
+# README and CI pass `build/deps/*.ls` to `build` and `test` where a program uses `pg.ssl` or `pg.pool`. `pg` itself needs
+# nothing from here. The compiler revision is also CI's LEX_SYS_REV (one is checked against the other in CI).
+
+[package]
+name = "pg"
+lex-sys = "653bdd1e9d7bbf032f1b03b62db91abcd18d83a1"
+
+# lex-sys's own TLS client (packages/tls, lex-sys epic #197) and the certificate verifier it requires (docs/tls.md).
+[dependencies.tls]
+git = "https://github.com/alpibrusl/lex-sys"
+rev = "653bdd1e9d7bbf032f1b03b62db91abcd18d83a1"
+path = "packages/tls/.lex-sys-vcs/tls"

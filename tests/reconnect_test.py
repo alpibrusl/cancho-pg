@@ -47,6 +47,15 @@ BASELINE = None
 BUSY_BOUND = 50
 
 
+def deps():
+    """The sources `lex-sys install` wrote for lex-sys.toml's dependencies: `pg.pool` takes lex-sys's `tls` (docs/tls.md)."""
+    d = os.path.join(ROOT, "build", "deps")
+    files = sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".ls")) if os.path.isdir(d) else []
+    if not files:
+        raise SystemExit("build/deps is empty: run `lex-sys install` first")
+    return files
+
+
 def build():
     global DRIVE, NARROW, BASELINE
     os.makedirs(os.path.join(ROOT, "build"), exist_ok=True)
@@ -54,7 +63,7 @@ def build():
     def one(name, main):
         out = os.path.join(ROOT, "build", name)
         subprocess.run([LEX, "build", "--std", os.path.join(ROOT, "tests", main), os.path.join(ROOT, "src", "pool.ls"),
-                        os.path.join(ROOT, "src", "pg.ls"), "-o", out], check=True)
+                        os.path.join(ROOT, "src", "pg.ls"), *deps(), "-o", out], check=True)
         return out
     DRIVE = one("reconnect_drive", "reconnect_drive.ls")
     NARROW = one("narrow_use", "narrow_use.ls")
@@ -552,7 +561,7 @@ class Authority(unittest.TestCase):
     def test_the_pool_does_not_widen_the_programs_authority(self):
         # a program narrowed to one host and port that keeps a pool full with tick / adopt / dial_failed
         out = subprocess.run([LEX, "authority", os.path.join(ROOT, "tests", "narrow_use.ls"), os.path.join(ROOT, "src", "pool.ls"),
-                              os.path.join(ROOT, "src", "pg.ls"), "--std"], capture_output=True, text=True).stdout
+                              os.path.join(ROOT, "src", "pg.ls"), *deps(), "--std"], capture_output=True, text=True).stdout
         performs = out.split("never touches")[0]
         self.assertIn('net_out("127.0.0.1:5432")', performs)
         self.assertNotIn('net_out("")', performs)

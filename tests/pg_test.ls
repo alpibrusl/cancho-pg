@@ -771,3 +771,149 @@ fn test_bind_named_message[&h](heap: &!h Heap) -> [heap] int {
     pg.drop_params(heap, ps);
     return 0;
 }
+
+// ------------------------------------------------------------------ TLS (docs/tls.md): the protocol's part, and the names
+
+fn test_ssl_request_message[&h](heap: &!h Heap) -> [heap] int {
+    let m = pg.ssl_request(heap);
+    borrow m as &mr in {
+        let g = buffer.bytes(mr);
+        // Int32 8, Int32 80877103 (1234 in the high half, 5679 in the low)
+        test.assert_eq(len(g), 8);
+        test.assert_eq(int_of(g[0]) + int_of(g[1]) + int_of(g[2]), 0);
+        test.assert_eq(int_of(g[3]), 8);
+        test.assert_eq(int_of(g[4]) * 256 + int_of(g[5]), 1234);
+        test.assert_eq(int_of(g[6]) * 256 + int_of(g[7]), 5679);
+    }
+    buffer.drop(heap, m);
+    test.assert_eq(pg.ssl_request_code(), 80877103);
+    return 0;
+}
+
+fn test_the_answer_to_ssl_request_is_one_byte() -> [] int {
+    test.assert_eq(pg.ssl_answer(""), 0 - 1);
+    test.assert_eq(pg.ssl_answer("S"), 0);
+    test.assert_eq(pg.ssl_answer("N"), 13);
+    // anything after the byte is what a server does not send and a man in the middle would (CVE-2021-23222)
+    test.assert_eq(pg.ssl_answer("S\0"), 14);
+    test.assert_eq(pg.ssl_answer("NN"), 14);
+    // an ErrorResponse, another byte, the wrong case
+    test.assert_eq(pg.ssl_answer("E"), 14);
+    test.assert_eq(pg.ssl_answer("s"), 14);
+    test.assert_eq(pg.ssl_answer("\0"), 14);
+    return 0;
+}
+
+fn test_sslmode_offers_two_and_names_the_rest() -> [] int {
+    test.assert_eq(pg.sslmode("disable"), pg.sslmode_disable());
+    test.assert_eq(pg.sslmode("verify-full"), pg.sslmode_verify_full());
+    test.assert(pg.sslmode_disable() != pg.sslmode_verify_full());
+    test.assert_eq(pg.sslmode("require"), 0 - 2);
+    test.assert_eq(pg.sslmode("verify-ca"), 0 - 2);
+    test.assert_eq(pg.sslmode("prefer"), 0 - 2);
+    test.assert_eq(pg.sslmode("allow"), 0 - 2);
+    test.assert_eq(pg.sslmode(""), 0 - 1);
+    test.assert_eq(pg.sslmode("Verify-Full"), 0 - 1);
+    test.assert_eq(pg.sslmode("verify-full "), 0 - 1);
+    return 0;
+}
+
+fn test_every_status_has_a_name_of_its_own() -> [] int {
+    var a = 0;
+    while a <= 22 {
+        let known = a <= 16 || a == 20 || a == 21;
+        test.assert(bytes.equal(pg.status_tag(a), "unknown") != known);
+        var b = 0;
+        while b < a {
+            if known && !bytes.equal(pg.status_tag(b), "unknown") {
+                test.assert(!bytes.equal(pg.status_tag(a), pg.status_tag(b)));
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    test.assert(bytes.equal(pg.status_tag(0), "ok"));
+    test.assert(bytes.equal(pg.status_tag(13), "pg-ssl-not-offered"));
+    test.assert(bytes.equal(pg.status_tag(14), "pg-ssl-bad-answer"));
+    test.assert(bytes.equal(pg.status_tag(15), "pg-ssl-failed"));
+    test.assert(bytes.equal(pg.status_tag(16), "pg-ssl-setup"));
+    test.assert(bytes.equal(pg.status_tag(0 - 1), "unknown"));
+    return 0;
+}
+
+// An Authentication message with code `code` and `data` after it.
+fn auth_msg[&h, &d](heap: &!h Heap, out: buffer.Buffer, code: int, data: &d [byte]) -> [heap] buffer.Buffer {
+    let body = buffer.append(heap, b32(heap, buffer.empty(heap, 16), code), data);
+    return frame(heap, out, 82, body);
+}
+
+fn error_msg[&h](heap: &!h Heap, out: buffer.Buffer) -> [heap] buffer.Buffer {
+    var body = cstr(heap, buffer.push(heap, buffer.empty(heap, 32), byte_of(83)), "FATAL");
+    body = cstr(heap, buffer.push(heap, body, byte_of(67)), "28P01");
+    body = buffer.push(heap, body, byte_of(0));
+    return frame(heap, out, 69, body);
+}
+
+fn asks[&h](heap: &!h Heap, m: buffer.Buffer) -> [heap] int {
+    var a = 0;
+    borrow m as &mr in {
+        a = pg.login_asks(buffer.bytes(mr));
+    }
+    buffer.drop(heap, m);
+    return a;
+}
+
+// The decisions `pg.login` and `pg.ssl.login` share.
+fn test_what_a_login_is_asked_for[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(asks(heap, auth_msg(heap, buffer.empty(heap, 16), 0, "")), 0);
+    test.assert_eq(asks(heap, buffer.empty(heap, 16)), 0);
+    test.assert_eq(asks(heap, auth_msg(heap, buffer.empty(heap, 16), 3, "")), 3);
+    test.assert_eq(asks(heap, auth_msg(heap, buffer.empty(heap, 16), 10, "SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0")), 10);
+    test.assert_eq(asks(heap, auth_msg(heap, buffer.empty(heap, 16), 10, "OTHER\0\0")), 5);
+    test.assert_eq(asks(heap, auth_msg(heap, buffer.empty(heap, 16), 5, "salt")), 5);
+    test.assert_eq(asks(heap, error_msg(heap, buffer.empty(heap, 16))), 4);
+    test.assert_eq(asks(heap, error_msg(heap, auth_msg(heap, buffer.empty(heap, 16), 3, ""))), 4);
+    return 0;
+}
+
+fn test_the_scram_challenge_and_the_verdict[&h](heap: &!h Heap) -> [heap] int {
+    let c = auth_msg(heap, buffer.empty(heap, 16), 11, "r=abc,s=c2FsdA==,i=4096");
+    borrow c as &cr in {
+        let m = buffer.bytes(cr);
+        let (f, t) = pg.scram_challenge(m);
+        expect_bytes(m[f..t], "r=abc,s=c2FsdA==,i=4096");
+    }
+    buffer.drop(heap, c);
+    let e = error_msg(heap, auth_msg(heap, buffer.empty(heap, 16), 11, "r=abc"));
+    borrow e as &er in {
+        let (f, t) = pg.scram_challenge(buffer.bytes(er));
+        test.assert_eq(f, 0 - 4);
+        test.assert_eq(t, 0 - 4);
+    }
+    buffer.drop(heap, e);
+    let n = auth_msg(heap, buffer.empty(heap, 16), 0, "");
+    borrow n as &nr in {
+        let (f, t) = pg.scram_challenge(buffer.bytes(nr));
+        test.assert_eq(f, 0 - 7);
+    }
+    buffer.drop(heap, n);
+    let v = auth_msg(heap, buffer.empty(heap, 16), 12, "v=sig");
+    borrow v as &vr in {
+        test.assert_eq(pg.scram_verdict(buffer.bytes(vr), "v=sig"), 0);
+        test.assert_eq(pg.scram_verdict(buffer.bytes(vr), "v=gis"), 7);
+        test.assert_eq(pg.scram_verdict(buffer.bytes(vr), "v=si"), 7);
+    }
+    buffer.drop(heap, v);
+    let ok_only = auth_msg(heap, buffer.empty(heap, 16), 0, "");
+    borrow ok_only as &or in {
+        // AuthenticationOk with no signature before it is not proof
+        test.assert_eq(pg.scram_verdict(buffer.bytes(or), "v=sig"), 7);
+    }
+    buffer.drop(heap, ok_only);
+    let refused = error_msg(heap, buffer.empty(heap, 16));
+    borrow refused as &rr in {
+        test.assert_eq(pg.scram_verdict(buffer.bytes(rr), "v=sig"), 4);
+    }
+    buffer.drop(heap, refused);
+    return 0;
+}
