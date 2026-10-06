@@ -328,7 +328,7 @@ servers, the client and the tests each ran in a container on the VM's network; t
 
 | gate | evidence |
 |---|---|
-| 1. every CI check | on Linux, every step of `ci.yml` in a container: unit tests 29 of 29, pool unit tests 12 of 12, `fmt --check` clean, `tests/e2e.py` 46 of 46 (against the TLS-enabled server, `disable`), through the proxy 46 of 46, `reconnect_test.py` 34 of 34, frame 6 of 6, SCRAM 6 of 6, the three stores. The pooler suite: 51 of 52 in that container, which has no `pgbench`; 52 of 52 on the macOS host, which has. Not run on GitHub's runner (section 11.5) |
+| 1. every CI check | **on GitHub's runner, every step green** (11.5); before that, on Linux arm64, every step of `ci.yml` in a container: unit tests 29 of 29, pool unit tests 12 of 12, `fmt --check` clean, `tests/e2e.py` 46 of 46 (against the TLS-enabled server, `disable`), through the proxy 46 of 46, `reconnect_test.py` 34 of 34, frame 6 of 6, SCRAM 6 of 6, the three stores. The pooler suite: 51 of 52 in that container, which has no `pgbench`; 52 of 52 on the macOS host, which has. Not run on GitHub's runner (section 11.5) |
 | 2. the TLS tests, in CI | `tests/tls_test.py`, 38 of 38 on Linux and on macOS (below), and a step of `ci.yml` |
 | 3. authority | `examples/psql_tls.ls`: `bounded`, no foreign symbol, `fs_read("")` (its CA file is named at run time). `tests/narrow_tls.ls` (a secure pool): `bounded`, no foreign symbol, `net_out("127.0.0.1:5432")`, `fs_read("/dev/urandom")`, `io_read`. Both asserted by the suite |
 | 4. mutants | 26 TLS mutants: 24 killed, 2 survive, both explained (11.3) |
@@ -447,9 +447,9 @@ tests' Linux assumptions (`reconnect.md` §6.6 ran Linux only), unchanged by thi
 
 ### 11.5 Not verified
 
-* **GitHub's runner.** Every CI step ran in a Linux container shaped like it; the workflow itself ran nowhere but in review. In particular
-  `docker restart` from a step, the job's `openssl`, and `lex-sys install` fetching from GitHub inside the job.
-* **x86-64.** Only arm64 (Linux and Darwin). The engine's AES-GCM is on the hardware instructions of both since `e59db18`.
+* *Corrected:* **GitHub's runner** (ubuntu-latest, x86-64) ran the workflow on this PR and passed every step: unit 29 and 12, e2e 46, reconnect
+  34, through the proxy 46, frame 6, SCRAM 6, the pooler 52 (with `pgbench`), the three stores, and `tls_test.py` 38 (its restart: down at
+  1.02 s, both lanes live at 1.78 s). So x86-64 is run too; the measurements of 11.2 are arm64 only.
 * **RSA certificate chains, a real CA's chain, a managed PostgreSQL.** The test CA is P-256 and one level.
 * **PostgreSQL other than 16**, and a server that offers only TLS 1.2 (the engine does 1.2 with the extended master secret).
 * **`lexsys-hooks` over TLS.** Its default build collides (above); its pure build was not tried with this pool.
