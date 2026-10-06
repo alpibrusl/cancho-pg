@@ -308,7 +308,7 @@ how requests are batched on the wire, or in the cost of waking a blocked client.
   growing; the slab sizes are fixed when the pool is made. A page of 100 users is about 9 KiB.
 * **Cancellation** (section 8) is not done: a client that disconnects while its query is pending leaves the query
   running, and its answer is dropped by the generation check.
-* **TLS** to PostgreSQL is still not there, for the blocking helpers or the pool.
+* **TLS** to PostgreSQL is still not there, for the blocking helpers or the pool. *Corrected:* built, for both ([`tls.md`](tls.md)).
 
 ### 9.4 How the tests were checked
 

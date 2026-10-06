@@ -17,8 +17,9 @@ without reflection is [`docs/design.md`](docs/design.md) §6.
 **Slices 1 to 4 built:** startup, trust, cleartext-password and **SCRAM-SHA-256** login
 (the default of every PostgreSQL since 14), simple queries, extended queries with parameters,
 `describe`, prepared statements, and a generator of typed query functions (`tools/pgen.ls`, [below](#typed-queries-pgen)); checked against
-PostgreSQL 16 and the stock `psql` client. **Not yet:** MD5 login
-(answered with status 5), TLS, binary result formats, `COPY`. The helpers of layer 3 wait for the
+PostgreSQL 16 and the stock `psql` client. **TLS** with lex-sys's own TLS client, no foreign code: `sslmode` `disable` and
+`verify-full`, for the blocking connection (`pg.ssl`) and the pool (`pool.secure`) ([below](#tls), [`docs/tls.md`](docs/tls.md)). **Not yet:** MD5 login
+(answered with status 5), binary result formats, `COPY`. The helpers of layer 3 wait for the
 server; **`pg.pool`** ([below](#a-pool-that-does-not-wait)) is the connection that does not, and
 [`docs/nonblocking.md`](docs/nonblocking.md) has what it measured. **The pool also reconnects without ever waiting**
 (`pool.reconnect`, `tick`, `revive`: a lost connection is replaced, with its statements prepared again, by a login that is a state machine on the
@@ -27,11 +28,13 @@ poller's events; [below](#a-pool-that-comes-back) and [`docs/reconnect.md`](docs
 
 ## Requirements
 
-- The **lex-sys** compiler at the revision this repository's CI builds with (below; `a87f666`, which has `tcp_connect_start`, the dial that
-  does not wait, that the reconnecting pool needs: a pool that is only given connections with `add` works with older ones). A package store records no hash of the `std`
-  it was published against, so the compiler revision is part of the contract.
+- The **lex-sys** compiler at the revision this repository's CI builds with (below; `653bdd1`, which has `packages/tls` and the
+  crypto it needs, and `tcp_connect_start`, the dial that does not wait). It is also `[package] lex-sys` in `lex-sys.toml`, and CI checks that
+  the two agree. A package store records no hash of the `std` it was published against, so the compiler revision is part of the contract.
+- For `pg.pool` and `pg.ssl`: lex-sys's TLS package, which `lex-sys install` fetches at the commit `lex-sys.toml` pins into `build/deps`
+  (`pg` alone needs nothing from it).
 - Rust, to build that compiler (its `rust-toolchain.toml` pins the toolchain).
-- A **PostgreSQL** to talk to (any version; the tests use 16), and for the tests `docker` and the stock `psql` client.
+- A **PostgreSQL** to talk to (any version; the tests use 16), and for the tests `docker`, `openssl` and the stock `psql` client.
 
 ## Quick start
 
@@ -196,7 +199,8 @@ The reply is what `pg.run_named` returns, so every accessor `pgen` wrote works o
 closes, or that sends something that is not the protocol, answers every request still on it with a `status` that is
 not 0, in its place in the order. `examples/` has no program for it: `lexsys-web`'s `users_pg` is the user, with
 `lex-sys`'s `http.server` (`hold`/`answer`). The package is a store of its own,
-`.lex-sys-vcs-pool`, requiring `size` and `kind` from `.lex-sys-vcs`.
+`.lex-sys-vcs-pool`, requiring the names it calls of `.lex-sys-vcs` and of lex-sys's `tls` (by origin: a consumer gets it fetched
+with the pool). `pg.ssl` is a third store, `.lex-sys-vcs-ssl`; `tests/stores.sh` publishes all three.
 
 ### A pool that comes back
 
@@ -312,12 +316,51 @@ failed; `4` the server answered a login with an error (the reply holds the `Erro
 server asked for authentication this cannot do (MD5); `6` a write failed; `7` the SCRAM exchange failed on
 the client's side: no nonce, a challenge that is malformed, whose nonce does not extend the client's, whose
 salt is not base64 or whose iteration count is not 1..1,000,000, or a final message that does not carry the
-signature only the real server can compute.
+signature only the real server can compute. TLS adds `13` the server will not do TLS (`N`) and `verify-full` was asked for, `14` its
+answer to SSLRequest was not one byte `S` or `N`, `15` the handshake or a record failed (the engine's code says why), `16` TLS could
+not start. `status_tag(status)` names every one (`pg-closed`, `pg-ssl-not-offered`, ...); [`docs/tls.md`](docs/tls.md) §8 has the table.
 
 **Not done, on purpose:** SASLprep (RFC 4013) of the password. PostgreSQL's own client applies it; a password
 whose normalised form differs from what was typed (a non-breaking space, a compatibility ligature) is not
 logged in with here. ASCII and already-normalised text are, and a password with accents and an emoji is one
-of the end-to-end tests. Channel binding (`SCRAM-SHA-256-PLUS`) needs TLS, which does not exist yet.
+of the end-to-end tests. Channel binding (`SCRAM-SHA-256-PLUS`) is not done: it needs the server certificate's hash from the TLS
+engine ([`docs/tls.md`](docs/tls.md) §12).
+
+## TLS
+
+`pg.ssl` (`src/ssl.ls`) is a blocking connection that may be TLS, and `pool.secure` makes every connection a pool makes TLS; both
+use lex-sys's own TLS client (`packages/tls`, TLS 1.3 and 1.2) and nothing foreign, so `lex-sys authority` of a program is what it
+was, plus the CA file it reads. **Two modes**: `disable` (what every function did before, and still the default) and `verify-full`
+(the server's chain to a root the program trusts, its name, its dates). `require`, `verify-ca`, `prefer` and `allow` are **not
+offered**: the engine always verifies chain and name, and the weaker modes are either unauthenticated or downgradeable by whoever
+answers `N` ([`docs/tls.md`](docs/tls.md) §4 has the reasons). The TLS engine is **not independently reviewed** (lex-sys #209).
+
+```
+let (link, status) = ssl.open(heap, conn, pg.sslmode(mode_text), "db.internal", entropy, pem, clock_unix_ms(clock));
+let (hello, s) = ssl.login(heap, link, user, secret, database, nonce);     // and simple, extended, describing, prepare, run_named, request
+conn_close(ssl.close(heap, link));                                         // close_notify, the engine's secrets overwritten
+
+let (made, roots) = pool.secure(heap, pl, "db.internal", entropy, pem, clock_unix_ms(clock), clock_ms(clock));   // before reconnect/start
+```
+
+The program reads `entropy` (32 bytes of `/dev/urandom`) and `pem` (the trust store: an operator's CA, or the system bundle) itself, so
+the library holds no file capability. The name checked is not the address dialled (libpq's `host` and `hostaddr`). A refusal has a tag:
+`pg.status_tag(status)`, and for status 15 the engine's, `ssl.reason(link, status)` or `tls.refusal_tag(pool.tls_failure(pl))`:
+
+```
+$ build/psql_tls verify-full build/tls/ca.crt localhost 127.0.0.1 5432 postgres postgres - "select ssl, version from pg_stat_ssl where pid = pg_backend_pid()"
+t|TLSv1.3
+# SELECT 1
+$ build/psql_tls verify-full build/tls/ca.crt wrong.test 127.0.0.1 5432 postgres postgres - "select 1"; echo $?
+ERROR x509-name-mismatch
+15
+$ build/psql_tls verify-full build/tls/ca.crt localhost 127.0.0.1 5433 postgres postgres - "select 1"     # a server with ssl=off
+ERROR pg-ssl-not-offered
+```
+
+(`lex-sys install; lex-sys build --std examples/psql_tls.ls src/ssl.ls src/pg.ls build/deps/*.ls -o build/psql_tls`.) What a TLS
+connection costs to open, the memory a connection takes, and what is not done (direct TLS, client certificates, channel binding) are
+[`docs/tls.md`](docs/tls.md) §9 and §11.
 
 ## A connection pooler
 
@@ -336,11 +379,14 @@ every measurement with its caveats, is [`docs/pooler.md`](docs/pooler.md).
 ## Tests
 
 ```
-lex-sys test tests/pg_test.ls src/pg.ls --std                     # 23 unit tests, no server
-eval "$(sh tests/postgres.sh)"                                    # a throwaway postgres:16 with a role of each login kind
+lex-sys install                                                   # lex-sys's tls package into build/deps (pg.pool and pg.ssl need it)
+lex-sys test tests/pg_test.ls src/pg.ls --std                     # 29 unit tests, no server
+eval "$(sh tests/postgres.sh)"                                    # a throwaway postgres:16 with a role of each login kind, TLS on
 python3 tests/e2e.py                                              # 46 tests against it (and a mock server)
-lex-sys test tests/pool_test.ls src/pool.ls src/pg.ls tests/generated/queries.ls --std   # 8 pool tests, no server
+lex-sys test tests/pool_test.ls src/pool.ls src/pg.ls tests/generated/queries.ls build/deps/*.ls --std   # 12 pool tests, no server
 python3 tests/reconnect_test.py                                   # 34 tests of the reconnecting pool: PostgreSQL behind a proxy, and mocks
+python3 tests/tls_test.py                                         # 37 TLS tests: the server with verify-full, refusals, mocks, a restart
+sh tests/stores.sh                                                # the three published stores are the stores of the sources
 ```
 
 The unit tests encode and decode with no server, from replies built here from the protocol's documented
@@ -381,8 +427,17 @@ server is left alone), a database that drops every packet, one that accepts and 
 connection of four killed, a connection that dies the moment it is made, and mock servers that answer the login in pieces, badly or hostilely; the
 loop reports the longest it was kept from waiting. NN deliberate bugs in the pool and the SCRAM pieces (`tests/mutants.py`) each fail a test.
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds the pinned compiler and runs all of it
-against a `postgres:16` service, and checks that the checked-in package store is the store of `src/pg.ls`.
+TLS is checked on its own (`tests/tls_test.py`, [`docs/tls.md`](docs/tls.md) §10 and §11): `tests/postgres.sh` runs the server with TLS on and
+a certificate from a test CA that `tests/tls_certs.sh` makes on every run, a `hostssl` and a `hostnossl` role, and a second server with
+`ssl=off`. The blocking client and the pool connect by name and by address with `verify-full` (trust, cleartext and SCRAM logins, the reference
+client's rows over TLS); a wrong name, another CA, an empty trust store and the modes not offered are refused, each with its tag; mock servers
+answer SSLRequest with bytes after the `S`, an ErrorResponse, a stray byte, a close, or something that is not TLS, and break a live session with a
+record that does not authenticate or a close_notify; the pool remakes eight connections over one engine after every backend is ended, and after
+a real `docker restart` of the server; the plaintext the engine holds when the pool's input is full is delivered to a loop that sleeps; and the
+authority of two programs is checked (nothing foreign). The TLS mutants of `tests/mutants.py --tls` are in [`docs/tls.md`](docs/tls.md) §11.
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds the pinned compiler, installs the TLS package and runs all of it
+against a `postgres:16` with TLS on, and checks that the three checked-in package stores are the stores of their sources.
 
 ## Documentation
 
@@ -391,29 +446,36 @@ against a `postgres:16` service, and checks that the checked-in package store is
 - [`docs/nonblocking.md`](docs/nonblocking.md): the non-blocking connection and `pg.pool`, with what they measured.
 - [`docs/reconnect.md`](docs/reconnect.md): the pool that makes its own connections: the login as a state machine, the backoff, what a caller sees, and every measurement.
 - [`docs/pooler.md`](docs/pooler.md): the connection pooler, what it does and does not do, and every measurement with its caveats.
+- [`docs/tls.md`](docs/tls.md): TLS to the server with lex-sys's own TLS client: why `disable` and `verify-full` only, the blocking link and the
+  pool, the refusals and their tags, the costs, the tests and what they measured.
 
 ## Layout
 
 ```
 src/pg.ls          the driver: login (trust, cleartext, SCRAM-SHA-256), simple and extended queries, describe, prepared statements
-src/pool.ls        pg.pool: a few non-blocking connections, pipelined, for a loop that must not wait, and that makes its own
+src/pool.ls        pg.pool: a few non-blocking connections, pipelined, for a loop that must not wait, and that makes its own (over TLS with `secure`)
+src/ssl.ls         pg.ssl: a blocking connection that may be TLS (sslmode disable or verify-full)
 tools/pgen.ls      the generator of typed query functions from .sql files
-examples/          psql.ls and describe.ls: small command-line clients
+examples/          psql.ls, psql_tls.ls and describe.ls: small command-line clients
+lex-sys.toml       the compiler and the one dependency (lex-sys's tls package)
 pooler/            the connection pooler (PgBouncer's transaction mode)
 tests/             unit tests (lex-sys), end-to-end tests against PostgreSQL 16 and a mock server (Python)
-docs/              design, non-blocking, reconnect, pooler
+docs/              design, non-blocking, reconnect, pooler, tls
 ```
 
 ## Limitations
 
-Not yet: MD5 login (answered with status 5), TLS (so no channel binding), binary result formats, `COPY`. The password is not
+Not yet: MD5 login (answered with status 5), binary result formats, `COPY`. TLS is `disable` and `verify-full` only, with no direct TLS
+(PostgreSQL 17's `sslnegotiation=direct`), no client certificate, no channel binding and no revocation check, on an engine not yet
+independently reviewed ([`docs/tls.md`](docs/tls.md)); the pooler speaks no TLS. The password is not
 SASLprep-normalised. The blocking helpers wait for the server; `pg.pool` is the connection that does not, and with `reconnect` it comes back
 by itself (a host *name* is still resolved by a call that waits; a connection that goes silent without a close is found only by the request timeout).
 
 ## Contributing
 
 Every change goes through what CI runs: the unit tests, `lex-sys fmt --check`, the end-to-end tests against a `postgres:16`
-service, the pooler tests, and the check that the published package stores are the stores of `src/pg.ls` and `src/pool.ls`. Design
+service (TLS on), the pooler tests, the TLS tests, and the check that the published package stores are the stores of `src/pg.ls`,
+`src/pool.ls` and `src/ssl.ls` (`sh tests/stores.sh`; `sh tests/stores.sh write` after a change). Design
 before code, in `docs/`, with claims measured; a claim that turns out false is corrected in place.
 
 ## Licence

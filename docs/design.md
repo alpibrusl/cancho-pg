@@ -2,7 +2,7 @@
 
 > **Status: slices 1-4 built; the non-blocking connection is built ([`nonblocking.md`](nonblocking.md)) and reconnects by itself ([`reconnect.md`](reconnect.md))** -- the v3 wire protocol (startup, trust, cleartext-password and
 > SCRAM-SHA-256 login, simple and extended queries with parameters, describe), checked against
-> a real PostgreSQL 16 and the stock `psql` client, the typed-query generator `tools/pgen.ls` (§8), and prepared statements (§4, §9). Not built: MD5 login, TLS,
+> a real PostgreSQL 16 and the stock `psql` client, the typed-query generator `tools/pgen.ls` (§8), and prepared statements (§4, §9), and TLS (`sslmode` `disable` and `verify-full`, [`tls.md`](tls.md)). Not built: MD5 login,
 > binary result formats, `COPY`. §5 says what comes after, in
 > order, and §6 answers *what sits on top of a driver in a language without reflection*.
 
@@ -86,7 +86,9 @@ protocol documentation and the RFC vectors (`tests/pg_test.ls`, 20 tests). Layer
   `pgbouncer`) in front of the database, OpenSSL through the existing FFI (`lex-sys`'s
   `examples/tls_client` shows it works, and puts C back on the authority report), or a TLS 1.3
   implementation in lex-sys, which is a project of its own. Managed PostgreSQL requires it; a
-  database on the same host or the same private network does not.
+  database on the same host or the same private network does not. *Corrected:* the third option exists now (lex-sys's
+  `packages/tls`, lex-sys epic #197), and TLS is built on it, `disable` and `verify-full`, with no foreign code:
+  [`tls.md`](tls.md).
 * **A non-blocking connection.** Every helper in layer 3 waits for the server. In an event loop
   that is one thread serving every client (`http.server`), a query inside a handler stops all of
   them for a round trip. **Measured** (`lexsys-web`, docs/benchmarks.md "On PostgreSQL"): about
@@ -127,7 +129,7 @@ protocol documentation and the RFC vectors (`tests/pg_test.ls`, 20 tests). Layer
    ceiling on reads) but shared state, slow queries and group commit for writes; the document states, before it
    is built, what the benchmark must show for it to be worth keeping.
 6. **A connection pooler** (PgBouncer's job, in lex-sys): designed in [`pooler.md`](pooler.md), not built, with its slices, its gate against PgBouncer 1.22 and the conditions under which it is stopped written down first.
-7. **TLS**, once the sidecar-or-FFI-or-implement question has an asker.
+7. **TLS**, once the sidecar-or-FFI-or-implement question has an asker. *Built* on lex-sys's own TLS client: [`tls.md`](tls.md).
 
 ## 6. If we cannot have SQLAlchemy, what is the best thing to have?
 

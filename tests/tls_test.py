@@ -460,6 +460,53 @@ class AgainstAMock(unittest.TestCase):
         self.assertTrue(gaps)
         self.assertLess(max(gaps), 1.0, "the server waited %.2f s for the rest of a request" % max(gaps))
 
+    def test_plaintext_the_engine_holds_with_nothing_left_in_the_kernel_is_delivered(self):
+        # Five requests (the first may come before the connection is live, and is refused); the server answers all of them at
+        # once, 15,000 bytes or less in one TLS record, into an input of 8 KiB that
+        # the loop empties every 300 ms. The whole record is read and decrypted while the input is full: the kernel has nothing
+        # left, the engine holds the rest, and no poller event will come for it. The loop then sleeps up to 3 s at a time.
+        def then(raw, t):
+            data, at, pending = b"", 0, []
+            t.settimeout(0.05)
+            deadline = time.monotonic() + 1.2
+            while time.monotonic() < deadline:
+                try:
+                    chunk = t.recv(65536)
+                    if not chunk:
+                        return
+                    data += chunk
+                except socket.timeout:
+                    continue
+                while len(data) - at >= 5 and len(data) - at >= 1 + int.from_bytes(data[at + 1:at + 5], "big"):
+                    kind, n = data[at:at + 1], int.from_bytes(data[at + 1:at + 5], "big")
+                    body = data[at + 5:at + 1 + n]
+                    if kind == b"B":
+                        q = body.index(b"\0") + 1
+                        q = body.index(b"\0", q) + 1
+                        q += 2 + 2 * int.from_bytes(body[q:q + 2], "big")
+                        q += 2
+                        size = int.from_bytes(body[q:q + 4], "big")
+                        pending.append(int(body[q + 4:q + 4 + size]))
+                    at += 1 + n
+            out = b""
+            for tag in pending:
+                value = b"x" * ((tag % 7 + 1) * 1000)
+                out += msg(b"2") + msg(b"D", (1).to_bytes(2, "big") + len(value).to_bytes(4, "big") + value) + msg(b"C", b"SELECT 1\0") + msg(b"Z", b"I")
+            t.settimeout(None)
+            t.sendall(out)
+            hold(t)
+        m = self.tls_server(then)
+        r = Run(port=m.port, lanes=1, seconds=1, mode="wide", period=200, in_cap=8192).result()
+        self.assertEqual(r.final("losses"), 0)
+        self.assertEqual(r.code, 0, r.err)
+        tags = sorted(tag for _, tag, _, _ in r.done)
+        self.assertEqual(tags, list(range(len(tags))), r.lines[-3:])
+        self.assertGreaterEqual(len(tags), 4)
+        self.assertEqual(r.final("done") + r.final("refused3"), 5)
+        for _, tag, status, value in r.done:
+            self.assertEqual((status, value), (0, "w%d" % ((tag % 7 + 1) * 1000)), tag)
+        self.assertLess(max(t for t, _, _, _ in r.done), 3.0, "an answer waited for the loop's timeout")
+
     def test_the_mock_tls_server_is_a_good_control(self):
         m = self.tls_server(lambda raw, t: hold(t))
         r = Run(port=m.port, lanes=1, seconds=1, mode="idle").result()

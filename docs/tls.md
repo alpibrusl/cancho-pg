@@ -98,7 +98,10 @@ call that waits, `docs/reconnect.md` §2.5) verifies the certificate against the
 The library reads no file. A program that wants TLS reads the PEM bundle (an operator's CA file, or the system bundle,
 `/etc/ssl/certs/ca-certificates.crt` on Debian) and 32 bytes of `/dev/urandom` with its own `Fs`, narrowed to those files, and hands the
 bytes over. That keeps `lex-sys authority` exact: the program's report names the two files and nothing wider (`fs_read("/dev/urandom")`
-it already has, for the SCRAM nonce). `lexsys-hooks`' `tlsx.setup` searches four system locations because it needs `Fs("")` anyway;
+it already has, for the SCRAM nonce). *Corrected (section 11.3):* an `Fs` is narrowed once (`narrow` consumes it), so a program cannot
+hold both `Fs("/dev/urandom")` and `Fs("/etc/pg/ca.crt")`: it holds the prefix common to the two, which is `fs_read("")`. The library
+still reads nothing; the report of a program that reads both files says `fs_read("")`. `tests/narrow_tls.ls` reads its bundle from
+standard input instead and keeps `fs_read("/dev/urandom")`. A capability that splits into two narrowed ones is a lex-sys gap. `lexsys-hooks`' `tlsx.setup` searches four system locations because it needs `Fs("")` anyway;
 a library that took `Fs("")` would force that on every program that used it.
 
 * **A bundle with no usable root is refused** at setup, before any connection: a store that trusts nothing would fail every handshake
@@ -143,7 +146,8 @@ into pure functions of `pg` that both `pg.login` and `ssl.login` call; only the 
 signature and its behaviour, and the existing suites are the evidence that it did.
 
 **What a caller does not have to know:** the engine's slot, its buffers (a region per call, under the 64 KiB a region holds), or the
-mode, once `open` is done.
+mode, once `open` is done. (`open` takes the `Conn` by value, and owning a `Conn` discharges `conn_read` and `conn_write`, so its row is
+`[heap]`; the functions over a borrowed `Link` carry them.)
 
 ## 7. The pool: `pg.pool` over TLS
 
@@ -182,7 +186,9 @@ and the lane is watched for writing until both the plaintext and the ciphertext 
 the engine has nothing, the socket is read (4,096 bytes) and fed. **A level-triggered poller does not see plaintext the engine holds**: when
 the input slab is full the engine may still hold decrypted bytes the kernel no longer has, and nothing would wake the loop for them. So a lane
 that stopped reading for room is marked, `next_wake` answers 0 for it once `next_done` has made room, and `tick` moves what the engine holds
-into the slab (no socket read is needed for it, so `tick`'s row is unchanged).
+into the slab (no socket read is needed for it, so `tick`'s row is unchanged). *Corrected (section 11.3):* that was half of it. The answers
+`tick` completes that way are announced by no event either, and a loop that takes answers after its poller wait would sleep its whole
+timeout with them ready; so `next_wake` also answers 0 in a turn whose `tick` completed answers.
 
 **Time.** The certificates are checked at the Unix time. The pool's clock is the loop's monotonic `now`; `secure` takes both clocks once and the
 pool checks certificates at `now + (unix_ms - now_ms)`. A monotonic clock does not jump when the host's clock is set; a loop that wants

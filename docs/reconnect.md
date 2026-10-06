@@ -248,7 +248,8 @@ PBKDF2 in pieces ors instead of xors; PBKDF2 in pieces starts from nothing. **30
 * **A real server restart** (`pg_ctlcluster restart`) was not done: the server is shared. The proxy reproduces what a restart does to a connection (a FIN, new connections refused, then accepted),
   and `pg_terminate_backend` reproduces what it does to a backend (a FATAL 57P01 message and a close). Not reproduced: the window in which the server accepts connections and answers
   `57P03 the database system is starting up`; a mock does it (`test_a_server_that_starts_up_slowly...`).
-* **TLS** and **MD5** logins: not done, as before; an MD5 server is refused (`last_failure` 5) and retried at the backoff.
+* **TLS** and **MD5** logins: not done, as before; an MD5 server is refused (`last_failure` 5) and retried at the backoff. *Corrected:*
+  TLS is built (`pool.secure`, [`tls.md`](tls.md)); the login gains SSLRequest, the answer and the handshake, on the same events and ticks.
 * **A host name** in `revive`/`tcp_connect_start` is resolved by a call that waits (section 2.5); only an address was measured.
 * **A cable cut with no reset** is found only by `request_ms` (tested with the proxy frozen); an idle connection that dies silently is found by the first request that waits.
 * **Darwin**: only Linux was run (`tcp_connect_start` says the same of itself).
