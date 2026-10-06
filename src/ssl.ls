@@ -109,6 +109,9 @@ fn negotiate[&l, &n, &e, &p](link: &!l Link, mode: int, server_name: &n [byte], 
         }
         return refuse(link, 16, code);
     }
+    // TLS writes a record at a time: the client's Finished and the StartupMessage go out as two writes with no read between,
+    // and Nagle's algorithm would hold the second until the server's delayed acknowledgement of the first (40 ms on Linux).
+    conn_nodelay(link.conn);
     var answer = 0;
     region r {
         let request = alloc_slice[r](8, byte_of(0));

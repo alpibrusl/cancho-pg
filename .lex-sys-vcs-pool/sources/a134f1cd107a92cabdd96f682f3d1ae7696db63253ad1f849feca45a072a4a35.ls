@@ -1936,7 +1936,10 @@ fn step[&h, &t, &c, &p](heap: &!h Heap, tab: &!t conns.Table, core: &!c Core, po
             ci[29] = started;
             code = 15;
         } else {
-            // The ClientHello goes now; the server's answer is a poller event, and `pump` moves the handshake on.
+            // The ClientHello goes now; the server's answer is a poller event, and `pump` moves the handshake on. A record is a
+            // write of its own (the client's Finished, then the StartupMessage, with no read between), which Nagle's algorithm
+            // would hold for the server's delayed acknowledgement: TCP_NODELAY, as libpq and PgBouncer set it.
+            conns.nodelay(tab, st[p + 10]);
             st[p + 25] = 1;
             st[p + 11] = ph_handshake();
             write_tls(tab, core, k);
