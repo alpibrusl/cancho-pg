@@ -82,6 +82,7 @@ TLS_MUTANTS = [
     ("a record that does not authenticate is ignored", POOL, "            ci[29] = n;\n            return 15;\n        } else {\n            st[p + 30] = 0;", "            ci[29] = n;\n            return 0;\n        } else {\n            st[p + 30] = 0;"),
     ("ciphertext the kernel did not take is not watched for", POOL, "if st[p + 4] == st[p + 3] && st[p + 26] == st[p + 27] {", "if st[p + 4] == st[p + 3] {"),
     ("a secure pool accepts a connection from add", POOL, "        if contents(cr.ci)[27] == 1 {\n            k = cr.lanes;", "        if false {\n            k = cr.lanes;"),
+    ("answers that tick completed do not wake the loop", POOL, "    if ci[31] == 1 {\n        return 0;\n    }\n    var best", "    var best"),
     ("a failed handshake is not a failed attempt", POOL, "        if shaken != 0 {\n            fail_attempt(tab, core, k, shaken);", "        if false {\n            fail_attempt(tab, core, k, shaken);"),
 ]
 

@@ -209,7 +209,8 @@ fn stable_ms() -> [] int {
 // connections lost, 15 changes of any lane's state, 16 nonces made, 17 connections the pool made, 18 why the
 // last attempt failed, 19 the errno of the last connect that failed, 20..24 the SQLSTATE of the last refusal, 26 why the
 // last connection was lost; TLS: 27 1 if the pool is secure, 28 the Unix time minus the loop's clock (ms), 29 the engine's
-// code of the last TLS failure, 30 the length of the server name in `sname`.
+// code of the last TLS failure, 30 the length of the server name in `sname`, 31 1 if this turn's `tick` completed answers
+// (from plaintext the engine held) that no poller event will announce.
 fn ci_size() -> [] int {
     return 32;
 }
@@ -1704,6 +1705,7 @@ fn tick_in[&h, &t, &c, &p](heap: &!h Heap, tab: &!t conns.Table, core: &!c Core,
     let st = contents(core.st);
     let ci = contents(core.ci);
     var want = 0;
+    ci[31] = 0;
     var k = 0;
     while k < core.lanes {
         let p = stride() * k;
@@ -1730,8 +1732,13 @@ fn tick_in[&h, &t, &c, &p](heap: &!h Heap, tab: &!t conns.Table, core: &!c Core,
             if st[p + 30] == 1 && st[p] < core.in_cap {
                 // TLS: what the engine held when the input was full, now that `next_done` has made room
                 let had = st[p];
+                let whole = st[p + 2];
                 let code = drain_tls(tab, core, k);
                 take_in(tab, core, k, had, code);
+                if st[p + 2] > whole || st[p + 6] != 1 {
+                    // answers (or a loss) the loop must hear of without an event: `next_wake` says 0 this turn
+                    ci[31] = 1;
+                }
             }
             if st[p + 18] < 0 {
                 st[p + 18] = now;
@@ -2064,13 +2071,17 @@ pub fn revive[&h, &n, &t, &p](heap: &!h Heap, pool: Pool, net: &n Net(""), host:
 }
 
 // How long (ms) the loop may sleep before the pool needs a turn: 0 if there is work to do now (a login with something to
-// send or a key to compute, or a connection that is due); the time to the nearest deadline or retry otherwise; -1 if
+// send or a key to compute, a connection that is due, or -- TLS -- answers this turn's `tick` completed from what the engine
+// held, or room for more of it); the time to the nearest deadline or retry otherwise; -1 if
 // there is nothing the clock has to wake the loop for. The poller's events wake it for the rest. Use the smaller of
 // this and the loop's own timeout.
 pub fn next_wake[&q](pool: &q Pool, now: int) -> [] int {
     let core = pool.core;
     let st = contents(core.st);
     let ci = contents(core.ci);
+    if ci[31] == 1 {
+        return 0;
+    }
     var best = 0 - 1;
     var k = 0;
     while k < core.lanes {

@@ -17,19 +17,22 @@
 # and a second server, lexsys-pg-test-nossl on localhost:5433, runs with ssl=off (it answers SSLRequest with `N`).
 #
 # Needs docker, openssl and a psql client. Stop them with `docker rm -f lexsys-pg-test lexsys-pg-test-nossl`. The environment
-# for the end-to-end tests is printed on stdout: `eval "$(sh tests/postgres.sh)"`.
+# for the end-to-end tests is printed on stdout: `eval "$(sh tests/postgres.sh)"`. PG_TEST_NAME, PG_TEST_PORT and
+# PG_TEST_NOSSL_PORT choose other names and ports (for a second set beside the first).
 set -eu
-NAME=lexsys-pg-test
-NOSSL=lexsys-pg-test-nossl
+NAME=${PG_TEST_NAME:-lexsys-pg-test}
+NOSSL=$NAME-nossl
+PORT=${PG_TEST_PORT:-5432}
+NOSSL_PORT=${PG_TEST_NOSSL_PORT:-5433}
 TLS_DIR=$(sh "$(dirname "$0")/tls_certs.sh" "$(pwd)/build/tls")
 docker rm -f "$NAME" "$NOSSL" >/dev/null 2>&1 || true
 # The key must belong to the server's user and be 0600: a copy made inside the container, from a read-only mount.
-docker run -d --name "$NAME" -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust -v "$TLS_DIR":/certs:ro postgres:16 sh -c '
+docker run -d --name "$NAME" -p "$PORT":5432 -e POSTGRES_HOST_AUTH_METHOD=trust -v "$TLS_DIR":/certs:ro postgres:16 sh -c '
     mkdir -p /tls && cp /certs/server.crt /certs/server.key /tls/ && chown -R postgres /tls && chmod 600 /tls/server.key &&
     exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tls/server.crt -c ssl_key_file=/tls/server.key' >/dev/null
-docker run -d --name "$NOSSL" -p 5433:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16 >/dev/null
+docker run -d --name "$NOSSL" -p "$NOSSL_PORT":5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16 >/dev/null
 
-export PGHOST=127.0.0.1 PGPORT=5432 PGUSER=postgres PGDATABASE=postgres
+export PGHOST=127.0.0.1 PGPORT=$PORT PGUSER=postgres PGDATABASE=postgres
 tries=0
 until psql -Atc 'select 1' >/dev/null 2>&1; do
     tries=$((tries + 1))
@@ -67,17 +70,17 @@ docker exec -u postgres "$NAME" sh -c '
     psql -Atc "select pg_reload_conf()" >/dev/null' >&2
 
 tries=0
-until PGPORT=5433 psql -Atc 'select 1' >/dev/null 2>&1; do
+until PGPORT=$NOSSL_PORT psql -Atc 'select 1' >/dev/null 2>&1; do
     tries=$((tries + 1))
     [ "$tries" -lt 60 ] || { echo "the server without TLS did not come up" >&2; exit 1; }
     sleep 1
 done
 
 cat <<ENV
-export PG_TLS_CA=$TLS_DIR/ca.crt PG_TLS_OTHER_CA=$TLS_DIR/other.crt PG_TLS_CONTAINER=$NAME PG_NOSSL_PORT=5433
+export PG_TLS_CA=$TLS_DIR/ca.crt PG_TLS_OTHER_CA=$TLS_DIR/other.crt PG_TLS_CONTAINER=$NAME PG_NOSSL_PORT=$NOSSL_PORT
+export PGHOST=127.0.0.1 PGPORT=$PORT PGUSER=postgres PGDATABASE=postgres
 ENV
 cat <<'ENV'
-export PGHOST=127.0.0.1 PGPORT=5432 PGUSER=postgres PGDATABASE=postgres
 export PG_CLEARTEXT_USER=pwuser PG_CLEARTEXT_PASSWORD=hunter2 PG_CLEARTEXT_DB=e2e_pw
 export PG_SCRAM_USER=scramuser PG_SCRAM_PASSWORD='s3cr3t pass' PG_SCRAM_DB=e2e_scram
 export PG_SCRAM_UNICODE_USER=scramuni PG_SCRAM_UNICODE_PASSWORD='pässwörd 🔑' PG_SCRAM_UNICODE_DB=e2e_scram_uni

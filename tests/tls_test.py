@@ -415,6 +415,51 @@ class AgainstAMock(unittest.TestCase):
         out, code = ours("verify-full", "select 1", port=m.port)
         self.assertEqual((out, code), ("ERROR tls-bad-record-mac\n", 15))
 
+    def test_a_request_the_kernel_cannot_take_at_once_goes_on_when_it_can(self):
+        # The server reads nothing for 1.5 s (its receive buffer small), so the pool's ciphertext waits for the kernel; then it
+        # reads slowly (8 KiB every 10 ms, so that the kernel stays full to the last record), and answers only after 4 s with
+        # nothing new. The loop sleeps in its poller up to 3 s at a time (mode `push`). A pool that watches its socket for
+        # writing keeps the server fed until the last byte; one that does not leaves the rest until the loop's timeout, and the
+        # server sees a pause of seconds.
+        gaps = []
+        reply = msg(b"2") + msg(b"D", (1).to_bytes(2, "big") + (5).to_bytes(4, "big") + b"60000") + msg(b"C", b"SELECT 1\0") + msg(b"Z", b"I")
+
+        def then(raw, t):
+            time.sleep(1.5)
+            t.settimeout(4.0)
+            data, at, syncs, last = b"", 0, 0, None
+            while True:
+                try:
+                    time.sleep(0.01)
+                    chunk = t.recv(8192)
+                    if not chunk:
+                        return
+                    now = time.monotonic()
+                    if last is not None:
+                        gaps.append(now - last)
+                    last = now
+                    data += chunk
+                    while len(data) - at >= 5 and len(data) - at >= 1 + int.from_bytes(data[at + 1:at + 5], "big"):
+                        if data[at:at + 1] == b"S":
+                            syncs += 1
+                        at += 1 + int.from_bytes(data[at + 1:at + 5], "big")
+                except socket.timeout:
+                    if syncs:
+                        t.sendall(reply * syncs)
+                        syncs = 0
+                    last = None
+        m = self.tls_server(then)
+        m.lis.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32768)
+        r = Run(port=m.port, lanes=1, seconds=1, mode="push", period=5).result()
+        self.assertEqual(r.code, 0, r.err)
+        tags = sorted(tag for _, tag, _, _ in r.done)
+        self.assertEqual(tags, list(range(len(tags))))
+        self.assertGreater(len(tags), 5)
+        self.assertTrue(all((s, v) == (0, "60000") for _, _, s, v in r.done))
+        self.assertGreater(r.final("full"), 10, "the kernel never made the pool wait")
+        self.assertTrue(gaps)
+        self.assertLess(max(gaps), 1.0, "the server waited %.2f s for the rest of a request" % max(gaps))
+
     def test_the_mock_tls_server_is_a_good_control(self):
         m = self.tls_server(lambda raw, t: hold(t))
         r = Run(port=m.port, lanes=1, seconds=1, mode="idle").result()
@@ -523,7 +568,8 @@ class Pool(unittest.TestCase):
         # a lane fails at about 0, 0.1, 0.3, 0.7, 1.1, 1.5, 1.9 s: seven, at the backoff, never faster
         self.assertGreaterEqual(r.final("attempts"), 8)
         self.assertLessEqual(r.final("attempts"), 18)
-        self.assertEqual(r.final("attempts"), r.final("failures"))
+        # every attempt failed but the ones under way when the run ended (one a lane at most)
+        self.assertGreaterEqual(r.final("failures"), r.final("attempts") - 2)
         self.check_stall(r)
 
     def test_an_unknown_authority_is_never_live(self):
@@ -556,13 +602,18 @@ class Pool(unittest.TestCase):
     def test_what_the_engine_holds_when_the_input_is_full_is_delivered(self):
         # answers of 1,000 to 7,000 bytes taken every 300 ms into an input of 16 KiB: reading stops for room while a record's
         # plaintext is still in the engine, and no poller event will say so
-        r = Run(lanes=2, seconds=3, mode="wide", period=5, in_cap=16384).result()
+        # plaintext the engine holds, and no poller event will say so. Once the requests stop the loop sleeps up to 3 s at a time:
+        # what the engine held must still come out at once.
+        run = Run(lanes=2, seconds=3, mode="wide", period=5, in_cap=16384)
+        r = run.result()
         self.assertEqual(r.code, 0, r.err)
         tags = sorted(tag for _, tag, _, _ in r.done)
         self.assertEqual(tags, list(range(len(tags))))
         self.assertGreater(len(tags), 50)
         for _, tag, status, value in r.done:
             self.assertEqual((status, value), (0, "w%d" % ((tag % 7 + 1) * 1000)), tag)
+        last = max(t for t, _, _, _ in r.done)
+        self.assertLess(last - 3.0, 1.0, "the last answers waited for the loop's timeout")
 
     def test_a_secure_pool_takes_no_connection_from_add(self):
         r = Run(lanes=1, seconds=1, mode="add").result()

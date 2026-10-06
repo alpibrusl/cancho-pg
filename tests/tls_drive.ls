@@ -13,7 +13,10 @@ import tls;
 //
 // `server name` `-` is a plain pool (no `secure`). `ca file` is the PEM bundle of the roots. `input slab` is each
 // connection's input (`in_cap`): a small one makes the answers fill it, so that the plaintext the engine holds must wait
-// for room. Mode `wide` is `lazy` with a statement whose answer is 1,000 to 7,000 bytes (printed as `w<length>`).
+// for room. Mode `wide` is `lazy` with a statement whose answer is 1,000 to 7,000 bytes (printed as `w<length>`), and once
+// the requests stop the loop sleeps in its poller up to 3 s at a time.
+// Mode `push` sends `len` of 60,000 bytes every `period` ms for `seconds`, and then waits for the answers, sleeping in the
+// poller up to 3 s at a time: a request the kernel could not take all at once moves on only if the pool watches for it.
 // Mode `add` dials one connection itself and offers it to the pool with `add`, printing `add 0 lane <answer + 10>`.
 // Each `ev` and `finished` line also says `secured 0|1`, `tls <engine code>` and `tag <its tag>`; a `secure` that is refused prints
 // `secure <answer>` and exits 106.
@@ -140,6 +143,28 @@ fn request[&h](heap: &!h Heap, name: &static [byte], n: int) -> [heap] buffer.Bu
     return m;
 }
 
+// `len` with a text of `n` bytes: a request of about `n` bytes.
+fn request_text[&h](heap: &!h Heap, n: int) -> [heap] buffer.Buffer {
+    var text = buffer.empty(heap, n);
+    var i = 0;
+    while i < n {
+        text = buffer.push(heap, text, byte_of(120));
+        i = i + 1;
+    }
+    var ps = pg.params(heap);
+    borrow text as &tr in {
+        ps = pg.param(heap, ps, buffer.bytes(tr));
+    }
+    buffer.drop(heap, text);
+    var m = buffer.empty(heap, 1);
+    borrow ps as &pr in {
+        buffer.drop(heap, m);
+        m = pg.bind_named(heap, "len", pr);
+    }
+    pg.drop_params(heap, ps);
+    return m;
+}
+
 fn show[&h, &i, &q](heap: &!h Heap, io: &!i Io, pl: &q pool.Pool, t: int, tag: int) -> [heap, err_write] int {
     var o = stamp(heap, "done", t);
     o = buffer.append(heap, o, " ");
@@ -180,6 +205,7 @@ fn run[&h, &i, &n, &k, &g, &f](heap: &!h Heap, io: &!i Io, net: &n Net(""), cloc
     let slow = int_of(arg(args, 8)[0]) == 115;
     let idle = int_of(arg(args, 8)[0]) == 105;
     let wide = int_of(arg(args, 8)[0]) == 119;
+    let push = int_of(arg(args, 8)[0]) == 112;
     let lazy = int_of(arg(args, 8)[0]) == 108 || wide;
     let port = number_of(arg(args, 2));
     let started = clock_ms(clock);
@@ -319,6 +345,21 @@ fn run[&h, &i, &n, &k, &g, &f](heap: &!h Heap, io: &!i Io, net: &n Net(""), cloc
                     emit(heap, io, line);
                 }
                 var wait = 10;
+                if wide && over {
+                    // the answers still to come are in the engine or the kernel: only the pool and the poller wake the loop
+                    wait = 3000;
+                }
+                if push {
+                    // only the poller, the pool and the next request wake this loop (up to 3 s): a socket the pool needs to
+                    // write to must be watched, or nothing moves until the timeout
+                    wait = 3000;
+                    if !over && next_at - now < wait {
+                        wait = next_at - now;
+                        if wait < 0 {
+                            wait = 0;
+                        }
+                    }
+                }
                 borrow pl as &qr in {
                     let w = pool.next_wake(qr, now);
                     if w >= 0 && w < wait {
@@ -380,7 +421,14 @@ fn run[&h, &i, &n, &k, &g, &f](heap: &!h Heap, io: &!i Io, net: &n Net(""), cloc
                     if wide {
                         statement = "wide";
                     }
-                    let m = request(heap, statement, next_tag);
+                    var m = buffer.empty(heap, 1);
+                    if push {
+                        buffer.drop(heap, m);
+                        m = request_text(heap, 60000);
+                    } else {
+                        buffer.drop(heap, m);
+                        m = request(heap, statement, next_tag);
+                    }
                     var r = 0 - 9;
                     borrow m as &mb in {
                         borrow mut pl as &!qw in {
@@ -430,7 +478,10 @@ fn run[&h, &i, &n, &k, &g, &f](heap: &!h Heap, io: &!i Io, net: &n Net(""), cloc
                 if over && pending == 0 {
                     finished = true;
                 }
-                if over && after - started > seconds * 1000 + 3000 {
+                if over && after - started > seconds * 1000 + 3000 && !push {
+                    finished = true;
+                }
+                if over && after - started > seconds * 1000 + 15000 {
                     finished = true;
                 }
             }
