@@ -1,9 +1,9 @@
 {
-  "op_id": "fe844938fd70801efc2ab6dbb487e411b7f3d177e0f4c3ccd35cd512b733e8d8",
+  "op_id": "af8cbbbaf5cb32c3f4d202834af0203f35c0fa4132671c90c7e8edbc3e9dd9e2",
   "operation": {
     "kind": "AddFunction",
     "sig_id": "16c22dc0a52dee3ca04c4794f1203e4d531b1b4a9040555da2771180844e73a0",
-    "stage_id": "6628079b75781feec03f04f4fd1953209ae3c93c57893663520679c569fe428e",
+    "stage_id": "b8ad00d32c699d1d433fb757cd5fb7b2d7a36042cda965bce09a8d8d79f75c45",
     "effects": [
       "conn_write",
       "heap",

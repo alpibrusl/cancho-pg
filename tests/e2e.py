@@ -910,6 +910,22 @@ class PoolAgainstAMock(unittest.TestCase):
         self.assertEqual([t for t, _, _ in done], list(range(8)))
         self.assertEqual([s for _, s, _ in done], [0, 0, 0, 1, 1, 1, 1, 1])
 
+    def test_answers_more_than_the_input_holds_in_a_loop_that_takes_them_when_quiet(self):
+        # docs/nonblocking.md section 10. Twelve answers of 20,000 bytes for an input of 64 KiB, in the loop of an `add` pool (no
+        # `tick`, no `next_wake`) that takes answers only once the poller has been quiet ("lazy"). The input fills with the kernel
+        # holding more: the lane must stop being watched for reading, or the poller is never quiet, the answers are never taken
+        # and the loop never waits; and `flush` must watch it again once they are, or the rest is never read.
+        value = b"x" * 20000
+
+        def plan(conn, i, v):
+            return [(self.msg(b"2", b"") + self.msg(b"D", (1).to_bytes(2, "big") + len(value).to_bytes(4, "big") + value)
+                     + self.msg(b"C", b"SELECT 1\0") + self.msg(b"Z", b"I"), 0)]
+        port = self.serve(plan)
+        done, finished, rc = pool_run(port, 1, 12, "lazy", budget=3000)
+        self.assertEqual(rc, 0)
+        self.assertEqual(done, [(i, 0, value.decode()) for i in range(12)])
+        self.assertLess(finished[1], 100, finished)
+
     def test_one_connection_dying_leaves_the_other_serving(self):
         def plan(conn, i, v):
             return "close" if conn == 0 and i == 1 else [(self.good(v), 0)]

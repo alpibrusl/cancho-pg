@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -156,17 +157,30 @@ class Run:
                     return None
                 self.cond.wait(left)
 
+    def reap(self, timeout):
+        """Wait for the process with `wait4`, which also says how much CPU it used (user and system, seconds)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            pid, status, usage = os.wait4(self.p.pid, os.WNOHANG)
+            if pid:
+                self.p.returncode = os.waitstatus_to_exitcode(status)
+                return usage.ru_utime + usage.ru_stime
+            time.sleep(0.01)
+        return None
+
     def result(self, timeout=60):
         self.wait(lambda text: text == "stop", timeout)
-        try:
-            self.p.wait(timeout=10)
-        except subprocess.TimeoutExpired:
+        cpu = self.reap(10)
+        if cpu is None:
             self.p.kill()
             self.p.wait()
         self.reader.join(5)
         self.p.stderr.close()
         with self.cond:
-            return Result(list(self.lines), self.p.returncode)
+            r = Result(list(self.lines), self.p.returncode)
+        r.cpu = cpu
+        r.wall = time.monotonic() - self.t0
+        return r
 
 
 class Result:
@@ -357,6 +371,46 @@ class AgainstAMock(unittest.TestCase):
         self.assertEqual(r.final("live"), 0)
         self.assertEqual(r.final("last"), 15)
         self.assertEqual(r.tag, "tls-peer-closed")
+
+    def test_a_connection_reset_while_its_input_is_full_is_ended_at_once(self):
+        # A plain pool's input (16 KiB) is full, its answers taken every 300 ms; the server has sent far more than that and then
+        # resets the connection. The parked lane is watched for nothing that makes it readable, but epoll reports a reset
+        # whatever it is asked for, at every wait: the pool must end the connection then, not turn without waiting until the
+        # loop makes room. (kqueue reports nothing for a filter that is not there: on macOS the reset is seen by the next write or
+        # by the read once there is room, so the status is checked on Linux alone.)
+        reply = msg(b"2") + msg(b"D", (1).to_bytes(2, "big") + (6000).to_bytes(4, "big") + b"x" * 6000) + msg(b"C", b"SELECT 1\0") + msg(b"Z", b"I")
+
+        # The loop takes its answers 300 ms, 600 ms ... after it starts, which is when it dials; the reset comes half way between
+        # two of them, and a request is written every 20 ms (a write to a reset socket fails, which would end it as well).
+        def handler(c, i):
+            accepted = time.monotonic()
+            read_startup(c)
+            c.sendall(finish_login())
+            serve_statements(c, count=4)
+            c.settimeout(0.01)
+            while i > 0 or time.monotonic() - accepted < 0.45:
+                try:
+                    kind, _ = read_message(c)
+                except socket.timeout:
+                    continue
+                if kind == b"S":
+                    c.sendall(reply)
+            c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            c.close()
+        m = self.mock(handler)
+        r = Run(port=m.port, lanes=1, seconds=2, mode="wide", period=20, in_cap=16384, name="-", ca="-").result()
+        print("\n    reset while parked: %d turns, %.2f s CPU in %.2f s, loss %d" % (r.final("turns"), r.cpu, r.wall, r.final("loss")),
+              file=sys.stderr)
+        # Ended by the reset (3, or 1), at the wait that reported it: not by the next request's write (6) after turns that did
+        # not wait. Some hundreds of turns are the loop's own (it waits 10 ms at most).
+        self.assertLess(r.final("turns"), 1500, "the loop spun on a reset it could not read")
+        self.assertEqual(r.code, 0, r.err)
+        tags = sorted(tag for _, tag, _, _ in r.done)
+        self.assertEqual(tags, list(range(len(tags))))
+        self.assertTrue(all(s in (0, 1, 3, 6) for _, _, s, _ in r.done), r.done)
+        self.assertEqual(r.final("losses"), 1)
+        if sys.platform.startswith("linux"):
+            self.assertIn(r.final("loss"), (1, 3))
 
     def tls_server(self, then, statements=4):
         """A mock that answers `S`, makes the TLS handshake as the real server's certificate would (Python's `ssl`), logs the
@@ -661,6 +715,48 @@ class Pool(unittest.TestCase):
             self.assertEqual((status, value), (0, "w%d" % ((tag % 7 + 1) * 1000)), tag)
         last = max(t for t, _, _, _ in r.done)
         self.assertLess(last - 3.0, 1.0, "the last answers waited for the loop's timeout")
+
+    def full_input(self, name, ca):
+        # docs/tls.md section 11.3 and docs/nonblocking.md section 10: answers of 1,000 to 7,000 bytes, a request every 5 ms, taken
+        # every 300 ms, into an input of 16 KiB: the input fills in a few milliseconds and the kernel holds the rest. The loop
+        # waits at most 10 ms a turn, so a loop that waits makes some hundreds of turns in the 3 s; one that is woken by a
+        # socket it cannot read makes millions, and the CPU of the run is the loop's.
+        r = Run(lanes=1, seconds=3, mode="wide", period=5, in_cap=16384, name=name, ca=ca).result()
+        self.assertEqual(r.code, 0, r.err)
+        tags = sorted(tag for _, tag, _, _ in r.done)
+        self.assertEqual(tags, list(range(len(tags))))
+        self.assertGreater(len(tags), 20)
+        for _, tag, status, value in r.done:
+            self.assertEqual((status, value), (0, "w%d" % ((tag % 7 + 1) * 1000)), tag)
+        self.assertEqual(r.final("losses"), 0)
+        turns = r.final("turns")
+        print("\n    full input (%s): %d turns, %d answers, %.2f s CPU in %.2f s" % ("plain" if name == "-" else "TLS", turns,
+              len(tags), r.cpu, r.wall), file=sys.stderr)
+        self.assertLess(turns, 5000, "the loop spun while the input was full")
+        self.assertLess(r.cpu, 0.5 * r.wall, "the loop used %.2f s of CPU in %.2f s" % (r.cpu, r.wall))
+
+    def test_a_full_input_is_not_watched_for_reading(self):
+        self.full_input("-", "-")
+
+    def test_a_full_input_is_not_watched_for_reading_over_tls(self):
+        self.full_input("localhost", CA)
+
+    def test_a_parked_lane_is_watched_again_in_a_loop_of_another_order(self):
+        # `mid`: `tick` and `flush` before the answers are taken, then `next_wake` (only it says the lane has room); `tail`: the
+        # answers, then `tick`, and `next_wake` not asked (only `tick` watches the lane again before the loop sleeps). Once the
+        # requests stop the loop sleeps up to 3 s: a lane left parked with room waits for that.
+        for mode in ("mid", "tail"):
+            r = Run(lanes=1, seconds=2, mode=mode, period=5, in_cap=16384, name="-", ca="-").result()
+            self.assertEqual(r.code, 0, (mode, r.err))
+            tags = sorted(tag for _, tag, _, _ in r.done)
+            self.assertEqual(tags, list(range(len(tags))), mode)
+            self.assertGreater(len(tags), 20, mode)
+            for _, tag, status, value in r.done:
+                self.assertEqual((status, value), (0, "w%d" % ((tag % 7 + 1) * 1000)), (mode, tag))
+            self.assertEqual(r.final("pending"), 0, mode)
+            last = max(t for t, _, _, _ in r.done)
+            self.assertLess(last - 2.0, 1.0, "%s: the last answers waited for the loop's timeout" % mode)
+            self.assertLess(r.final("turns"), 5000, mode)
 
     def test_a_secure_pool_takes_no_connection_from_add(self):
         r = Run(lanes=1, seconds=1, mode="add").result()

@@ -46,7 +46,9 @@ module pg.pool;
 // Sizes are fixed when the pool is made (and `reconnect` makes the one copy of the login and the
 // statements it needs) and nothing is allocated afterwards: per connection an
 // input slab (`in_cap`: the replies waiting to be taken, and a reply that does not fit is a
-// failure, status 8), an output slab (`out_cap`) and `depth` requests in flight.
+// failure, status 8), an output slab (`out_cap`) and `depth` requests in flight. A connection whose input is full is not
+// watched for reading (the poller would report it at every wait and the loop would never sleep) until `next_done` has made
+// room and `flush` or `tick` watches it again; `next_wake` answers 0 meanwhile (docs/nonblocking.md section 10).
 //
 // TLS (docs/tls.md section 7). `secure` makes every connection the pool makes `verify-full`: SSLRequest, the server's
 // one-byte answer, a TLS handshake with cancho's own engine (`packages/tls`, which the pool owns, one slot per connection)
@@ -76,7 +78,8 @@ import tls_record;
 //      4  how much of that the kernel has taken
 //      5  requests in flight (queued or sent, and not yet given out)
 //      6  0 never used, 1 live, 2 down, 3 logging in
-//      7  what it is watched for: 1 readable, 3 readable and writable, 2 writable (dialing)
+//      7  what it is watched for: 1 readable, 3 readable and writable, 2 writable (dialing, or parked with output to send),
+//         0 nothing (parked with nothing to send; before `start`, not registered at all)
 //      8  where the ring of tags starts
 //      9  why it died
 //     10  the connection's slot in the table, or -1
@@ -101,8 +104,10 @@ import tls_record;
 //     29  and to
 //     30  TLS: 1 if reading stopped because the input was full: the engine may hold plaintext no poller event will announce
 //     31  TLS: 1 once the handshake is done: what the lane writes and reads goes through the engine
+//     32  live: 1 while parked: the input is full, so the socket is not watched for reading until `next_done` makes room
+//         and `flush` or `tick` watches it again (docs/nonblocking.md section 10)
 fn stride() -> [] int {
-    return 32;
+    return 33;
 }
 
 // TLS: the ciphertext a lane can hold that the kernel has not taken (one record of 16 KiB with room), and what one read takes.
@@ -372,6 +377,7 @@ pub fn add[&h](heap: &!h Heap, pool: Pool, conn: Conn) -> [heap] (Pool, int) {
                 st[p + 20] = 1;
                 st[p + 23] = 0 - 1;
                 st[p + 24] = 0;
+                st[p + 32] = 0;
             }
         }
     }
@@ -393,7 +399,7 @@ fn start_in[&t, &c, &p](tab: &!t conns.Table, core: &!c Core, poller: &!p Poller
     var k = 0;
     while k < core.lanes {
         let p = stride() * k;
-        if st[p + 6] == 1 && st[p + 7] == 0 {
+        if st[p + 6] == 1 && st[p + 7] == 0 && st[p + 32] == 0 {
             if conns.watch(tab, poller, st[p + 10], first_token + k, 1) == 0 {
                 st[p + 7] = 1;
             } else {
@@ -636,6 +642,7 @@ fn kill[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int, code: int) -> [] i
     st[p + 6] = 2;
     st[p + 9] = code;
     st[p + 7] = 0;
+    st[p + 32] = 0;
     st[p + 12] = 0 - 1;
     st[p + 23] = 0 - 1;
     st[p + 24] = 1;
@@ -689,6 +696,7 @@ fn fail_attempt[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int, code: int)
     end_tls(core, k);
     st[p + 6] = 2;
     st[p + 7] = 0;
+    st[p + 32] = 0;
     st[p + 11] = 0;
     st[p] = 0;
     st[p + 1] = 0;
@@ -752,6 +760,7 @@ fn go_live[&c](core: &!c Core, k: int) -> [] int {
     st[p + 15] = 0;
     st[p + 18] = 0 - 1;
     st[p + 23] = 0 - 1;
+    st[p + 32] = 0;
     ci[17] = ci[17] + 1;
     ci[15] = ci[15] + 1;
     if st[p + 20] == 1 {
@@ -844,20 +853,8 @@ fn flush_lane[&t, &c, &p](tab: &!t conns.Table, core: &!c Core, poller: &!p Poll
         if st[p + 4] == st[p + 3] && st[p + 26] == st[p + 27] {
             st[p + 3] = 0;
             st[p + 4] = 0;
-            if st[p + 7] != 1 {
-                if conns.rewatch(tab, poller, st[p + 10], core.base + k, 1) == 0 {
-                    st[p + 7] = 1;
-                } else {
-                    fail_lane(tab, core, k, 6);
-                }
-            }
-        } else if st[p + 7] != 3 {
-            if conns.rewatch(tab, poller, st[p + 10], core.base + k, 3) == 0 {
-                st[p + 7] = 3;
-            } else {
-                fail_lane(tab, core, k, 6);
-            }
         }
+        watch_lane(tab, core, poller, k);
     }
     return 0;
 }
@@ -1035,7 +1032,7 @@ fn drain_tls[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [conn_writ
 }
 
 // Watch connection `k` for writing as well as reading while it has output the kernel has not taken (plaintext queued, or
-// ciphertext), and for reading alone otherwise.
+// ciphertext), and for reading alone otherwise; a parked connection (its input full) is not watched for reading.
 fn watch_lane[&t, &c, &p](tab: &!t conns.Table, core: &!c Core, poller: &!p Poller, k: int) -> [poll] int {
     let st = contents(core.st);
     let p = stride() * k;
@@ -1043,8 +1040,11 @@ fn watch_lane[&t, &c, &p](tab: &!t conns.Table, core: &!c Core, poller: &!p Poll
         return 0;
     }
     var want = 1;
+    if st[p + 32] == 1 {
+        want = 0;
+    }
     if st[p + 4] < st[p + 3] || st[p + 26] < st[p + 27] {
-        want = 3;
+        want = want + 2;
     }
     if st[p + 7] != want {
         if conns.rewatch(tab, poller, st[p + 10], core.base + k, want) == 0 {
@@ -1052,6 +1052,37 @@ fn watch_lane[&t, &c, &p](tab: &!t conns.Table, core: &!c Core, poller: &!p Poll
         } else {
             fail_lane(tab, core, k, 6);
         }
+    }
+    return 0;
+}
+
+// Live connection `k`'s input is full (docs/nonblocking.md section 10): it is parked, no longer watched for reading, for a
+// level-triggered poller would report the bytes the kernel still holds at every wait, and the loop would turn without
+// waiting until room is made. Room is made by `next_done`; `unpark` watches it again. An input that is full without a whole
+// reply in it (and none handed out at its front) will never have room: that is a reply larger than the slab, status 8.
+fn park[&t, &c, &p](tab: &!t conns.Table, core: &!c Core, poller: &!p Poller, k: int) -> [poll] int {
+    let st = contents(core.st);
+    let p = stride() * k;
+    if st[p + 6] != 1 || st[p] < core.in_cap {
+        return 0;
+    }
+    if st[p + 2] == 0 && core.cur != k {
+        kill(tab, core, k, 8);
+        return 0;
+    }
+    st[p + 32] = 1;
+    watch_lane(tab, core, poller, k);
+    return 0;
+}
+
+// Parked connection `k` has room again: watch it for reading. With TLS, the plaintext the engine holds is input too: a lane
+// is watched again only once `tick` has moved all of it in (`st[p + 30]` is 0 again) and there is still room.
+fn unpark[&t, &c, &p](tab: &!t conns.Table, core: &!c Core, poller: &!p Poller, k: int) -> [poll] int {
+    let st = contents(core.st);
+    let p = stride() * k;
+    if st[p + 32] == 1 && st[p + 6] == 1 && st[p] < core.in_cap && st[p + 30] == 0 {
+        st[p + 32] = 0;
+        watch_lane(tab, core, poller, k);
     }
     return 0;
 }
@@ -1194,7 +1225,8 @@ fn submit_in[&c, &m](core: &!c Core, tag: int, request: &m [byte]) -> [] int {
 
 // Send what `submit` queued, on every connection that has some: one write each if the kernel takes it
 // all, otherwise the rest goes as the poller reports the socket writable. Call it once per turn of the
-// loop, after the turn's `submit`s.
+// loop, after the turn's `submit`s. It also watches again for reading a connection whose input was full and
+// that `next_done` has made room in: a loop that takes answers after `flush` gets that at the next `flush` or `tick`.
 pub fn flush[&q, &p](pool: &!q Pool, poller: &!p Poller) -> [conn_write, poll] int {
     return flush_all(pool.tab, pool.core, poller);
 }
@@ -1204,6 +1236,7 @@ fn flush_all[&t, &c, &p](tab: &!t conns.Table, core: &!c Core, poller: &!p Polle
     var k = 0;
     while k < core.lanes {
         let p = stride() * k;
+        unpark(tab, core, poller, k);
         if st[p + 6] == 1 && (st[p + 4] < st[p + 3] || st[p + 26] < st[p + 27]) {
             flush_lane(tab, core, poller, k);
         }
@@ -1242,16 +1275,21 @@ fn pump_in[&t, &c, &p](tab: &!t conns.Table, core: &!c Core, poller: &!p Poller,
     }
     if readiness % 2 == 1 && st[p + 6] == 1 {
         let base = k * core.in_cap;
-        if st[p] >= core.in_cap {
-            // Nothing to read into. Replies waiting to be taken make room when they are; a
-            // single reply that fills it all will never be whole.
-            if st[p + 2] == 0 {
-                kill(tab, core, k, 8);
+        if st[p + 32] == 1 {
+            // Parked: watched for nothing that makes it readable, so the socket failed or was reset (epoll reports both
+            // whatever it is asked for). It cannot be read until there is room, and it would be reported at every wait.
+            var code = 1;
+            if conns.connect_status(tab, st[p + 10]) != 0 {
+                code = 3;
             }
+            kill(tab, core, k, code);
+        } else if st[p] >= core.in_cap {
+            park(tab, core, poller, k);
         } else if st[p + 31] == 1 {
             let had = st[p];
             let code = read_tls(tab, core, k);
             take_in(tab, core, k, had, code);
+            park(tab, core, poller, k);
         } else {
             match conns.read(tab, st[p + 10], contents(core.acc)[base + st[p]..base + core.in_cap]) {
                 Received::Data(got) => {
@@ -1262,6 +1300,8 @@ fn pump_in[&t, &c, &p](tab: &!t conns.Table, core: &!c Core, poller: &!p Poller,
                         kill(tab, core, k, 10);
                     } else if framed == 0 - 2 {
                         kill(tab, core, k, 11);
+                    } else {
+                        park(tab, core, poller, k);
                     }
                 }
                 Received::End => {
@@ -1735,11 +1775,13 @@ fn tick_in[&h, &t, &c, &p](heap: &!h Heap, tab: &!t conns.Table, core: &!c Core,
                 let whole = st[p + 2];
                 let code = drain_tls(tab, core, k);
                 take_in(tab, core, k, had, code);
+                park(tab, core, poller, k);
                 if st[p + 2] > whole || st[p + 6] != 1 {
                     // answers (or a loss) the loop must hear of without an event: `next_wake` says 0 this turn
                     ci[31] = 1;
                 }
             }
+            unpark(tab, core, poller, k);
             if st[p + 18] < 0 {
                 st[p + 18] = now;
             }
@@ -2006,6 +2048,7 @@ pub fn adopt[&h, &p](heap: &!h Heap, pool: Pool, poller: &!p Poller, now: int, c
             st[p + 11] = ph_connect();
             st[p + 14] = now + ci[9];
             st[p + 16] = 0;
+            st[p + 32] = 0;
             end_tls(cw, lane);
         } else {
             ci[13] = ci[13] + 1;
@@ -2111,6 +2154,10 @@ pub fn next_wake[&q](pool: &q Pool, now: int) -> [] int {
         }
         if (st[p + 6] == 1 || st[p + 6] == 3) && st[p + 30] == 1 && st[p] < core.in_cap {
             // TLS: plaintext the engine holds, and room for it now
+            at = now;
+        }
+        if st[p + 6] == 1 && st[p + 32] == 1 && st[p] < core.in_cap {
+            // parked, and `next_done` has made room: `flush` or `tick` watches it for reading again
             at = now;
         }
         if at >= 0 {

@@ -15,6 +15,9 @@ import tls;
 // connection's input (`in_cap`): a small one makes the answers fill it, so that the plaintext the engine holds must wait
 // for room. Mode `wide` is `lazy` with a statement whose answer is 1,000 to 7,000 bytes (printed as `w<length>`), and once
 // the requests stop the loop sleeps in its poller up to 3 s at a time.
+// Modes `mid` and `tail` are `wide` with the loop in another order (docs/nonblocking.md section 10): `mid` calls `pool.revive` after
+// the turn's requests, before `flush`, so that it takes its answers last and asks `next_wake` right after; `tail` calls it last, after
+// taking the answers, and does not ask `next_wake` (it sleeps 10 ms, then up to 3 s once the requests stop). For a plain pool.
 // Mode `push` sends `len` of 60,000 bytes every `period` ms for `seconds`, and then waits for the answers, sleeping in the
 // poller up to 3 s at a time: a request the kernel could not take all at once moves on only if the pool watches for it.
 // Mode `add` dials one connection itself and offers it to the pool with `add`, printing `add 0 lane <answer + 10>`.
@@ -33,7 +36,7 @@ import tls;
 //     ev <t> live <n> connecting <n> reconnects <n> attempts <n> failures <n> losses <n> last <code> errno <e>
 //         whenever `pool.changes` moved (and once at the start)
 //     done <t> <tag> <status> <value, or - for no row, then the SQLSTATE if the server refused>
-//     finished <t> maxbusy <ms> maxgap <ms> turns <n> done <n> ok <n> refused3 <n> full <n> live <n> reconnects <n> ...
+//     finished <t> maxbusy <ms> maxgap <ms> turns <n> done <n> ok <n> refused3 <n> full <n> pending <n> live <n> reconnects <n> ...
 //
 // `maxbusy` is the longest the loop spent between one return of `poller_wait` and the next call of it: what a
 // request to the loop would wait for, on top of the sleep. `maxgap` is the longest between two turns.
@@ -204,7 +207,9 @@ fn pem_max() -> [] int {
 fn run[&h, &i, &n, &k, &g, &f](heap: &!h Heap, io: &!i Io, net: &n Net(""), clock: &k Clock, args: &g Args, fs: &f Fs(""), lanes: int, seconds: int, min_ms: int, max_ms: int, attempt_ms: int, request_ms: int, period: int, in_cap: int) -> [heap, err_write, net_out(""), conn_read, conn_write, poll, clock, args, fs_read("")] int {
     let slow = int_of(arg(args, 8)[0]) == 115;
     let idle = int_of(arg(args, 8)[0]) == 105;
-    let wide = int_of(arg(args, 8)[0]) == 119;
+    let mid = int_of(arg(args, 8)[0]) == 109;
+    let tail = int_of(arg(args, 8)[0]) == 116;
+    let wide = int_of(arg(args, 8)[0]) == 119 || mid || tail;
     let push = int_of(arg(args, 8)[0]) == 112;
     let lazy = int_of(arg(args, 8)[0]) == 108 || wide;
     let port = number_of(arg(args, 2));
@@ -325,8 +330,10 @@ fn run[&h, &i, &n, &k, &g, &f](heap: &!h Heap, io: &!i Io, net: &n Net(""), cloc
                     maxgap = now - last_turn;
                 }
                 last_turn = now;
-                borrow mut poller as &!pw in {
-                    pl = pool.revive(heap, pl, net, arg(args, 1), port, pw, now);
+                if !mid && !tail {
+                    borrow mut poller as &!pw in {
+                        pl = pool.revive(heap, pl, net, arg(args, 1), port, pw, now);
+                    }
                 }
                 var changed = false;
                 borrow pl as &qr in {
@@ -362,7 +369,7 @@ fn run[&h, &i, &n, &k, &g, &f](heap: &!h Heap, io: &!i Io, net: &n Net(""), cloc
                 }
                 borrow pl as &qr in {
                     let w = pool.next_wake(qr, now);
-                    if w >= 0 && w < wait {
+                    if w >= 0 && w < wait && !tail {
                         wait = w;
                     }
                     if !announced && pool.live(qr) > 0 {
@@ -444,6 +451,11 @@ fn run[&h, &i, &n, &k, &g, &f](heap: &!h Heap, io: &!i Io, net: &n Net(""), cloc
                         full = full + 1;
                     }
                 }
+                if mid {
+                    borrow mut poller as &!pw in {
+                        pl = pool.revive(heap, pl, net, arg(args, 1), port, pw, clock_ms(clock));
+                    }
+                }
                 borrow mut poller as &!pw in {
                     borrow mut pl as &!qw in {
                         pool.flush(qw, pw);
@@ -468,6 +480,11 @@ fn run[&h, &i, &n, &k, &g, &f](heap: &!h Heap, io: &!i Io, net: &n Net(""), cloc
                     }
                     borrow mut pl as &!qw in {
                         tag = pool.next_done(qw);
+                    }
+                }
+                if tail {
+                    borrow mut poller as &!pw in {
+                        pl = pool.revive(heap, pl, net, arg(args, 1), port, pw, clock_ms(clock));
                     }
                 }
                 turns = turns + 1;
@@ -498,6 +515,7 @@ fn run[&h, &i, &n, &k, &g, &f](heap: &!h Heap, io: &!i Io, net: &n Net(""), cloc
             line = field(heap, line, "refused3", refused3);
             line = field(heap, line, "full", full);
             borrow pl as &qr in {
+                line = field(heap, line, "pending", pool.in_flight(qr));
                 line = counters(heap, line, qr);
             }
             line = word(heap, line, "\nstop\n");
