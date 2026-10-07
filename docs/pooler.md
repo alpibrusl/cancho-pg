@@ -101,7 +101,7 @@ reported as bound by the load generator or by PostgreSQL itself carries no ratio
    before the next client sees it. A test that leaves a row uncommitted and checks that no other client reads it.
 4. *Refusals in their words.* A named `Parse` in transaction mode, a client over the limit, a wrong password, a
    database that does not exist: `ErrorResponse` with a SQLSTATE a client library understands, never a hang or a reset.
-5. *Real clients.* `psql`, `pgbench` (simple and extended protocol), `psycopg`, and `lexsys-pg`'s own driver and
+5. *Real clients.* `psql`, `pgbench` (simple and extended protocol), `psycopg`, and `cancho-pg`'s own driver and
    pool, each through the pooler.
 6. *Hostile bytes.* A client sending a message length of 0, 3, 2^31-1, a truncated message, garbage startup, a million
    connections that open and close, a client that never reads: the pooler stays up and answers the next client. Mutation
@@ -135,7 +135,7 @@ Stopped, and written up as a negative result, if any of these holds after the sl
 
 ## 6. Why in this repository
 
-`lexsys-pg` already has the message encoders and decoders, SCRAM (client side, with HMAC and PBKDF2 that P2 reuses for the
+`cancho-pg` already has the message encoders and decoders, SCRAM (client side, with HMAC and PBKDF2 that P2 reuses for the
 server side), and the test rig (a real PostgreSQL, `psql`, a mock server). The pooler is a second *program* here, not a
 second layer of the driver: `examples/` or a `pooler/` directory with its own entry point, sharing `src/pg.cho` for
 what it needs and adding nothing to the driver's public surface.

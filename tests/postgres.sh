@@ -7,10 +7,10 @@
 #   scramuser    e2e_scram       scram-sha-256                    PG_SCRAM_*
 #   scramuni     e2e_scram_uni   scram-sha-256, non-ASCII secret  PG_SCRAM_UNICODE_*
 #
-# Needs docker and a psql client. Stop it with `docker rm -f lexsys-pg-test`. The environment
+# Needs docker and a psql client. Stop it with `docker rm -f cancho-pg-test`. The environment
 # for the end-to-end tests is printed on stdout: `eval "$(sh tests/postgres.sh)"`.
 set -eu
-NAME=lexsys-pg-test
+NAME=cancho-pg-test
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker run -d --name "$NAME" -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16 >/dev/null
 
