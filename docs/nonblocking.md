@@ -380,3 +380,16 @@ driver's own (`wait4`).
 * `e2e.py` `PoolAgainstAMock.test_answers_more_than_the_input_holds_in_a_loop_that_takes_them_when_quiet`: the loop of an `add` pool (no
   `tick`, no `next_wake`) that takes answers only once the poller is quiet, twelve answers of 20,000 bytes into 64 KiB. Before the fix the
   poller is never quiet and the driver never ends (killed at the test's 120 s); after, every answer, 12 of 12.
+
+**Mutants** (`python3 tests/mutants.py --full`, Linux): a full input stays watched for reading; a parked lane is never watched again; `flush`
+does not watch it again; `tick` does not; `next_wake` does not answer 0 for a parked lane with room; a parked lane's reset is not noticed; a
+full input with no whole reply is parked instead of failed. **7 killed.** The two loop orders of the third test exist for the fourth and fifth:
+in the drivers' usual order each of the two covers for the other, and both survived until it was written. The whole set was run again with this
+change (`python3 tests/mutants.py`, Linux arm64 in Docker): **61 killed, 2 survived**, the two that survived before it ([`tls.md`](tls.md)
+§11.3): *the loop is not woken for what the engine holds* and *ciphertext the kernel did not take is not watched for* (now a mutant of
+`watch_lane`'s condition, which `flush_lane` uses now).
+
+**Not verified.** macOS (kqueue) was not run: there a parked lane's read filter is removed, so a reset is seen by the next write or once
+there is room (the reset test checks the status on Linux only). A loop that calls neither `flush` nor `tick` after taking answers and sleeps
+without asking `next_wake` is not served (it was not before either: it spun). `lexsys-hooks` and `users_pg` were not run against this
+change; both call `flush` every turn after taking answers.
