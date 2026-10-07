@@ -1,6 +1,6 @@
-# lexsys-pg
+# cancho-pg
 
-[![ci](https://github.com/alpibrusl/lexsys-pg/actions/workflows/ci.yml/badge.svg)](https://github.com/alpibrusl/lexsys-pg/actions/workflows/ci.yml)
+[![ci](https://github.com/alpibrusl/cancho-pg/actions/workflows/ci.yml/badge.svg)](https://github.com/alpibrusl/cancho-pg/actions/workflows/ci.yml)
 
 A PostgreSQL client for [cancho](https://github.com/alpibrusl/cancho), written in cancho:
 the v3 frontend/backend wire protocol over a TCP connection. **No C and no foreign call** --
@@ -39,7 +39,7 @@ Get the compiler at the revision CI builds and tests with (read from `ci.yml`, s
 
 ```
 git clone https://github.com/alpibrusl/cancho
-git clone https://github.com/alpibrusl/lexsys-pg && cd lexsys-pg
+git clone https://github.com/alpibrusl/cancho-pg && cd cancho-pg
 REV=$(sed -n 's/^ *CANCHO_REV: *//p' .github/workflows/ci.yml)
 (cd ../cancho && git checkout "$REV" && cargo build --release -p cancho)
 export PATH=$PWD/../cancho/target/release:$PATH
@@ -230,9 +230,9 @@ that program, and the test reads its authority): the pool never dials. A host *n
 (`fetch` refuses a store that no longer matches the lock):
 
 ```
-cancho vcs lock  --store ../lexsys-pg/.cancho-vcs -o pg.lock \
+cancho vcs lock  --store ../cancho-pg/.cancho-vcs -o pg.lock \
     login simple extended describing params param param_null drop_params size kind fields value tag error_field base64_encode
-cancho vcs fetch --lock pg.lock --store ../lexsys-pg/.cancho-vcs -o deps/
+cancho vcs fetch --lock pg.lock --store ../cancho-pg/.cancho-vcs -o deps/
 cancho build --std app.cho deps/*.cho -o app
 ```
 

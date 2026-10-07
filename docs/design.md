@@ -1,4 +1,4 @@
-# lexsys-pg: a PostgreSQL client in cancho
+# cancho-pg: a PostgreSQL client in cancho
 
 > **Status: slices 1-4 built; the non-blocking connection is built ([`nonblocking.md`](nonblocking.md)) and reconnects by itself ([`reconnect.md`](reconnect.md))** -- the v3 wire protocol (startup, trust, cleartext-password and
 > SCRAM-SHA-256 login, simple and extended queries with parameters, describe), checked against
