@@ -320,3 +320,76 @@ never, hangs up part way, sends garbage, or sends a reply larger than the slab. 
 request larger than the kernel's buffers reaches, the compaction of the output queue, and the accounting of replies
 that arrive together with the hang-up. Tests were written for each (a mock that does not read for a second, 3 MB
 requests, a driver that takes answers only once the poller has been quiet) and all eleven are caught.
+
+## 10. A full input: the lane stops being watched for reading
+
+**The bug** (found by the TLS work, [`tls.md`](tls.md) §11.3, and not changed there). A connection's input slab (`in_cap`) holds the
+replies the application has not taken. When it is full, `pump` reads nothing; but the socket stayed watched for reading, and the poller
+is level-triggered: while the kernel holds more for that socket, every `poller_wait` reports it at once, `pump` reads nothing again,
+and the loop turns without ever sleeping until the application takes answers. Plain and TLS alike. Measured before the fix (below):
+9 to 10 million turns of the loop in 3 s, the whole of a core.
+
+**The rule.** A live lane whose input is full is **parked**: it is no longer watched for reading (for writing still, while it has output
+the kernel has not taken). It is watched again once there is room, which only `next_done` makes. With TLS, **plaintext the engine holds
+counts as input**: the engine may hold decrypted bytes the kernel no longer has (section 7 of `tls.md`), so a parked TLS lane is watched
+again only once `tick` has moved all of that into the input and there is still room; if it filled the input again, the lane stays parked.
+
+* **Where.** `pump` parks a lane after a read that leaves its input full (and `tick` after it moved what the engine held). An input that
+  is full with no whole reply in it, and no reply handed out at its front, will never have room: that is a reply larger than the slab,
+  status 8, as before (it used to be decided at the next readable event; it is decided when the input fills). `flush` and `tick` watch a
+  parked lane again when it has room: `next_done` has no poller, so the lane waits for the next of the two. `next_wake` answers 0 while a
+  parked lane has room, so a loop that takes answers after both and then sleeps turns once more instead of sleeping.
+* **The state.** One field per lane (`st[32]`, the stride is 33): 1 while parked. What the lane is watched for (`st[7]`) can now be 0
+  (parked, nothing to send) or 2 (parked, output waiting); `start` registers only a lane that is neither registered nor parked.
+* **A reset while parked.** epoll reports `EPOLLERR` and `EPOLLHUP` whatever a socket is watched for, so a parked lane whose connection
+  is reset is reported at every wait. A readable event on a parked lane can only be that, so the lane is lost then: status 3 if the socket
+  has an error (`SO_ERROR`, a reset), 1 otherwise, without reading what the kernel may still hold for it (there is no room to read it
+  into): the requests whose answers were not yet in the input are answered as lost, their outcome unknown, and the answers already in the
+  input are still delivered, as on every loss. A graceful close (FIN) is not reported while
+  parked (`EPOLLIN`/`EPOLLRDHUP` are not asked for): it is read once there is room, after the answers before it. kqueue reports nothing
+  for a filter that is not there, so on macOS a reset is seen by the next write (6) or the read once there is room.
+* **What the loop must do.** Nothing new for the loops in this repository, `cancho-web`'s `users_pg` and `lexsys-hooks`: each calls `flush`
+  once a turn (and the reconnecting ones `tick`). A loop that takes answers and then sleeps without calling `flush` or `tick` leaves a
+  parked lane unwatched until its timeout; `next_wake` says 0 for it.
+* **Alternatives.** An edge-triggered poller (cancho has none); removing the socket from the poller while parked (`poller_remove`
+  exists, but `std.conns` has no `unwatch`, and the lane would have to be registered again: a cancho change for nothing the mask does
+  not do, except silence a reset, which is handled above); growing the slab (the sizes are fixed on purpose).
+
+**The reproduction, before and after** (`tests/tls_test.py`, Linux arm64 in Docker on the macOS host, `postgres:16` of `tests/postgres.sh`).
+`tls_drive` in mode `wide` against the real server: one lane, an input of 16 KiB, a request every 5 ms whose answer is 1,000 to 7,000
+bytes, the answers taken every 300 ms; the loop waits 10 ms at most, so a loop that waits makes some hundreds of turns. The CPU is the
+driver's own (`wait4`).
+
+| run of 3 s | before: turns | before: CPU | after: turns | after: CPU | answers (both) |
+|---|---:|---:|---:|---:|---:|
+| plain | 8,992,268 and 10,265,746 | 2.96 s | 308, 309 | 0.02 s | 97 |
+| TLS | 9,257,769 and 8,817,429 | 2.95 s | 304, 312 | 0.03 s | 97 |
+| a reset while parked (plain mock, 2 s) | 5,789,029 | 1.70 s | 226 to 230 | 0.01 s | |
+
+**Tests.** Each fails before the fix and passes after it:
+
+* `tls_test.py` `Pool.test_a_full_input_is_not_watched_for_reading` and `..._over_tls`: the table's run; fewer than 5,000 turns and less
+  than half the wall time in CPU, every answer right and in order, no connection lost.
+* `tls_test.py` `Pool.test_a_parked_lane_is_watched_again_in_a_loop_of_another_order`: the same with the loop in two other orders (`tls_drive`
+  modes `mid` and `tail`): `tick` and `flush` before the answers are taken and `next_wake` after (only `next_wake` says the lane has room), and
+  the answers then `tick` with `next_wake` not asked (only `tick` watches the lane again). Once the requests stop the loop sleeps up to 3 s;
+  every request is answered and the last within 1 s of the end.
+* `tls_test.py` `AgainstAMock.test_a_connection_reset_while_its_input_is_full_is_ended_at_once`: a mock sends far more than the input holds
+  and resets the connection half way between two takes; fewer than 1,500 turns, and on Linux the loss is the reset's (3), not the next
+  request's write (6).
+* `e2e.py` `PoolAgainstAMock.test_answers_more_than_the_input_holds_in_a_loop_that_takes_them_when_quiet`: the loop of an `add` pool (no
+  `tick`, no `next_wake`) that takes answers only once the poller is quiet, twelve answers of 20,000 bytes into 64 KiB. Before the fix the
+  poller is never quiet and the driver never ends (killed at the test's 120 s); after, every answer, 12 of 12.
+
+**Mutants** (`python3 tests/mutants.py --full`, Linux): a full input stays watched for reading; a parked lane is never watched again; `flush`
+does not watch it again; `tick` does not; `next_wake` does not answer 0 for a parked lane with room; a parked lane's reset is not noticed; a
+full input with no whole reply is parked instead of failed. **7 killed.** The two loop orders of the third test exist for the fourth and fifth:
+in the drivers' usual order each of the two covers for the other, and both survived until it was written. The whole set was run again with this
+change (`python3 tests/mutants.py`, Linux arm64 in Docker): **61 killed, 2 survived**, the two that survived before it ([`tls.md`](tls.md)
+§11.3): *the loop is not woken for what the engine holds* and *ciphertext the kernel did not take is not watched for* (now a mutant of
+`watch_lane`'s condition, which `flush_lane` uses now).
+
+**Not verified.** macOS (kqueue) was not run: there a parked lane's read filter is removed, so a reset is seen by the next write or once
+there is room (the reset test checks the status on Linux only). A loop that calls neither `flush` nor `tick` after taking answers and sleeps
+without asking `next_wake` is not served (it was not before either: it spun). `lexsys-hooks` and `users_pg` were not run against this
+change; both call `flush` every turn after taking answers.
