@@ -1,0 +1,249 @@
+edition 5;
+
+import std.buffer;
+import std.io;
+import pg;
+import pg.ssl;
+
+// `psql_tls` -- `psql`, with `sslmode` (docs/tls.md), over `pg.ssl`.
+//
+//     psql_tls <sslmode> <ca file|-> <server name> <host> <port> <user> <database> <password|-> <sql> [parameter ...]
+//
+// `sslmode` is `disable` or `verify-full`; `ca file` is the PEM bundle of the roots to trust (`-` for none, which `disable`
+// needs and `verify-full` refuses); `server name` is the name the certificate must carry (a DNS name or an IP literal), and
+// `host` the address dialled. Output as `psql`'s; a connection that is refused prints `ERROR <tag>` -- the engine's
+// (`x509-name-mismatch`, `x509-unknown-issuer`, ...) or `pg`'s (`pg-ssl-not-offered`, ...) -- and exits with the status.
+// A mode libpq has and this does not (`require`, `verify-ca`, `prefer`, `allow`) is refused before anything is dialled (16).
+//
+// `cancho authority`: the network, the console, `/dev/urandom` (the SCRAM nonce and the TLS entropy), the clock (the
+// certificates' dates) and `fs_read("")`, because the CA file is named at run time: a program with a fixed path narrows it to
+// that one file. Nothing foreign.
+
+fn number_of[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 || len(text) > 17 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        n = n * 10 + (c - 48);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn show[&i, &m](io: &!i Io, m: &m [byte]) -> [io_write] int {
+    var at = 0;
+    while pg.size(m, at) > 0 {
+        let k = pg.kind(m, at);
+        if k == 68 {
+            var j = 0;
+            while j < pg.fields(m, at) {
+                if j > 0 {
+                    io.write_all(io, "|");
+                }
+                let (from, to) = pg.value(m, at, j);
+                if from < 0 {
+                    io.write_all(io, "\\N");
+                } else {
+                    io.write_all(io, m[from..to]);
+                }
+                j = j + 1;
+            }
+            io.write_all(io, "\n");
+        } else if k == 67 {
+            let (from, to) = pg.tag(m, at);
+            io.write_all(io, "# ");
+            io.write_all(io, m[from..to]);
+            io.write_all(io, "\n");
+        } else if k == 69 {
+            let (cf, ct) = pg.error_field(m, at, 67);
+            let (mf, mt) = pg.error_field(m, at, 77);
+            io.write_all(io, "ERROR ");
+            io.write_all(io, m[cf..ct]);
+            io.write_all(io, ": ");
+            io.write_all(io, m[mf..mt]);
+            io.write_all(io, "\n");
+        }
+        at = at + pg.size(m, at);
+    }
+    return 0;
+}
+
+fn finish[&h, &i](heap: &!h Heap, io: &!i Io, reply: buffer.Buffer) -> [heap, io_write] int {
+    borrow reply as &rb in {
+        show(io, buffer.bytes(rb));
+    }
+    buffer.drop(heap, reply);
+    return 0;
+}
+
+// The most PEM a trust store may be. A file that fills it is refused, never truncated.
+fn pem_max() -> [] int {
+    return 2097152;
+}
+
+// `n` bytes of `/dev/urandom`, or none if the read came up short.
+fn random[&h, &f](heap: &!h Heap, fs: &f Fs(""), n: int) -> [heap, fs_read("")] buffer.Buffer {
+    var out = buffer.empty(heap, n);
+    region a {
+        let raw = alloc_slice[a](64, byte_of(0));
+        let got = fs_read(fs, "/dev/urandom", raw[0..n]);
+        if got == n {
+            out = buffer.append(heap, out, raw[0..n]);
+        }
+    }
+    return out;
+}
+
+fn ask[&h, &i, &l, &g](heap: &!h Heap, io: &!i Io, link: &!l ssl.Link, args: &g Args) -> [heap, io_write, conn_read, conn_write, args] int {
+    if arg_count(args) <= 10 {
+        let (r, s) = ssl.simple(heap, link, arg(args, 9));
+        finish(heap, io, r);
+        return s;
+    }
+    var ps = pg.params(heap);
+    var k = 10;
+    while k < arg_count(args) {
+        let a = arg(args, k);
+        if len(a) == 2 && int_of(a[0]) == 92 && int_of(a[1]) == 78 {
+            ps = pg.param_null(heap, ps);
+        } else {
+            ps = pg.param(heap, ps, a);
+        }
+        k = k + 1;
+    }
+    var out = 0;
+    borrow ps as &pr in {
+        let (r, s) = ssl.extended(heap, link, arg(args, 9), pr);
+        finish(heap, io, r);
+        out = s;
+    }
+    pg.drop_params(heap, ps);
+    return out;
+}
+
+fn refused[&i, &l](io: &!i Io, link: &l ssl.Link, status: int) -> [io_write] int {
+    io.write_all(io, "ERROR ");
+    io.write_all(io, ssl.reason(link, status));
+    io.write_all(io, "\n");
+    return status;
+}
+
+// Open the link, log in, ask, close: the status.
+fn session[&h, &g, &i, &e, &p, &n](heap: &!h Heap, args: &g Args, io: &!i Io, conn: Conn, mode: int, entropy: &e [byte], pem: &p [byte], nonce: &n [byte], now: int) -> [heap, args, io_write] int {
+    let (made, s0) = ssl.open(heap, conn, mode, arg(args, 3), entropy, pem, now);
+    var link = made;
+    var status = 0;
+    borrow mut link as &!lw in {
+        if s0 != 0 {
+            status = refused(io, lw, s0);
+        } else {
+            var secret = arg(args, 8);
+            if len(secret) == 1 && int_of(secret[0]) == 45 {
+                secret = "";
+            }
+            let (hello, s1) = ssl.login(heap, lw, arg(args, 6), secret, arg(args, 7), nonce);
+            if s1 != 0 {
+                finish(heap, io, hello);
+                if s1 != 4 {
+                    refused(io, lw, s1);
+                }
+                status = s1;
+            } else {
+                buffer.drop(heap, hello);
+                status = ask(heap, io, lw, args);
+                if status != 0 {
+                    refused(io, lw, status);
+                }
+            }
+        }
+    }
+    conn_close(ssl.close(heap, link));
+    return status;
+}
+
+fn run[&h, &g, &i, &f, &k](heap: &!h Heap, args: &g Args, io: &!i Io, conn: Conn, fs: &f Fs(""), clock: &k Clock, mode: int) -> [heap, args, io_write, fs_read(""), clock] int {
+    let entropy = random(heap, fs, 32);
+    let nonce_raw = random(heap, fs, 18);
+    var nonce = buffer.empty(heap, 1);
+    borrow nonce_raw as &nr in {
+        if len(buffer.bytes(nr)) == 18 {
+            buffer.drop(heap, nonce);
+            nonce = pg.base64_encode(heap, buffer.bytes(nr));
+        }
+    }
+    buffer.drop(heap, nonce_raw);
+    var pem = box_slice(heap, pem_max(), byte_of(0));
+    var pem_len = 0;
+    let cafile = arg(args, 2);
+    if !(len(cafile) == 1 && int_of(cafile[0]) == 45) {
+        borrow mut pem as &!pw in {
+            let got = fs_read(fs, cafile, contents(pw));
+            if got > 0 && got < pem_max() {
+                pem_len = got;
+            }
+        }
+    }
+    let now = clock_unix_ms(clock);
+    var status = 0;
+    borrow entropy as &er in {
+        borrow pem as &pr in {
+            borrow nonce as &nb in {
+                status = session(heap, args, io, conn, mode, buffer.bytes(er), contents(pr)[0..pem_len], buffer.bytes(nb), now);
+            }
+        }
+    }
+    unbox_slice(heap, pem);
+    buffer.drop(heap, entropy);
+    buffer.drop(heap, nonce);
+    return status;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock } = split(world);
+    release(ffi);
+    var status = 100;
+    borrow mut io as &!i in {
+        borrow args as &g in {
+            if arg_count(g) >= 10 {
+                status = 101;
+                let port = number_of(arg(g, 5));
+                let mode = pg.sslmode(arg(g, 1));
+                if mode < 0 {
+                    io.write_all(i, "ERROR pg-ssl-setup: sslmode is disable or verify-full\n");
+                    status = 16;
+                } else if port > 0 && port < 65536 {
+                    status = 102;
+                    borrow fs as &f in {
+                        borrow clock as &k in {
+                            borrow net as &nn in {
+                                match tcp_connect(nn, arg(g, 4), port) {
+                                    Dialed::Ok(c) => {
+                                        borrow mut heap as &!h in {
+                                            status = run(h, g, i, c, f, k, mode);
+                                        }
+                                    }
+                                    Dialed::Failed(e) => {
+                                        status = 103;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(clock);
+    release(net);
+    release(args);
+    release(io);
+    release(heap);
+    return status;
+}

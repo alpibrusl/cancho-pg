@@ -7,7 +7,8 @@ on:
 
 env:
   # The compiler these sources are built and tested with. A package store records no hash
-  # of the `std` it was published against, so the revision is part of the contract.
+  # of the `std` it was published against, so the revision is part of the contract. It is
+  # also `[package] cancho` in cancho.toml (checked below), and it has packages/tls (docs/tls.md).
   CANCHO_REV: a4572ea3b506e4bcec1c4be43deda1043c11ba9f
 
 jobs:
@@ -39,8 +40,20 @@ jobs:
       - name: The reference client
         run: which psql || (sudo apt-get update -q && sudo apt-get install -y -q postgresql-client)
 
-      # postgres:16 with a role for each way a server asks for a password (tests/postgres.sh)
-      - name: PostgreSQL 16 with trust, cleartext and SCRAM roles
+      # One compiler revision: the one CI builds is the one the project file names.
+      - name: cancho.toml names the compiler CI builds
+        working-directory: pg
+        run: grep -qx "cancho = \"$CANCHO_REV\"" cancho.toml
+
+      # cancho's TLS client (packages/tls and the x509 it requires), at the pinned commit, into build/deps:
+      # what pg.pool and pg.ssl are built with (docs/tls.md section 9). pg itself needs none of it.
+      - name: Dependencies (cancho install)
+        working-directory: pg
+        run: ../cancho/target/release/cancho install
+
+      # postgres:16 with a role for each way a server asks for a password, TLS on with a test CA made in the
+      # job, a hostssl and a hostnossl role, and a second server without TLS (tests/postgres.sh)
+      - name: PostgreSQL 16 with trust, cleartext and SCRAM roles, and TLS
         working-directory: pg
         run: sh tests/postgres.sh > /tmp/pg.env.sh
 
@@ -52,7 +65,7 @@ jobs:
       # `pgen` writes is a Parse and a Sync for each statement.
       - name: Pool unit tests (no server)
         working-directory: pg
-        run: ../cancho/target/release/cancho test tests/pool_test.cho src/pool.cho src/pg.cho tests/generated/queries.cho --std
+        run: ../cancho/target/release/cancho test tests/pool_test.cho src/pool.cho src/pg.cho tests/generated/queries.cho build/deps/*.cho --std
 
       - name: Formatting
         working-directory: pg
@@ -115,23 +128,22 @@ jobs:
           eval "$(cat /tmp/pg.env.sh)"
           PGDATABASE=postgres python3 pooler/tests/pooler_e2e.py build/pooler
 
-      # A consumer locks names from the checked-in store; it must be the store of this source.
-      - name: The published store is the store of src/pg.cho
+      # A consumer locks names from the checked-in stores; each must be the store of its source: pg (src/pg.cho), pg.pool
+      # (src/pool.cho, requiring the names it calls of pg and of cancho's tls), pg.ssl (src/ssl.cho, the same).
+      - name: The published stores are the stores of src/pg.cho, src/pool.cho and src/ssl.cho
         working-directory: pg
-        run: |
-          rm -rf /tmp/store
-          ../cancho/target/release/cancho vcs publish --std --store /tmp/store src/pg.cho > /dev/null
-          diff -r /tmp/store .cancho-vcs
+        env:
+          CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
+        run: sh tests/stores.sh
 
-      # `pg.pool` is a package of its own, published beside `pg` and requiring the names it uses
-      # (`size`, `kind`, the login's messages and SCRAM's pieces) from `pg`'s store; the same rule: the checked-in store is the store of the source.
-      - name: The published store is the store of src/pool.cho
+      # TLS (docs/tls.md section 10): the blocking client and the pool against the TLS server with verify-full; a wrong name, an
+      # unknown authority, an empty trust store, the modes not offered; the server without TLS; hostssl and hostnossl both ways;
+      # mock servers that answer SSLRequest badly or break a live session; the pool's server restarted (last: the restart is
+      # of this job's server); the authority of two programs.
+      - name: TLS tests
         working-directory: pg
+        env:
+          CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
         run: |
-          # published beside the checked-in one: the store records the path of the store it requires
-          # relative to itself, so a copy elsewhere would differ in that one line
-          rm -rf .cancho-vcs-pool-check
-          lex=../cancho/target/release/cancho
-          $lex vcs lock --store .cancho-vcs -o /tmp/pg-for-pool.lock auth_code base64_encode error_field hmac_sha256 kind parse_append password pbkdf2_begin pbkdf2_more sasl_initial sasl_response scram_client_final_with scram_client_first scram_iterations scram_salt size startup > /dev/null
-          $lex vcs publish --std --store .cancho-vcs-pool-check --requires /tmp/pg-for-pool.lock:.cancho-vcs src/pool.cho > /dev/null
-          diff -r .cancho-vcs-pool-check .cancho-vcs-pool
+          eval "$(cat /tmp/pg.env.sh)"
+          python3 tests/tls_test.py

@@ -1,0 +1,14 @@
+# cancho-pg's project file: the compiler these sources are written for and the one library they take from elsewhere.
+# `cancho install` writes the dependency's sources (and those it requires: `x509`) into build/deps; the commands of the
+# README and CI pass `build/deps/*.cho` to `build` and `test` where a program uses `pg.ssl` or `pg.pool`. `pg` itself needs
+# nothing from here. The compiler revision is also CI's CANCHO_REV (one is checked against the other in CI).
+
+[package]
+name = "pg"
+cancho = "a4572ea3b506e4bcec1c4be43deda1043c11ba9f"
+
+# cancho's own TLS client (packages/tls, cancho epic #197) and the certificate verifier it requires (docs/tls.md).
+[dependencies.tls]
+git = "https://github.com/alpibrusl/cancho"
+rev = "a4572ea3b506e4bcec1c4be43deda1043c11ba9f"
+path = "packages/tls/.cancho-vcs/tls"

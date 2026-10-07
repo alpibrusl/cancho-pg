@@ -291,3 +291,112 @@ fn test_the_generated_script_is_one_parse_and_sync_for_each_statement[&h](heap: 
     test.assert(first_name_ok);
     return 0;
 }
+
+// ------------------------------------------------------------------ TLS (docs/tls.md section 7)
+
+// A root certificate (ECDSA P-256, self-signed, ten years), only to be loaded: nothing it signed exists.
+fn a_root() -> [] &static [byte] {
+    return "-----BEGIN CERTIFICATE-----\nMIIBrDCCAVGgAwIBAgIUJLX7ifKpy03Pcn1QELLrc6slLZQwCgYIKoZIzj0EAwIw\nIzEhMB8GA1UEAwwYbGV4c3lzLXBnIHVuaXQgdGVzdCByb290MB4XDTI2MTAwNjIy\nMzAyM1oXDTM2MTAwMzIyMzAyM1owIzEhMB8GA1UEAwwYbGV4c3lzLXBnIHVuaXQg\ndGVzdCByb290MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEuXKaaSBDdlHRIMY6\nOaNhTiJ05H3a9p5e/xaMeqCW/hnErZ5CcxUU/5U7PpZ1Vz55QcIpySHdRyJP0CTy\n4ml9naNjMGEwHQYDVR0OBBYEFFzf3z+eZ4HUX1lVTS1ZU/jLFzALMB8GA1UdIwQY\nMBaAFFzf3z+eZ4HUX1lVTS1ZU/jLFzALMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0P\nAQH/BAQDAgIEMAoGCCqGSM49BAMCA0kAMEYCIQCAU/9Eu5y3DOU6KtvUyCMsD2GM\n49BcNbaWTa0z3GACjgIhAMlBYUSv9R5cjv8szlDoCLAYE/ONj/W4U06RHU2oCj/Q\n-----END CERTIFICATE-----\n";
+}
+
+fn entropy() -> [] &static [byte] {
+    return "0123456789abcdef0123456789abcdef";
+}
+
+fn test_a_tls_failure_of_a_live_connection_is_lost() -> [] int {
+    test.assert(pool.lost(15));
+    // an attempt's TLS failures are not a request's status
+    test.assert(!pool.lost(14));
+    test.assert(!pool.lost(16));
+    return 0;
+}
+
+fn test_secure_refuses_what_cannot_be_used[&h](heap: &!h Heap) -> [heap] int {
+    var pl = pool.empty(heap, 2, 4, 4096, 4096);
+    var rc = 0;
+    let (p1, r1) = pool.secure(heap, pl, "", entropy(), a_root(), 1000000, 0);
+    pl = p1;
+    test.assert_eq(r1, 0 - 1);
+    let (p2, r2) = pool.secure(heap, pl, "db", entropy()[0..31], a_root(), 1000000, 0);
+    pl = p2;
+    test.assert_eq(r2, 0 - 1);
+    // a name of 256 bytes (the most is 255)
+    let (p3, r3) = pool.secure(heap, pl, "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn", entropy(), a_root(), 1000000, 0);
+    pl = p3;
+    test.assert_eq(r3, 0 - 1);
+    // nothing in the bundle to trust: not made secure
+    let (p4, r4) = pool.secure(heap, pl, "db", entropy(), "not a certificate", 1000000, 0);
+    pl = p4;
+    test.assert_eq(r4, 0);
+    borrow pl as &qr in {
+        test.assert(!pool.secured(qr));
+    }
+    let (p5, r5) = pool.secure(heap, pl, "db", entropy(), a_root(), 1000000, 0);
+    pl = p5;
+    test.assert_eq(r5, 1);
+    borrow pl as &qr in {
+        test.assert(pool.secured(qr));
+        test.assert_eq(pool.tls_failure(qr), 0);
+    }
+    // once
+    let (p6, r6) = pool.secure(heap, pl, "db", entropy(), a_root(), 1000000, 0);
+    pl = p6;
+    test.assert_eq(r6, 0 - 1);
+    borrow mut pl as &!qw in {
+        test.assert_eq(pool.wall(qw, 2000000, 10), 0);
+    }
+    pool.close(heap, pl);
+    return 0;
+}
+
+fn test_secure_comes_before_start[&h](heap: &!h Heap) -> [heap, poll] int {
+    var pl = pool.empty(heap, 1, 4, 4096, 4096);
+    match poller_new() {
+        Polling::Ok(po) => {
+            var poller = po;
+            borrow mut poller as &!pw in {
+                borrow mut pl as &!qw in {
+                    pool.start(qw, pw, 10);
+                }
+            }
+            let (made, rc) = pool.secure(heap, pl, "db", entropy(), a_root(), 1000000, 0);
+            pl = made;
+            test.assert_eq(rc, 0 - 1);
+            poller_close(poller);
+        }
+        Polling::Failed(e) => {
+            test.assert(false);
+        }
+    }
+    pool.close(heap, pl);
+    return 0;
+}
+
+// A secure pool and `reconnect`, in either order, and nothing is due until `start`.
+fn test_a_secure_pool_reconnects_like_any_other[&h](heap: &!h Heap) -> [heap, conn_write, poll] int {
+    var pl = pool.empty(heap, 2, 4, 4096, 4096);
+    let (p1, r1) = pool.reconnect(heap, pl, "u", "p", "d", "0123456789abcdef", "", 0, 100, 400, 1000, 0);
+    pl = p1;
+    test.assert_eq(r1, 0);
+    let (p2, r2) = pool.secure(heap, pl, "db", entropy(), a_root(), 1000000, 0);
+    pl = p2;
+    test.assert_eq(r2, 1);
+    match poller_new() {
+        Polling::Ok(po) => {
+            var poller = po;
+            borrow mut poller as &!pw in {
+                borrow mut pl as &!qw in {
+                    test.assert_eq(pool.tick(heap, qw, pw, 0), 0);
+                    pool.start(qw, pw, 10);
+                    test.assert_eq(pool.tick(heap, qw, pw, 0), 2);
+                }
+            }
+            poller_close(poller);
+        }
+        Polling::Failed(e) => {
+            test.assert(false);
+        }
+    }
+    pool.close(heap, pl);
+    return 0;
+}
