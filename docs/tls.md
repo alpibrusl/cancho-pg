@@ -433,6 +433,10 @@ completed not waking the loop; a failed handshake not failing the attempt. **24 
   part of the *last* record of what is queued, and on these machines a writable event comes with more room free than the pool's whole output
   slab (64 KiB), so the last record always fits (an explanation, not measured). Reachable with a small send buffer, which no test here can set.
 
+The 30 earlier mutants of the pool and of SCRAM (`docs/reconnect.md` §6.5) were run again against the pool with TLS in it: **30 killed**.
+(A run of all 56 in a container without the Docker socket also reported the two survivors above as killed, by the restart test's *error*
+at restarting the server: the environment, not the mutant; the run with the socket, which this section reports, is the one that counts.)
+
 A first run of these mutants found three tests that checked less than they said: the held-plaintext test against the real server did not
 reach the state (the server's later answers rescued it), so the one-record mock was added; the kernel-full test's server answered after
 0.5 s of silence, which rescued a stalled write, so it measures the server's waits instead; and the mock's own read timeout closed the
