@@ -411,7 +411,8 @@ pieces, which it does not.
 * **The pool spins when its input is full and the kernel holds more** (plain and TLS alike, found with a 16 KiB input whose answers are
   taken every 300 ms: 7 million turns in 3 s): a full input stops the reads but the socket stays watched for reading, and a level-triggered
   poller reports it ready every turn. Not changed here (it is the existing pool's, and a caller sizes the input above its replies);
-  recorded for the pool's own backlog.
+  recorded for the pool's own backlog. *Corrected:* fixed since, plain and TLS ([`nonblocking.md`](nonblocking.md) §10): a lane whose
+  input is full is not watched for reading until room is made, and plaintext the engine holds counts as input.
 * **`lexsys-hooks`' default build cannot take this pool as it is** (section 12, question 1): checked with `lex-sys check` of its `src/`, its
   other dependencies and this `pg` and pool: `function open is defined twice` (its `tls` module and lex-sys's). The previous pool checks
   clean against the same sources with `653bdd1`.

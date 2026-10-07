@@ -195,7 +195,9 @@ pool.pump(pl, poller, token, readiness);
 while (tag = pool.next_done(pl)) >= 0 { ... pool.reply(pl), pool.status(pl) ... }
 ```
 
-The reply is what `pg.run_named` returns, so every accessor `pgen` wrote works on it. A connection the server
+The reply is what `pg.run_named` returns, so every accessor `pgen` wrote works on it. A connection whose input slab is full of answers
+not yet taken is not watched for reading until `next_done` makes room; the next `flush` (or `tick`) watches it again, so call `flush` every
+turn ([`docs/nonblocking.md`](docs/nonblocking.md) §10). A connection the server
 closes, or that sends something that is not the protocol, answers every request still on it with a `status` that is
 not 0, in its place in the order. `examples/` has no program for it: `lexsys-web`'s `users_pg` is the user, with
 `lex-sys`'s `http.server` (`hold`/`answer`). The package is a store of its own,
@@ -433,7 +435,9 @@ a certificate from a test CA that `tests/tls_certs.sh` makes on every run, a `ho
 client's rows over TLS); a wrong name, another CA, an empty trust store and the modes not offered are refused, each with its tag; mock servers
 answer SSLRequest with bytes after the `S`, an ErrorResponse, a stray byte, a close, or something that is not TLS, and break a live session with a
 record that does not authenticate or a close_notify; the pool remakes eight connections over one engine after every backend is ended, and after
-a real `docker restart` of the server; the plaintext the engine holds when the pool's input is full is delivered to a loop that sleeps; and the
+a real `docker restart` of the server; the plaintext the engine holds when the pool's input is full is delivered to a loop that sleeps; a full
+input, plain and over TLS, leaves the loop waiting instead of turning (the turns and the CPU of a 3 s run are counted), and a connection reset while
+its input is full is ended at once ([`docs/nonblocking.md`](docs/nonblocking.md) §10); and the
 authority of two programs is checked (nothing foreign). The TLS mutants of `tests/mutants.py --tls` are in [`docs/tls.md`](docs/tls.md) §11.
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds the pinned compiler, installs the TLS package and runs all of it

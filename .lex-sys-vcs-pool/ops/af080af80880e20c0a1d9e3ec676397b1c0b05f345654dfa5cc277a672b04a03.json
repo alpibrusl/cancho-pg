@@ -1,9 +1,9 @@
 {
-  "op_id": "92fe8c7947bcb4d10944b2463d69658091ceaf3fb66e83bd9f5ff89a1882ca48",
+  "op_id": "af080af80880e20c0a1d9e3ec676397b1c0b05f345654dfa5cc277a672b04a03",
   "operation": {
     "kind": "AddFunction",
     "sig_id": "12a22c4d852966d952e01e9636a45f905768e92765cdd8dc65fcb31bc0c416cf",
-    "stage_id": "0bf6b899bdd099443476ff24f63cd174eb3860f71d8387555851d01b465ee83b",
+    "stage_id": "452f7347b8a6094cbbe1f68a29e5433df88e40a6736e4fcb9903a0d32b4d9742",
     "effects": [],
     "edition": 1
   }

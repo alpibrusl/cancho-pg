@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Single-edit mutants of src/pool.ls, src/pg.ls and src/ssl.ls: each one must make a test fail.
 
-    LEX_SYS=... PGHOST=... python3 tests/mutants.py [--tls] [name ...]      (default: all; the server env of tests/e2e.py)
+    LEX_SYS=... PGHOST=... python3 tests/mutants.py [--tls | --full] [name ...]      (default: all; the server env of tests/e2e.py)
 
 For each mutant: save the file, make the edit, run the unit tests (no server) and then tests/reconnect_test.py until the first
 failure, restore the file from the saved copy and check with `cmp` that it is the same bytes. Prints one line per mutant
@@ -80,10 +80,23 @@ TLS_MUTANTS = [
     ("what the engine holds is never drained", POOL, "            if st[p + 30] == 1 && st[p] < core.in_cap {\n                // TLS: what the engine held when the input was full, now", "            if false {\n                // TLS: what the engine held when the input was full, now"),
     ("the loop is not woken for what the engine holds", POOL, "        if (st[p + 6] == 1 || st[p + 6] == 3) && st[p + 30] == 1 && st[p] < core.in_cap {", "        if false {"),
     ("a record that does not authenticate is ignored", POOL, "            ci[29] = n;\n            return 15;\n        } else {\n            st[p + 30] = 0;", "            ci[29] = n;\n            return 0;\n        } else {\n            st[p + 30] = 0;"),
-    ("ciphertext the kernel did not take is not watched for", POOL, "if st[p + 4] == st[p + 3] && st[p + 26] == st[p + 27] {", "if st[p + 4] == st[p + 3] {"),
+    ("ciphertext the kernel did not take is not watched for", POOL, "    if st[p + 4] < st[p + 3] || st[p + 26] < st[p + 27] {\n        want = want + 2;", "    if st[p + 4] < st[p + 3] {\n        want = want + 2;"),
     ("a secure pool accepts a connection from add", POOL, "        if contents(cr.ci)[27] == 1 {\n            k = cr.lanes;", "        if false {\n            k = cr.lanes;"),
     ("answers that tick completed do not wake the loop", POOL, "    if ci[31] == 1 {\n        return 0;\n    }\n    var best", "    var best"),
     ("a failed handshake is not a failed attempt", POOL, "        if shaken != 0 {\n            fail_attempt(tab, core, k, shaken);", "        if false {\n            fail_attempt(tab, core, k, shaken);"),
+]
+
+# A full input (docs/nonblocking.md section 10): a lane whose input is full is parked, not watched for reading, until room is
+# made. Plain and TLS alike; run against the unit suites, the pool's mock tests of tests/e2e.py (an `add` pool's loop, which
+# never calls `tick`) and tests/tls_test.py (the servers of tests/postgres.sh).
+FULL_MUTANTS = [
+    ("a full input stays watched for reading", POOL, "    if st[p + 32] == 1 {\n        want = 0;\n    }", "    if false {\n        want = 0;\n    }"),
+    ("a parked lane is never watched again", POOL, "    if st[p + 32] == 1 && st[p + 6] == 1 && st[p] < core.in_cap && st[p + 30] == 0 {", "    if false {"),
+    ("flush does not watch a parked lane again", POOL, "        unpark(tab, core, poller, k);\n        if st[p + 6] == 1 && (st[p + 4]", "        if st[p + 6] == 1 && (st[p + 4]"),
+    ("tick does not watch a parked lane again", POOL, "            unpark(tab, core, poller, k);\n            if st[p + 18] < 0 {", "            if st[p + 18] < 0 {"),
+    ("the loop is not woken for a parked lane with room", POOL, "        if st[p + 6] == 1 && st[p + 32] == 1 && st[p] < core.in_cap {", "        if false {"),
+    ("a parked lane's reset is not noticed", POOL, "        if st[p + 32] == 1 {\n            // Parked:", "        if false {\n            // Parked:"),
+    ("a full input with no whole reply is parked, not failed", POOL, "    if st[p + 2] == 0 && core.cur != k {\n        kill(tab, core, k, 8);", "    if false {\n        kill(tab, core, k, 8);"),
 ]
 
 
@@ -100,6 +113,10 @@ def suites(tls=False):
     """The suites, in the order a mutant is most likely to fail them. Yields (name, command)."""
     yield "pg_test", [LEX, "test", "tests/pg_test.ls", "src/pg.ls", "--std"]
     yield "pool_test", [LEX, "test", "tests/pool_test.ls", "src/pool.ls", "src/pg.ls", "tests/generated/queries.ls", *deps(), "--std"]
+    if tls == "full":
+        yield "e2e PoolAgainstAMock", [sys.executable, "tests/e2e.py", "-f", "PoolAgainstAMock"]
+        yield "tls_test", [sys.executable, "tests/tls_test.py", "-f"]
+        return
     if tls:
         yield "tls_test", [sys.executable, "tests/tls_test.py", "-f"]
         return
@@ -108,15 +125,19 @@ def suites(tls=False):
 
 
 def main():
-    # `--tls`: only the TLS mutants (each runs tests/tls_test.py, which needs the TLS server of tests/postgres.sh)
+    # `--tls`: only the TLS mutants (each runs tests/tls_test.py, which needs the TLS server of tests/postgres.sh); `--full`: only
+    # those of a full input
     only_tls = "--tls" in sys.argv[1:]
-    wanted = [a for a in sys.argv[1:] if a != "--tls"]
+    only_full = "--full" in sys.argv[1:]
+    wanted = [a for a in sys.argv[1:] if a not in ("--tls", "--full")]
     killed, survived = 0, []
     scratch = tempfile.mkdtemp()
-    for name, rel, old, new, tls in [m + (False,) for m in MUTANTS] + [m + (True,) for m in TLS_MUTANTS]:
+    for name, rel, old, new, tls in [m + (False,) for m in MUTANTS] + [m + (True,) for m in TLS_MUTANTS] + [m + ("full",) for m in FULL_MUTANTS]:
         if wanted and not any(w in name for w in wanted):
             continue
-        if only_tls and not tls:
+        if only_tls and tls is not True:
+            continue
+        if only_full and tls != "full":
             continue
         path = os.path.join(ROOT, rel)
         saved = os.path.join(scratch, os.path.basename(rel))
