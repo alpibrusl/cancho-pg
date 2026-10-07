@@ -2,9 +2,9 @@
 """End-to-end tests of the reconnecting `pg.pool` (docs/reconnect.md), against a real PostgreSQL and against mock servers.
 
     PGHOST=127.0.0.1 PGPORT=5432 PGUSER=postgres PGDATABASE=postgres python3 tests/reconnect_test.py
-    LEX_SYS=/path/to/lex-sys   (default: lex-sys on PATH)
+    CANCHO=/path/to/cancho   (default: cancho on PATH)
 
-Every test runs `tests/reconnect_drive.ls` (a loop that has no connection when it starts and keeps its pool full with
+Every test runs `tests/reconnect_drive.cho` (a loop that has no connection when it starts and keeps its pool full with
 `pool.revive`) behind `tests/tcpproxy.py`, so that the network can be cut, black-holed or frozen without touching the
 server, and a backend is killed with `pg_terminate_backend` only when it is one of the proxy's own (`client_port` is a
 port the proxy opened), so a shared server's other sessions are left alone. The loop's own clock says how long the
@@ -31,7 +31,7 @@ HOST = os.environ.get("PGHOST", "127.0.0.1")
 PORT = int(os.environ.get("PGPORT", "5432"))
 USER = os.environ.get("PGUSER", "postgres")
 DB = os.environ.get("PGDATABASE", "postgres")
-LEX = os.environ.get("LEX_SYS", "lex-sys")
+LEX = os.environ.get("CANCHO", "cancho")
 SCRAM = (os.environ.get("PG_SCRAM_USER"), os.environ.get("PG_SCRAM_DB"), os.environ.get("PG_SCRAM_PASSWORD"))
 CLEARTEXT = (os.environ.get("PG_CLEARTEXT_USER"), os.environ.get("PG_CLEARTEXT_DB"), os.environ.get("PG_CLEARTEXT_PASSWORD"))
 
@@ -53,12 +53,12 @@ def build():
 
     def one(name, main):
         out = os.path.join(ROOT, "build", name)
-        subprocess.run([LEX, "build", "--std", os.path.join(ROOT, "tests", main), os.path.join(ROOT, "src", "pool.ls"),
-                        os.path.join(ROOT, "src", "pg.ls"), "-o", out], check=True)
+        subprocess.run([LEX, "build", "--std", os.path.join(ROOT, "tests", main), os.path.join(ROOT, "src", "pool.cho"),
+                        os.path.join(ROOT, "src", "pg.cho"), "-o", out], check=True)
         return out
-    DRIVE = one("reconnect_drive", "reconnect_drive.ls")
-    NARROW = one("narrow_use", "narrow_use.ls")
-    BASELINE = one("stall_baseline", "stall_baseline.ls")
+    DRIVE = one("reconnect_drive", "reconnect_drive.cho")
+    NARROW = one("narrow_use", "narrow_use.cho")
+    BASELINE = one("stall_baseline", "stall_baseline.cho")
 
 
 def psql(sql):
@@ -551,8 +551,8 @@ class Logins(Base):
 class Authority(unittest.TestCase):
     def test_the_pool_does_not_widen_the_programs_authority(self):
         # a program narrowed to one host and port that keeps a pool full with tick / adopt / dial_failed
-        out = subprocess.run([LEX, "authority", os.path.join(ROOT, "tests", "narrow_use.ls"), os.path.join(ROOT, "src", "pool.ls"),
-                              os.path.join(ROOT, "src", "pg.ls"), "--std"], capture_output=True, text=True).stdout
+        out = subprocess.run([LEX, "authority", os.path.join(ROOT, "tests", "narrow_use.cho"), os.path.join(ROOT, "src", "pool.cho"),
+                              os.path.join(ROOT, "src", "pg.cho"), "--std"], capture_output=True, text=True).stdout
         performs = out.split("never touches")[0]
         self.assertIn('net_out("127.0.0.1:5432")', performs)
         self.assertNotIn('net_out("")', performs)

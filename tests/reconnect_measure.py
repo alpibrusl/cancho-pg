@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The numbers of docs/reconnect.md: how long the loop is kept from waiting, how fast a pool is back, how the backoff behaves.
 
-    python3 tests/reconnect_measure.py           (the server environment of tests/e2e.py; LEX_SYS; builds like reconnect_test.py)
+    python3 tests/reconnect_measure.py           (the server environment of tests/e2e.py; CANCHO; builds like reconnect_test.py)
 
 Not a test: it prints what it measured, with the load of the machine, one table per question.
 """

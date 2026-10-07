@@ -1,0 +1,1462 @@
+edition 5;
+
+module pg;
+
+// `pg` -- a PostgreSQL client for cancho, in cancho: the v3 frontend/backend wire
+// protocol over a `Conn`. No C, no foreign call: `cancho authority` on a program using
+// it reports `net_out` (to the one host the program narrowed it to), `conn_read`,
+// `conn_write`, `heap`.
+//
+// Three layers, so each can be tested alone and a caller can take only what it needs:
+//
+//   1. Encoders that build the bytes a client sends: `startup`, `password`, `query`
+//      (simple protocol), `execute` (extended protocol: Parse, Bind, Describe, Execute,
+//      Sync, with parameters sent as data and never spliced into the SQL), `describe`
+//      (the types of a statement's parameters and columns, without running it), `terminate`.
+//   2. Decoders over the bytes a server answers with: `size` frames one message at `at`,
+//      and `kind`, `fields`, `value`, `column_name`, `column_oid`, `param_count`, `param_oid`,
+//      `error_field`, `tag`, `auth_code`, `status` read it. A reply is the accumulated bytes of every message up
+//      to ReadyForQuery; nothing is copied out of it, a value is a `(from, to)` into it.
+//   3. Blocking helpers over a `Conn`: `send`, `receive`, `login`, `simple`, `extended`,
+//      `describing`.
+//
+// Authentication: trust, cleartext password, and SCRAM-SHA-256 (the default of every
+// PostgreSQL since 14), the last built here on `std.crypto.sha256`: base64, HMAC-SHA-256 and
+// PBKDF2 are in this file because nothing else has them yet, and are public so they can be
+// checked against their RFC test vectors (`tests/pg_test.cho`).
+//
+// What is not here yet: MD5 authentication (`login` answers 5), TLS, binary result formats,
+// `COPY`, notifications, and a non-blocking connection (every helper here waits for the
+// server -- see docs/design.md for why that matters in an event loop).
+//
+// Status codes the helpers answer with: 0 ok; 1 the server closed the connection;
+// 2 a read or write would block; 3 a read failed; 4 the server answered a login with an
+// error (the reply holds the ErrorResponse); 5 the server asked for authentication
+// this cannot do; 6 a write failed; 7 a SCRAM exchange failed on the client's side (no
+// nonce was supplied, the server's messages were malformed, its nonce did not extend ours,
+// or its signature was not the one only a server that knows the password could send).
+
+import std.buffer;
+import std.bytes;
+import std.crypto;
+
+// ---------------------------------------------------------------------
+// Encoding
+// ---------------------------------------------------------------------
+
+fn put_be32[&h](heap: &!h Heap, b: buffer.Buffer, n: int) -> [heap] buffer.Buffer {
+    var o = buffer.push(heap, b, byte_of(n / 16777216 % 256));
+    o = buffer.push(heap, o, byte_of(n / 65536 % 256));
+    o = buffer.push(heap, o, byte_of(n / 256 % 256));
+    return buffer.push(heap, o, byte_of(n % 256));
+}
+
+fn put_be16[&h](heap: &!h Heap, b: buffer.Buffer, n: int) -> [heap] buffer.Buffer {
+    let o = buffer.push(heap, b, byte_of(n / 256 % 256));
+    return buffer.push(heap, o, byte_of(n % 256));
+}
+
+// `s` and its terminating NUL.
+fn put_cstr[&h, &s](heap: &!h Heap, b: buffer.Buffer, s: &s [byte]) -> [heap] buffer.Buffer {
+    return buffer.push(heap, buffer.append(heap, b, s), byte_of(0));
+}
+
+// A tagged message: the type byte, a length that counts itself and the body, the body.
+fn header[&h](heap: &!h Heap, b: buffer.Buffer, tag: int, body: int) -> [heap] buffer.Buffer {
+    return put_be32(heap, buffer.push(heap, b, byte_of(tag)), 4 + body);
+}
+
+// The first message of a connection: no type byte, protocol 3.0, `user` and `database`.
+pub fn startup[&h, &u, &d](heap: &!h Heap, user: &u [byte], database: &d [byte]) -> [heap] buffer.Buffer {
+    // length (4) + protocol (4) + "user\0" + user\0 + "database\0" + database\0 + final \0
+    var m = put_be32(heap, buffer.empty(heap, 64), 25 + len(user) + len(database));
+    m = put_be32(heap, m, 196608);
+    m = put_cstr(heap, m, "user");
+    m = put_cstr(heap, m, user);
+    m = put_cstr(heap, m, "database");
+    m = put_cstr(heap, m, database);
+    return buffer.push(heap, m, byte_of(0));
+}
+
+// The answer to a cleartext-password authentication request.
+pub fn password[&h, &s](heap: &!h Heap, secret: &s [byte]) -> [heap] buffer.Buffer {
+    return put_cstr(heap, header(heap, buffer.empty(heap, 32), 112, len(secret) + 1), secret);
+}
+
+// A simple query: one message, the SQL as text, results in text. Several statements
+// separated by `;` are answered one after the other.
+pub fn query[&h, &s](heap: &!h Heap, sql: &s [byte]) -> [heap] buffer.Buffer {
+    return put_cstr(heap, header(heap, buffer.empty(heap, 64), 81, len(sql) + 1), sql);
+}
+
+// Ask the server what a statement would take and give back, without running it: Parse
+// (unnamed statement), Describe the statement, Sync. The reply is a ParameterDescription
+// (`param_count`, `param_oid`) and a RowDescription (`fields`, `column_name`, `column_oid`),
+// or NoData for a statement that returns no rows. This is how a program learns the types of
+// `$1`, `$2` and of every result column from the database itself.
+pub fn describe[&h, &s](heap: &!h Heap, sql: &s [byte]) -> [heap] buffer.Buffer {
+    var m = header(heap, buffer.empty(heap, 64), 80, 1 + len(sql) + 1 + 2);
+    m = put_cstr(heap, m, "");
+    m = put_cstr(heap, m, sql);
+    m = put_be16(heap, m, 0);
+    m = header(heap, m, 68, 2);
+    m = buffer.push(heap, m, byte_of(83));
+    m = buffer.push(heap, m, byte_of(0));
+    return header(heap, m, 83, 0);
+}
+
+pub fn terminate[&h](heap: &!h Heap) -> [heap] buffer.Buffer {
+    return header(heap, buffer.empty(heap, 8), 88, 0);
+}
+
+// Parameters for `execute`, each one a length and its bytes (a length of -1 is NULL).
+pub res struct Params {
+    count: int,
+    packed: buffer.Buffer,
+}
+
+pub fn params[&h](heap: &!h Heap) -> [heap] Params {
+    return Params { count: 0, packed: buffer.empty(heap, 64) };
+}
+
+// A text-format parameter. The server infers its type from where `$n` is used.
+pub fn param[&h, &v](heap: &!h Heap, p: Params, value: &v [byte]) -> [heap] Params {
+    let Params { count, packed } = p;
+    let b = buffer.append(heap, put_be32(heap, packed, len(value)), value);
+    return Params { count: count + 1, packed: b };
+}
+
+pub fn param_null[&h](heap: &!h Heap, p: Params) -> [heap] Params {
+    let Params { count, packed } = p;
+    return Params { count: count + 1, packed: put_be32(heap, packed, 4294967295) };
+}
+
+pub fn drop_params[&h](heap: &!h Heap, p: Params) -> [heap] int {
+    let Params { count, packed } = p;
+    buffer.drop(heap, packed);
+    return count;
+}
+
+// An extended-protocol query with parameters `$1`, `$2`, ...: Parse (unnamed statement),
+// Bind (unnamed portal, text parameters, text results), Describe the portal, Execute, Sync.
+// The SQL and the values travel separately, so a value is never parsed as SQL.
+pub fn execute[&h, &s, &p](heap: &!h Heap, sql: &s [byte], ps: &p Params) -> [heap] buffer.Buffer {
+    var m = header(heap, buffer.empty(heap, 128), 80, 1 + len(sql) + 1 + 2);
+    m = put_cstr(heap, m, "");
+    m = put_cstr(heap, m, sql);
+    m = put_be16(heap, m, 0);
+    // Bind: portal "", statement "", 0 format codes (text), the parameters, 0 result codes
+    m = header(heap, m, 66, 1 + 1 + 2 + 2 + buffer.size(ps.packed) + 2);
+    m = put_cstr(heap, m, "");
+    m = put_cstr(heap, m, "");
+    m = put_be16(heap, m, 0);
+    m = put_be16(heap, m, ps.count);
+    m = buffer.append(heap, m, buffer.bytes(ps.packed));
+    m = put_be16(heap, m, 0);
+    // Describe the portal, Execute it without a row limit, Sync
+    m = header(heap, m, 68, 2);
+    m = buffer.push(heap, m, byte_of(80));
+    m = buffer.push(heap, m, byte_of(0));
+    m = header(heap, m, 69, 1 + 4);
+    m = buffer.push(heap, m, byte_of(0));
+    m = put_be32(heap, m, 0);
+    return header(heap, m, 83, 0);
+}
+
+// Prepared statements: Parse once, under a name, and Bind and Execute it many times. PostgreSQL
+// then parses and plans the SQL once per connection instead of once per call -- a one-row lookup
+// costs it about half as much (docs/design.md section 4). A name is at most 63 bytes (the server's
+// limit), unique on the connection, and the statement lives until the connection ends.
+
+// Parse `sql` as the statement `name` (no parameter types: the server infers them), then Sync.
+// The answer is a ParseComplete and a ReadyForQuery, or an ErrorResponse.
+pub fn parse_named[&h, &n, &s](heap: &!h Heap, name: &n [byte], sql: &s [byte]) -> [heap] buffer.Buffer {
+    var m = header(heap, buffer.empty(heap, 64 + len(sql)), 80, len(name) + 1 + len(sql) + 1 + 2);
+    m = put_cstr(heap, m, name);
+    m = put_cstr(heap, m, sql);
+    m = put_be16(heap, m, 0);
+    return header(heap, m, 83, 0);
+}
+
+// `script` and one more statement for it: Parse `sql` as `name`, then Sync (`parse_named`), appended. Start from
+// `buffer.empty` and count the calls: that is what a pool that logs in by itself sends after the login, once the
+// connection is made (`pg.pool.reconnect`).
+pub fn parse_append[&h, &n, &s](heap: &!h Heap, script: buffer.Buffer, name: &n [byte], sql: &s [byte]) -> [heap] buffer.Buffer {
+    var out = script;
+    let one = parse_named(heap, name, sql);
+    borrow one as &or in {
+        out = buffer.append(heap, out, buffer.bytes(or));
+    }
+    buffer.drop(heap, one);
+    return out;
+}
+
+// Bind the prepared statement `name` to the parameters `ps` (text in, text out), Execute it without
+// a row limit, Sync. No Describe: the caller knows the columns of a statement it prepared, so the
+// answer is only DataRows, a CommandComplete and a ReadyForQuery (or an ErrorResponse, which for a
+// name that was never prepared is SQLSTATE 26000).
+pub fn bind_named[&h, &n, &p](heap: &!h Heap, name: &n [byte], ps: &p Params) -> [heap] buffer.Buffer {
+    var m = header(heap, buffer.empty(heap, 64 + len(name) + buffer.size(ps.packed)), 66, 1 + len(name) + 1 + 2 + 2 + buffer.size(ps.packed) + 2);
+    m = put_cstr(heap, m, "");
+    m = put_cstr(heap, m, name);
+    m = put_be16(heap, m, 0);
+    m = put_be16(heap, m, ps.count);
+    m = buffer.append(heap, m, buffer.bytes(ps.packed));
+    m = put_be16(heap, m, 0);
+    m = header(heap, m, 69, 1 + 4);
+    m = buffer.push(heap, m, byte_of(0));
+    m = put_be32(heap, m, 0);
+    return header(heap, m, 83, 0);
+}
+
+// ---------------------------------------------------------------------
+// Decoding
+// ---------------------------------------------------------------------
+
+// An unsigned big-endian 32-bit integer. A length of -1 (NULL) reads as 4294967295.
+fn be32[&b](m: &b [byte], at: int) -> [] int {
+    return int_of(m[at]) * 16777216 + int_of(m[at + 1]) * 65536 + int_of(m[at + 2]) * 256 + int_of(m[at + 3]);
+}
+
+fn be16[&b](m: &b [byte], at: int) -> [] int {
+    return int_of(m[at]) * 256 + int_of(m[at + 1]);
+}
+
+// The bytes a NULL length (-1) reads as through `be32`: nothing follows it.
+fn null_length() -> [] int {
+    return 2147483648;
+}
+
+// The type byte of the message at `at` ('R' 82, 'T' 84, 'D' 68, 'C' 67, 'E' 69, 'Z' 90, ...).
+pub fn kind[&b](m: &b [byte], at: int) -> [] int {
+    return int_of(m[at]);
+}
+
+// The whole size of the message at `at` (type byte, length, body): `-1` if not all of it
+// is in `m` yet, `-2` if its length is impossible. Walk a reply with `at = at + size(m, at)`
+// while it is positive.
+pub fn size[&b](m: &b [byte], at: int) -> [] int {
+    if at + 5 > len(m) {
+        return 0 - 1;
+    }
+    let n = be32(m, at + 1);
+    if n < 4 {
+        return 0 - 2;
+    }
+    if at + 1 + n > len(m) {
+        return 0 - 1;
+    }
+    return 1 + n;
+}
+
+// ReadyForQuery's transaction status: 'I' 73 idle, 'T' 84 in a transaction, 'E' 69 failed.
+pub fn status[&b](m: &b [byte], at: int) -> [] int {
+    return int_of(m[at + 5]);
+}
+
+// The request code of an Authentication message: 0 ok, 3 cleartext password, 5 MD5, 10 SASL.
+pub fn auth_code[&b](m: &b [byte], at: int) -> [] int {
+    return be32(m, at + 5);
+}
+
+// The column or value count of a RowDescription or DataRow.
+pub fn fields[&b](m: &b [byte], at: int) -> [] int {
+    return be16(m, at + 5);
+}
+
+// Where column `i` of the RowDescription at `at` starts (its name), or -1.
+fn column_at[&b](m: &b [byte], at: int, i: int) -> [] int {
+    if i < 0 || i >= fields(m, at) {
+        return 0 - 1;
+    }
+    var p = at + 7;
+    var j = 0;
+    while j < i {
+        while int_of(m[p]) != 0 {
+            p = p + 1;
+        }
+        p = p + 1 + 18;
+        j = j + 1;
+    }
+    return p;
+}
+
+// The name of column `i`, as `(from, to)` in `m`; `(-1, -1)` if there is no such column.
+pub fn column_name[&b](m: &b [byte], at: int, i: int) -> [] (int, int) {
+    let p = column_at(m, at, i);
+    if p < 0 {
+        return (0 - 1, 0 - 1);
+    }
+    var q = p;
+    while int_of(m[q]) != 0 {
+        q = q + 1;
+    }
+    return (p, q);
+}
+
+// The type oid of column `i` (23 int4, 25 text, 16 bool, 20 int8, 1700 numeric, ...), or -1.
+pub fn column_oid[&b](m: &b [byte], at: int, i: int) -> [] int {
+    let p = column_at(m, at, i);
+    if p < 0 {
+        return 0 - 1;
+    }
+    var q = p;
+    while int_of(m[q]) != 0 {
+        q = q + 1;
+    }
+    return be32(m, q + 1 + 6);
+}
+
+// ParameterDescription ('t' 116): how many parameters the statement takes, and the oid of
+// parameter `i` (1-based like `$1`: `param_oid(m, at, 1)` is the type of `$1`), or -1.
+pub fn param_count[&b](m: &b [byte], at: int) -> [] int {
+    return be16(m, at + 5);
+}
+
+pub fn param_oid[&b](m: &b [byte], at: int, i: int) -> [] int {
+    if i < 1 || i > param_count(m, at) {
+        return 0 - 1;
+    }
+    return be32(m, at + 7 + 4 * (i - 1));
+}
+
+// Value `i` of the DataRow at `at`, as `(from, to)` in `m`. A NULL is `(-1, -1)`; an empty
+// string is `(n, n)`, which is not the same thing.
+pub fn value[&b](m: &b [byte], at: int, i: int) -> [] (int, int) {
+    if i < 0 || i >= fields(m, at) {
+        return (0 - 1, 0 - 1);
+    }
+    var p = at + 7;
+    var j = 0;
+    while j < i {
+        let l = be32(m, p);
+        if l >= null_length() {
+            p = p + 4;
+        } else {
+            p = p + 4 + l;
+        }
+        j = j + 1;
+    }
+    let l = be32(m, p);
+    if l >= null_length() {
+        return (0 - 1, 0 - 1);
+    }
+    return (p + 4, p + 4 + l);
+}
+
+// A field of the ErrorResponse (or NoticeResponse) at `at`, by its code byte: 'S' 83 severity,
+// 'C' 67 SQLSTATE, 'M' 77 message, 'D' 68 detail, 'H' 72 hint, 'P' 80 position. `(-1, -1)` if absent.
+pub fn error_field[&b](m: &b [byte], at: int, code: int) -> [] (int, int) {
+    let end = at + size(m, at);
+    var p = at + 5;
+    while p < end - 1 && int_of(m[p]) != 0 {
+        let c = int_of(m[p]);
+        var q = p + 1;
+        while q < end && int_of(m[q]) != 0 {
+            q = q + 1;
+        }
+        if c == code {
+            return (p + 1, q);
+        }
+        p = q + 1;
+    }
+    return (0 - 1, 0 - 1);
+}
+
+// The command tag of the CommandComplete at `at` ("SELECT 3", "INSERT 0 1"), as `(from, to)`.
+pub fn tag[&b](m: &b [byte], at: int) -> [] (int, int) {
+    return (at + 5, at + size(m, at) - 1);
+}
+
+// Whether `m` holds a complete ReadyForQuery.
+pub fn ready[&b](m: &b [byte]) -> [] bool {
+    var at = 0;
+    while size(m, at) > 0 {
+        if kind(m, at) == 90 {
+            return true;
+        }
+        at = at + size(m, at);
+    }
+    return false;
+}
+
+// The table oid and the column number (attnum) of column `i` of a RowDescription, when the column
+// is a plain reference to a table's column; `0` for both when it is an expression. These are what
+// let a generator ask the catalogue whether the column can be NULL. `-1` if there is no such column.
+pub fn column_table[&b](m: &b [byte], at: int, i: int) -> [] int {
+    let p = column_at(m, at, i);
+    if p < 0 {
+        return 0 - 1;
+    }
+    var q = p;
+    while int_of(m[q]) != 0 {
+        q = q + 1;
+    }
+    return be32(m, q + 1);
+}
+
+pub fn column_attnum[&b](m: &b [byte], at: int, i: int) -> [] int {
+    let p = column_at(m, at, i);
+    if p < 0 {
+        return 0 - 1;
+    }
+    var q = p;
+    while int_of(m[q]) != 0 {
+        q = q + 1;
+    }
+    return be16(m, q + 5);
+}
+
+// The first DataRow of a reply, as an offset for `value`, or -1.
+pub fn first_row[&b](m: &b [byte]) -> [] int {
+    return next_row(m, 0 - 1);
+}
+
+// The first DataRow after the one at `at` (`at` of -1 starts at the beginning), or -1: the loop
+// `var at = first_row(m); while at >= 0 { ...; at = next_row(m, at); }` visits each row once.
+pub fn next_row[&b](m: &b [byte], at: int) -> [] int {
+    var p = 0;
+    if at >= 0 {
+        if size(m, at) < 1 {
+            return 0 - 1;
+        }
+        p = at + size(m, at);
+    }
+    while size(m, p) > 0 {
+        if kind(m, p) == 68 {
+            return p;
+        }
+        p = p + size(m, p);
+    }
+    return 0 - 1;
+}
+
+// The offset of the first ErrorResponse in a reply, or -1 if the statement succeeded.
+pub fn failure[&b](m: &b [byte]) -> [] int {
+    var p = 0;
+    while size(m, p) > 0 {
+        if kind(m, p) == 69 {
+            return p;
+        }
+        p = p + size(m, p);
+    }
+    return 0 - 1;
+}
+
+// The row count in the last command tag ("INSERT 0 1" is 1, "SELECT 3" is 3, "UPDATE 0" is 0), or -1
+// if the reply has no tag or it carries no count ("CREATE TABLE").
+pub fn affected[&b](m: &b [byte]) -> [] int {
+    var p = 0;
+    var last = 0 - 1;
+    while size(m, p) > 0 {
+        if kind(m, p) == 67 {
+            last = p;
+        }
+        p = p + size(m, p);
+    }
+    if last < 0 {
+        return 0 - 1;
+    }
+    let (from, to) = tag(m, last);
+    var q = to;
+    while q > from && int_of(m[q - 1]) != 32 {
+        q = q - 1;
+    }
+    if q == from || q == to {
+        return 0 - 1;
+    }
+    var k = q;
+    while k < to {
+        if int_of(m[k]) < 48 || int_of(m[k]) > 57 {
+            return 0 - 1;
+        }
+        k = k + 1;
+    }
+    return int_text(m, q, to);
+}
+
+// A decimal integer in text form (what the server sends for int2, int4, int8 and oid): an
+// optional minus and digits. Accumulated downwards, so -9223372036854775808 is exact.
+pub fn int_text[&b](m: &b [byte], from: int, to: int) -> [] int {
+    var i = from;
+    var negative = false;
+    if i < to && int_of(m[i]) == 45 {
+        negative = true;
+        i = i + 1;
+    }
+    var n = 0;
+    while i < to {
+        let d = int_of(m[i]) - 48;
+        if d < 0 || d > 9 {
+            return 0;
+        }
+        n = n * 10 - d;
+        i = i + 1;
+    }
+    if negative {
+        return n;
+    }
+    return 0 - n;
+}
+
+// A boolean in text form: `t` is true, anything else (the server sends `f`) is false.
+pub fn bool_text[&b](m: &b [byte], from: int, to: int) -> [] bool {
+    return to - from == 1 && int_of(m[from]) == 116;
+}
+
+// `n` written in decimal after what `b` already holds. Works downwards from `n`, so the most
+// negative integer needs no special case.
+fn put_int[&h](heap: &!h Heap, b: buffer.Buffer, n: int) -> [heap] buffer.Buffer {
+    var out = b;
+    var rest = n;
+    if n < 0 {
+        out = buffer.push(heap, out, byte_of(45));
+    } else {
+        rest = 0 - n;
+    }
+    // `rest` is now zero or negative; collect its digits least significant first
+    var digits = box_slice(heap, 20, byte_of(0));
+    var count = 0;
+    borrow mut digits as &!dw in {
+        let d = contents(dw);
+        if rest == 0 {
+            d[0] = byte_of(48);
+            count = 1;
+        }
+        while rest != 0 {
+            d[count] = byte_of(48 - rest % 10);
+            rest = rest / 10;
+            count = count + 1;
+        }
+    }
+    borrow digits as &dr in {
+        var k = count;
+        while k > 0 {
+            out = buffer.push(heap, out, contents(dr)[k - 1]);
+            k = k - 1;
+        }
+    }
+    unbox_slice(heap, digits);
+    return out;
+}
+
+// A text-format integer parameter (for `int2`, `int4`, `int8`, `oid`), written in decimal.
+pub fn param_int[&h](heap: &!h Heap, p: Params, value: int) -> [heap] Params {
+    let text = put_int(heap, buffer.empty(heap, 24), value);
+    var out = p;
+    borrow text as &tr in {
+        out = param(heap, out, buffer.bytes(tr));
+    }
+    buffer.drop(heap, text);
+    return out;
+}
+
+// A boolean parameter: `t` or `f`.
+pub fn param_bool[&h](heap: &!h Heap, p: Params, value: bool) -> [heap] Params {
+    if value {
+        return param(heap, p, "t");
+    }
+    return param(heap, p, "f");
+}
+
+// ---------------------------------------------------------------------
+// Authentication: base64, HMAC-SHA-256, PBKDF2, SCRAM-SHA-256
+// ---------------------------------------------------------------------
+
+fn b64_alphabet() -> [] &static [byte] {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+}
+
+// RFC 4648 base64, standard alphabet, `=` padding.
+pub fn base64_encode[&h, &d](heap: &!h Heap, data: &d [byte]) -> [heap] buffer.Buffer {
+    let a = b64_alphabet();
+    var out = buffer.empty(heap, len(data) / 3 * 4 + 4);
+    var i = 0;
+    while i + 3 <= len(data) {
+        let n = int_of(data[i]) * 65536 + int_of(data[i + 1]) * 256 + int_of(data[i + 2]);
+        out = buffer.push(heap, out, a[n / 262144 % 64]);
+        out = buffer.push(heap, out, a[n / 4096 % 64]);
+        out = buffer.push(heap, out, a[n / 64 % 64]);
+        out = buffer.push(heap, out, a[n % 64]);
+        i = i + 3;
+    }
+    let rest = len(data) - i;
+    if rest == 1 {
+        let n = int_of(data[i]) * 65536;
+        out = buffer.push(heap, out, a[n / 262144 % 64]);
+        out = buffer.push(heap, out, a[n / 4096 % 64]);
+        out = buffer.push(heap, out, byte_of(61));
+        out = buffer.push(heap, out, byte_of(61));
+    }
+    if rest == 2 {
+        let n = int_of(data[i]) * 65536 + int_of(data[i + 1]) * 256;
+        out = buffer.push(heap, out, a[n / 262144 % 64]);
+        out = buffer.push(heap, out, a[n / 4096 % 64]);
+        out = buffer.push(heap, out, a[n / 64 % 64]);
+        out = buffer.push(heap, out, byte_of(61));
+    }
+    return out;
+}
+
+// The 6-bit value of a base64 character, or -1.
+fn b64_value(c: int) -> [] int {
+    if c >= 65 && c <= 90 {
+        return c - 65;
+    }
+    if c >= 97 && c <= 122 {
+        return c - 97 + 26;
+    }
+    if c >= 48 && c <= 57 {
+        return c - 48 + 52;
+    }
+    if c == 43 {
+        return 62;
+    }
+    if c == 47 {
+        return 63;
+    }
+    return 0 - 1;
+}
+
+// Decode RFC 4648 base64 (padding required, the alphabet strict). The flag is false for
+// anything else, and the bytes are then not to be used.
+pub fn base64_decode[&h, &s](heap: &!h Heap, text: &s [byte]) -> [heap] (buffer.Buffer, bool) {
+    var out = buffer.empty(heap, len(text) / 4 * 3 + 3);
+    var ok = len(text) % 4 == 0;
+    var i = 0;
+    while ok && i < len(text) {
+        var pad = 0;
+        if i + 4 == len(text) && int_of(text[i + 3]) == 61 {
+            pad = 1;
+            if int_of(text[i + 2]) == 61 {
+                pad = 2;
+            }
+        }
+        let v0 = b64_value(int_of(text[i]));
+        let v1 = b64_value(int_of(text[i + 1]));
+        var v2 = 0;
+        var v3 = 0;
+        if pad < 2 {
+            v2 = b64_value(int_of(text[i + 2]));
+        }
+        if pad < 1 {
+            v3 = b64_value(int_of(text[i + 3]));
+        }
+        if v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0 {
+            ok = false;
+        } else {
+            let n = v0 * 262144 + v1 * 4096 + v2 * 64 + v3;
+            out = buffer.push(heap, out, byte_of(n / 65536 % 256));
+            if pad < 2 {
+                out = buffer.push(heap, out, byte_of(n / 256 % 256));
+            }
+            if pad < 1 {
+                out = buffer.push(heap, out, byte_of(n % 256));
+            }
+        }
+        i = i + 4;
+    }
+    return (out, ok);
+}
+
+// SHA-256 of `message`, as a 32-byte buffer.
+fn digest[&h, &m](heap: &!h Heap, message: &m [byte]) -> [heap] buffer.Buffer {
+    let raw = box_slice(heap, 32, byte_of(0));
+    borrow mut raw as &!w in {
+        crypto.sha256(message, contents(w));
+    }
+    var out = buffer.empty(heap, 32);
+    borrow raw as &r in {
+        out = buffer.append(heap, out, contents(r));
+    }
+    unbox_slice(heap, raw);
+    return out;
+}
+
+// The two 64-byte pads of HMAC (key xor 0x36, key xor 0x5c), one after the other: a key
+// longer than a block is hashed first, a shorter one is zero-padded (RFC 2104).
+fn hmac_pads[&h, &k](heap: &!h Heap, key: &k [byte]) -> [heap] buffer.Buffer {
+    var kb = buffer.empty(heap, 64);
+    if len(key) > 64 {
+        let d = digest(heap, key);
+        borrow d as &db in {
+            kb = buffer.append(heap, kb, buffer.bytes(db));
+        }
+        buffer.drop(heap, d);
+    } else {
+        kb = buffer.append(heap, kb, key);
+    }
+    var pads = buffer.empty(heap, 128);
+    borrow kb as &kr in {
+        let k = buffer.bytes(kr);
+        var i = 0;
+        while i < 64 {
+            var b = 0;
+            if i < len(k) {
+                b = int_of(k[i]);
+            }
+            pads = buffer.push(heap, pads, byte_of(b ^ 54));
+            i = i + 1;
+        }
+        i = 0;
+        while i < 64 {
+            var b = 0;
+            if i < len(k) {
+                b = int_of(k[i]);
+            }
+            pads = buffer.push(heap, pads, byte_of(b ^ 92));
+            i = i + 1;
+        }
+    }
+    buffer.drop(heap, kb);
+    return pads;
+}
+
+// HMAC-SHA-256 of `message` under the key whose pads are `pads`: H(opad || H(ipad || message)).
+fn hmac_with[&h, &p, &m](heap: &!h Heap, pads: &p [byte], message: &m [byte]) -> [heap] buffer.Buffer {
+    var inner = buffer.append(heap, buffer.empty(heap, 64 + len(message)), pads[0..64]);
+    inner = buffer.append(heap, inner, message);
+    var inner_hash = buffer.empty(heap, 8);
+    borrow inner as &ir in {
+        buffer.drop(heap, inner_hash);
+        inner_hash = digest(heap, buffer.bytes(ir));
+    }
+    buffer.drop(heap, inner);
+    var outer = buffer.append(heap, buffer.empty(heap, 96), pads[64..128]);
+    borrow inner_hash as &hr in {
+        outer = buffer.append(heap, outer, buffer.bytes(hr));
+    }
+    buffer.drop(heap, inner_hash);
+    var out = buffer.empty(heap, 8);
+    borrow outer as &or in {
+        buffer.drop(heap, out);
+        out = digest(heap, buffer.bytes(or));
+    }
+    buffer.drop(heap, outer);
+    return out;
+}
+
+// HMAC-SHA-256 (RFC 2104, checked against RFC 4231), 32 bytes.
+pub fn hmac_sha256[&h, &k, &m](heap: &!h Heap, key: &k [byte], message: &m [byte]) -> [heap] buffer.Buffer {
+    let pads = hmac_pads(heap, key);
+    var out = buffer.empty(heap, 8);
+    borrow pads as &pr in {
+        buffer.drop(heap, out);
+        out = hmac_with(heap, buffer.bytes(pr), message);
+    }
+    buffer.drop(heap, pads);
+    return out;
+}
+
+// PBKDF2-HMAC-SHA-256 with a 32-byte output (RFC 8018; one block, so `T1`): U1 =
+// HMAC(P, salt || 00000001), Ui = HMAC(P, Ui-1), T = U1 xor ... xor Uc.
+pub fn pbkdf2_sha256[&h, &p, &s](heap: &!h Heap, password: &p [byte], salt: &s [byte], iterations: int) -> [heap] buffer.Buffer {
+    let pads = hmac_pads(heap, password);
+    var first = buffer.append(heap, buffer.empty(heap, len(salt) + 4), salt);
+    first = buffer.push(heap, first, byte_of(0));
+    first = buffer.push(heap, first, byte_of(0));
+    first = buffer.push(heap, first, byte_of(0));
+    first = buffer.push(heap, first, byte_of(1));
+    var u = buffer.empty(heap, 8);
+    borrow pads as &pr in {
+        borrow first as &fr in {
+            buffer.drop(heap, u);
+            u = hmac_with(heap, buffer.bytes(pr), buffer.bytes(fr));
+        }
+    }
+    buffer.drop(heap, first);
+    let t = box_slice(heap, 32, byte_of(0));
+    borrow mut t as &!tw in {
+        borrow u as &ur in {
+            let tt = contents(tw);
+            let ub = buffer.bytes(ur);
+            var j = 0;
+            while j < 32 {
+                tt[j] = ub[j];
+                j = j + 1;
+            }
+        }
+    }
+    var k = 1;
+    while k < iterations {
+        var next = buffer.empty(heap, 8);
+        borrow pads as &pr in {
+            borrow u as &ur in {
+                buffer.drop(heap, next);
+                next = hmac_with(heap, buffer.bytes(pr), buffer.bytes(ur));
+            }
+        }
+        buffer.drop(heap, u);
+        u = next;
+        borrow mut t as &!tw in {
+            borrow u as &ur in {
+                let tt = contents(tw);
+                let ub = buffer.bytes(ur);
+                var j = 0;
+                while j < 32 {
+                    tt[j] = byte_of(int_of(tt[j]) ^ int_of(ub[j]));
+                    j = j + 1;
+                }
+            }
+        }
+        k = k + 1;
+    }
+    buffer.drop(heap, u);
+    buffer.drop(heap, pads);
+    var out = buffer.empty(heap, 32);
+    borrow t as &tr in {
+        out = buffer.append(heap, out, contents(tr));
+    }
+    unbox_slice(heap, t);
+    return out;
+}
+
+// PBKDF2-HMAC-SHA-256 in pieces, for a caller that must not spend a whole turn on it: the 4096
+// iterations of a login are about 9 ms in one go. `state` is 64 bytes that the caller keeps between
+// calls: the last `Ui` in 0..32 and the running `T` in 32..64. `pbkdf2_begin` does the first
+// iteration (U1 = HMAC(P, salt || 00000001), T = U1) and answers 0, or -1 for a state that is too small;
+// each `pbkdf2_more` does `count` more; after `iterations - 1` of them in all, 32..64 holds what
+// `pbkdf2_sha256` answers.
+pub fn pbkdf2_begin[&h, &p, &s, &t](heap: &!h Heap, password: &p [byte], salt: &s [byte], state: &!t [byte]) -> [heap] int {
+    if len(state) < 64 {
+        return 0 - 1;
+    }
+    let pads = hmac_pads(heap, password);
+    var first = buffer.append(heap, buffer.empty(heap, len(salt) + 4), salt);
+    first = buffer.push(heap, first, byte_of(0));
+    first = buffer.push(heap, first, byte_of(0));
+    first = buffer.push(heap, first, byte_of(0));
+    first = buffer.push(heap, first, byte_of(1));
+    var u = buffer.empty(heap, 8);
+    borrow pads as &pr in {
+        borrow first as &fr in {
+            buffer.drop(heap, u);
+            u = hmac_with(heap, buffer.bytes(pr), buffer.bytes(fr));
+        }
+    }
+    buffer.drop(heap, first);
+    buffer.drop(heap, pads);
+    borrow u as &ur in {
+        let ub = buffer.bytes(ur);
+        var j = 0;
+        while j < 32 {
+            state[j] = ub[j];
+            state[32 + j] = ub[j];
+            j = j + 1;
+        }
+    }
+    buffer.drop(heap, u);
+    return 0;
+}
+
+// `count` more iterations of the PBKDF2 begun by `pbkdf2_begin` on the same `state` and `password`.
+pub fn pbkdf2_more[&h, &p, &t](heap: &!h Heap, password: &p [byte], state: &!t [byte], count: int) -> [heap] int {
+    if len(state) < 64 {
+        return 0 - 1;
+    }
+    let pads = hmac_pads(heap, password);
+    var done = 0;
+    while done < count {
+        var next = buffer.empty(heap, 8);
+        borrow pads as &pr in {
+            buffer.drop(heap, next);
+            next = hmac_with(heap, buffer.bytes(pr), state[0..32]);
+        }
+        borrow next as &nr in {
+            let nb = buffer.bytes(nr);
+            var j = 0;
+            while j < 32 {
+                state[j] = nb[j];
+                state[32 + j] = byte_of(int_of(state[32 + j]) ^ int_of(nb[j]));
+                j = j + 1;
+            }
+        }
+        buffer.drop(heap, next);
+        done = done + 1;
+    }
+    buffer.drop(heap, pads);
+    return done;
+}
+
+// `x xor y`, byte by byte, over the shorter of the two.
+fn xor_bytes[&h, &x, &y](heap: &!h Heap, a: &x [byte], b: &y [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, len(a));
+    var i = 0;
+    while i < len(a) && i < len(b) {
+        out = buffer.push(heap, out, byte_of(int_of(a[i]) ^ int_of(b[i])));
+        i = i + 1;
+    }
+    return out;
+}
+
+// SCRAM-SHA-256 (RFC 5802 with RFC 7677's hash), the client side. PostgreSQL takes the user
+// from the startup message and ignores the one inside SCRAM, so a login passes `""`; the
+// functions take it anyway so the RFC 7677 example (user "user") checks them as written.
+//
+//   client-first  = "n,,n=<user>,r=<nonce>"
+//   server-first  = "r=<nonce><server nonce>,s=<salt, base64>,i=<iterations>"
+//   client-final  = "c=biws,r=<nonce><server nonce>,p=<proof, base64>"
+//   server-final  = "v=<server signature, base64>"
+pub fn scram_client_first[&h, &u, &n](heap: &!h Heap, user: &u [byte], nonce: &n [byte]) -> [heap] buffer.Buffer {
+    var m = buffer.append(heap, buffer.empty(heap, 48), "n,,n=");
+    m = buffer.append(heap, m, user);
+    m = buffer.append(heap, m, ",r=");
+    return buffer.append(heap, m, nonce);
+}
+
+// The value of attribute `key` (a letter) in a comma-separated `k=v` list, as `(from, to)`,
+// or `(-1, -1)`. A value may contain `=` (base64 padding) and anything but `,`.
+pub fn scram_attr[&b](m: &b [byte], key: int) -> [] (int, int) {
+    var at = 0;
+    while at < len(m) {
+        var end = at;
+        while end < len(m) && int_of(m[end]) != 44 {
+            end = end + 1;
+        }
+        if end - at >= 2 && int_of(m[at]) == key && int_of(m[at + 1]) == 61 {
+            return (at + 2, end);
+        }
+        at = end + 1;
+    }
+    return (0 - 1, 0 - 1);
+}
+
+// A decimal number, or -1 for empty text or a non-digit or more than 9 digits.
+fn digits[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 || len(text) > 9 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        n = n * 10 + (c - 48);
+        i = i + 1;
+    }
+    return n;
+}
+
+// Check the server's challenge `server_first` against the client's `nonce` and read its iteration
+// count. Answers `(iterations, status)`: status 0, or 1 for a malformed message, 2 for a server nonce
+// that does not extend ours, 4 for an iteration count that is not 1..=1,000,000 (a hostile server
+// would otherwise choose how long the client computes); the iterations are then 0.
+pub fn scram_iterations[&s, &n](server_first: &s [byte], nonce: &n [byte]) -> [] (int, int) {
+    let (rf, rt) = scram_attr(server_first, 114);
+    let (sf, st) = scram_attr(server_first, 115);
+    let (inf, ie) = scram_attr(server_first, 105);
+    if rf < 0 || sf < 0 || inf < 0 {
+        return (0, 1);
+    }
+    let full = server_first[rf..rt];
+    if len(full) <= len(nonce) || !bytes.starts_with(full, nonce) {
+        return (0, 2);
+    }
+    let iterations = digits(server_first[inf..ie]);
+    if iterations < 1 || iterations > 1000000 {
+        return (0, 4);
+    }
+    return (iterations, 0);
+}
+
+// The salt of `server_first`, decoded: `(bytes, ok)`, not ok for a salt that is missing or is not base64.
+pub fn scram_salt[&h, &s](heap: &!h Heap, server_first: &s [byte]) -> [heap] (buffer.Buffer, bool) {
+    let (sf, st) = scram_attr(server_first, 115);
+    if sf < 0 {
+        return (buffer.empty(heap, 8), false);
+    }
+    return base64_decode(heap, server_first[sf..st]);
+}
+
+// The client's answer to `server_first`, and the `server-final` message it must get back.
+// Answers `(client_final, expected_server_final, status)`: status 0, or 1 for a malformed
+// message, 2 for a server nonce that does not extend ours, 3 for a bad salt, 4 for an
+// iteration count that is not 1..=1,000,000 (a hostile server would otherwise choose how long
+// the client computes), with both buffers empty.
+pub fn scram_client_final[&h, &p, &u, &n, &s](heap: &!h Heap, password: &p [byte], user: &u [byte], nonce: &n [byte], server_first: &s [byte]) -> [heap] (buffer.Buffer, buffer.Buffer, int) {
+    let (iterations, checked) = scram_iterations(server_first, nonce);
+    if checked != 0 {
+        return (buffer.empty(heap, 8), buffer.empty(heap, 8), checked);
+    }
+    let (salt, salt_ok) = scram_salt(heap, server_first);
+    if !salt_ok {
+        buffer.drop(heap, salt);
+        return (buffer.empty(heap, 8), buffer.empty(heap, 8), 3);
+    }
+    var salted = buffer.empty(heap, 8);
+    borrow salt as &sr in {
+        buffer.drop(heap, salted);
+        salted = pbkdf2_sha256(heap, password, buffer.bytes(sr), iterations);
+    }
+    buffer.drop(heap, salt);
+    var final = buffer.empty(heap, 8);
+    var expected = buffer.empty(heap, 8);
+    var status = 1;
+    borrow salted as &sdr in {
+        buffer.drop(heap, final);
+        buffer.drop(heap, expected);
+        let (f, e, st) = scram_client_final_with(heap, buffer.bytes(sdr), user, nonce, server_first);
+        final = f;
+        expected = e;
+        status = st;
+    }
+    buffer.drop(heap, salted);
+    return (final, expected, status);
+}
+
+// The rest of `scram_client_final`, from the salted password (`pbkdf2_sha256` of the password and the
+// challenge's salt, `iterations` times) on: the same answer. The challenge must have passed
+// `scram_iterations`; a message with no nonce is status 1. A caller that computes the salted
+// password in pieces (`pbkdf2_begin`, `pbkdf2_more`) ends here.
+pub fn scram_client_final_with[&h, &x, &u, &n, &s](heap: &!h Heap, salted_bytes: &x [byte], user: &u [byte], nonce: &n [byte], server_first: &s [byte]) -> [heap] (buffer.Buffer, buffer.Buffer, int) {
+    let (rf, rt) = scram_attr(server_first, 114);
+    if rf < 0 {
+        return (buffer.empty(heap, 8), buffer.empty(heap, 8), 1);
+    }
+    let full = server_first[rf..rt];
+    // AuthMessage = client-first-bare "," server-first "," client-final-without-proof
+    var without_proof = buffer.append(heap, buffer.empty(heap, 64), "c=biws,r=");
+    without_proof = buffer.append(heap, without_proof, full);
+    var auth = buffer.append(heap, buffer.empty(heap, 128), "n=");
+    auth = buffer.append(heap, auth, user);
+    auth = buffer.append(heap, auth, ",r=");
+    auth = buffer.append(heap, auth, nonce);
+    auth = buffer.push(heap, auth, byte_of(44));
+    auth = buffer.append(heap, auth, server_first);
+    auth = buffer.push(heap, auth, byte_of(44));
+    borrow without_proof as &wr in {
+        auth = buffer.append(heap, auth, buffer.bytes(wr));
+    }
+
+    let client_key = hmac_sha256(heap, salted_bytes, "Client Key");
+    let server_key = hmac_sha256(heap, salted_bytes, "Server Key");
+    var stored = buffer.empty(heap, 8);
+    borrow client_key as &ckr in {
+        buffer.drop(heap, stored);
+        stored = digest(heap, buffer.bytes(ckr));
+    }
+    var signature = buffer.empty(heap, 8);
+    var server_signature = buffer.empty(heap, 8);
+    borrow auth as &ar in {
+        borrow stored as &str in {
+            buffer.drop(heap, signature);
+            signature = hmac_sha256(heap, buffer.bytes(str), buffer.bytes(ar));
+        }
+        borrow server_key as &skr in {
+            buffer.drop(heap, server_signature);
+            server_signature = hmac_sha256(heap, buffer.bytes(skr), buffer.bytes(ar));
+        }
+    }
+    buffer.drop(heap, auth);
+    buffer.drop(heap, stored);
+    buffer.drop(heap, server_key);
+    var proof = buffer.empty(heap, 8);
+    borrow client_key as &ckr in {
+        borrow signature as &sgr in {
+            buffer.drop(heap, proof);
+            proof = xor_bytes(heap, buffer.bytes(ckr), buffer.bytes(sgr));
+        }
+    }
+    buffer.drop(heap, client_key);
+    buffer.drop(heap, signature);
+
+    var final = buffer.empty(heap, 8);
+    borrow proof as &pr in {
+        let b64 = base64_encode(heap, buffer.bytes(pr));
+        buffer.drop(heap, final);
+        final = buffer.append(heap, without_proof, ",p=");
+        borrow b64 as &br in {
+            final = buffer.append(heap, final, buffer.bytes(br));
+        }
+        buffer.drop(heap, b64);
+    }
+    buffer.drop(heap, proof);
+    var expected = buffer.append(heap, buffer.empty(heap, 64), "v=");
+    borrow server_signature as &ssr in {
+        let b64 = base64_encode(heap, buffer.bytes(ssr));
+        borrow b64 as &br in {
+            expected = buffer.append(heap, expected, buffer.bytes(br));
+        }
+        buffer.drop(heap, b64);
+    }
+    buffer.drop(heap, server_signature);
+    return (final, expected, 0);
+}
+
+// SASLInitialResponse: 'p', the mechanism name, the length of the client-first message (4
+// bytes) and the message itself. SASLResponse is `p` with only the message.
+pub fn sasl_initial[&h, &c](heap: &!h Heap, first: &c [byte]) -> [heap] buffer.Buffer {
+    var m = header(heap, buffer.empty(heap, 64), 112, 14 + 4 + len(first));
+    m = put_cstr(heap, m, "SCRAM-SHA-256");
+    m = put_be32(heap, m, len(first));
+    return buffer.append(heap, m, first);
+}
+
+pub fn sasl_response[&h, &c](heap: &!h Heap, message: &c [byte]) -> [heap] buffer.Buffer {
+    return buffer.append(heap, header(heap, buffer.empty(heap, 64), 112, len(message)), message);
+}
+
+// ---------------------------------------------------------------------
+// Over a connection (blocking)
+// ---------------------------------------------------------------------
+
+// Write all of `bytes`; false if the connection would block or failed.
+pub fn send[&c, &b](conn: &!c Conn, bytes: &b [byte]) -> [conn_write] bool {
+    var at = 0;
+    while at < len(bytes) {
+        match conn_write(conn, bytes[at..len(bytes)]) {
+            Sent::Wrote(w) => {
+                at = at + w;
+            }
+            Sent::Again => {
+                return false;
+            }
+            Sent::Failed(e) => {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Read into `acc` until it holds a ReadyForQuery (what `acc` already holds counts: nothing
+// is read if it is already complete). With `login` set, also stop at an Authentication
+// request the client must answer (code other than 0) and at an ErrorResponse, neither of
+// which is followed by a ReadyForQuery. Answers the reply so far and a status code.
+fn read_until[&h, &c](heap: &!h Heap, conn: &!c Conn, acc: buffer.Buffer, login: bool) -> [heap, conn_read] (buffer.Buffer, int) {
+    var a = acc;
+    var scanned = 0;
+    var done = false;
+    var status = 0;
+    while !done {
+        borrow a as &ar in {
+            let m = buffer.bytes(ar);
+            while size(m, scanned) > 0 && !done {
+                let k = kind(m, scanned);
+                if k == 90 {
+                    done = true;
+                }
+                if login && k == 69 {
+                    done = true;
+                }
+                if login && k == 82 && auth_code(m, scanned) != 0 {
+                    done = true;
+                }
+                scanned = scanned + size(m, scanned);
+            }
+        }
+        if !done {
+            region r {
+                var buf = alloc_slice[r](4096, byte_of(0));
+                match conn_read(conn, buf) {
+                    Received::Data(k) => {
+                        a = buffer.append(heap, a, buf[0..k]);
+                    }
+                    Received::End => {
+                        status = 1;
+                        done = true;
+                    }
+                    Received::Again => {
+                        status = 2;
+                        done = true;
+                    }
+                    Received::Failed(e) => {
+                        status = 3;
+                        done = true;
+                    }
+                }
+            }
+        }
+    }
+    return (a, status);
+}
+
+// Read the server's answer to what was just sent: everything up to ReadyForQuery.
+// Answers the reply (every message, in order) and a status code.
+pub fn receive[&h, &c](heap: &!h Heap, conn: &!c Conn) -> [heap, conn_read] (buffer.Buffer, int) {
+    return read_until(heap, conn, buffer.empty(heap, 256), false);
+}
+
+// The SCRAM-SHA-256 exchange after the server has asked for it (`first` is what it said, and is
+// ended here): the client-first message, the server's challenge, the proof, and the server's
+// signature checked against the one only a server that knows the password can compute. Answers
+// the final reply (up to ReadyForQuery) and a status code.
+fn scram_login[&h, &c, &s, &n](heap: &!h Heap, conn: &!c Conn, secret: &s [byte], nonce: &n [byte], first: buffer.Buffer) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    buffer.drop(heap, first);
+    var ok = false;
+    let msg = scram_client_first(heap, "", nonce);
+    borrow msg as &mr in {
+        let m = sasl_initial(heap, buffer.bytes(mr));
+        borrow m as &mb in {
+            ok = send(conn, buffer.bytes(mb));
+        }
+        buffer.drop(heap, m);
+    }
+    buffer.drop(heap, msg);
+    if !ok {
+        return (buffer.empty(heap, 8), 6);
+    }
+    let (second, s2) = read_until(heap, conn, buffer.empty(heap, 256), true);
+    if s2 != 0 {
+        return (second, s2);
+    }
+    var challenge_from = 0 - 1;
+    var challenge_to = 0 - 1;
+    var failed = false;
+    borrow second as &sr in {
+        let m = buffer.bytes(sr);
+        var at = 0;
+        while size(m, at) > 0 {
+            if kind(m, at) == 69 {
+                failed = true;
+            }
+            if kind(m, at) == 82 && auth_code(m, at) == 11 {
+                challenge_from = at + 9;
+                challenge_to = at + size(m, at);
+            }
+            at = at + size(m, at);
+        }
+    }
+    if failed {
+        return (second, 4);
+    }
+    if challenge_from < 0 {
+        return (second, 7);
+    }
+    var final = buffer.empty(heap, 8);
+    var expected = buffer.empty(heap, 8);
+    var st = 0;
+    borrow second as &sr in {
+        let (f, e, status) = scram_client_final(heap, secret, "", nonce, buffer.bytes(sr)[challenge_from..challenge_to]);
+        buffer.drop(heap, final);
+        final = f;
+        buffer.drop(heap, expected);
+        expected = e;
+        st = status;
+    }
+    buffer.drop(heap, second);
+    if st != 0 {
+        buffer.drop(heap, final);
+        buffer.drop(heap, expected);
+        return (buffer.empty(heap, 8), 7);
+    }
+    var sent = false;
+    borrow final as &fr in {
+        let m = sasl_response(heap, buffer.bytes(fr));
+        borrow m as &mb in {
+            sent = send(conn, buffer.bytes(mb));
+        }
+        buffer.drop(heap, m);
+    }
+    buffer.drop(heap, final);
+    if !sent {
+        buffer.drop(heap, expected);
+        return (buffer.empty(heap, 8), 6);
+    }
+    let (third, s3) = read_until(heap, conn, buffer.empty(heap, 256), true);
+    if s3 != 0 {
+        buffer.drop(heap, expected);
+        return (third, s3);
+    }
+    var rejected = false;
+    var verified = false;
+    borrow third as &tr in {
+        let m = buffer.bytes(tr);
+        var at = 0;
+        while size(m, at) > 0 {
+            if kind(m, at) == 69 {
+                rejected = true;
+            }
+            if kind(m, at) == 82 && auth_code(m, at) == 12 {
+                borrow expected as &er in {
+                    verified = bytes.equal(m[at + 9..at + size(m, at)], buffer.bytes(er));
+                }
+            }
+            at = at + size(m, at);
+        }
+    }
+    buffer.drop(heap, expected);
+    if rejected {
+        return (third, 4);
+    }
+    if !verified {
+        return (third, 7);
+    }
+    return read_until(heap, conn, third, false);
+}
+
+// Connect-time exchange: send the startup message, answer whatever authentication the server asks
+// for -- none (trust), a cleartext password, or SCRAM-SHA-256 -- and read to ReadyForQuery.
+// `nonce` is the client's one-time value for SCRAM: at least 18 bytes of entropy, written as
+// printable characters without a comma (`base64_encode` of 18 random bytes is right); it is not
+// used otherwise, and a SCRAM server with an empty nonce is status 7. Answers the server's reply
+// (the parameter statuses and backend key, or the ErrorResponse) and a status code.
+pub fn login[&h, &c, &u, &s, &d, &n](heap: &!h Heap, conn: &!c Conn, user: &u [byte], secret: &s [byte], database: &d [byte], nonce: &n [byte]) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    let hello = startup(heap, user, database);
+    var ok = false;
+    borrow hello as &hb in {
+        ok = send(conn, buffer.bytes(hb));
+    }
+    buffer.drop(heap, hello);
+    if !ok {
+        return (buffer.empty(heap, 8), 6);
+    }
+    let (first, s1) = read_until(heap, conn, buffer.empty(heap, 256), true);
+    if s1 != 0 {
+        return (first, s1);
+    }
+    var asked = 0;
+    var failed = false;
+    var scram = false;
+    borrow first as &fb in {
+        let m = buffer.bytes(fb);
+        var at = 0;
+        while size(m, at) > 0 {
+            if kind(m, at) == 82 {
+                asked = auth_code(m, at);
+                if asked == 10 {
+                    scram = bytes.find(m[at + 9..at + size(m, at)], "SCRAM-SHA-256") >= 0;
+                }
+            }
+            if kind(m, at) == 69 {
+                failed = true;
+            }
+            at = at + size(m, at);
+        }
+    }
+    if failed {
+        return (first, 4);
+    }
+    if asked == 0 {
+        return (first, 0);
+    }
+    if asked == 10 && scram {
+        if len(nonce) == 0 {
+            return (first, 7);
+        }
+        return scram_login(heap, conn, secret, nonce, first);
+    }
+    if asked != 3 {
+        return (first, 5);
+    }
+    buffer.drop(heap, first);
+    let reply = password(heap, secret);
+    var sent = false;
+    borrow reply as &rb in {
+        sent = send(conn, buffer.bytes(rb));
+    }
+    buffer.drop(heap, reply);
+    if !sent {
+        return (buffer.empty(heap, 8), 6);
+    }
+    let (second, s2) = read_until(heap, conn, buffer.empty(heap, 256), true);
+    if s2 != 0 {
+        return (second, s2);
+    }
+    var bad = false;
+    borrow second as &sb in {
+        let m = buffer.bytes(sb);
+        var at = 0;
+        while size(m, at) > 0 {
+            if kind(m, at) == 69 {
+                bad = true;
+            }
+            at = at + size(m, at);
+        }
+    }
+    if bad {
+        return (second, 4);
+    }
+    return (second, 0);
+}
+
+// Run one simple-protocol query and read everything up to ReadyForQuery.
+pub fn simple[&h, &c, &s](heap: &!h Heap, conn: &!c Conn, sql: &s [byte]) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    let q = query(heap, sql);
+    var ok = false;
+    borrow q as &qb in {
+        ok = send(conn, buffer.bytes(qb));
+    }
+    buffer.drop(heap, q);
+    if !ok {
+        return (buffer.empty(heap, 8), 6);
+    }
+    return receive(heap, conn);
+}
+
+// Describe a statement (see `describe`) and read the reply up to ReadyForQuery.
+pub fn describing[&h, &c, &s](heap: &!h Heap, conn: &!c Conn, sql: &s [byte]) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    let q = describe(heap, sql);
+    var ok = false;
+    borrow q as &qb in {
+        ok = send(conn, buffer.bytes(qb));
+    }
+    buffer.drop(heap, q);
+    if !ok {
+        return (buffer.empty(heap, 8), 6);
+    }
+    return receive(heap, conn);
+}
+
+// Run one extended-protocol query with parameters and read everything up to ReadyForQuery.
+pub fn extended[&h, &c, &s, &p](heap: &!h Heap, conn: &!c Conn, sql: &s [byte], ps: &p Params) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    let q = execute(heap, sql, ps);
+    var ok = false;
+    borrow q as &qb in {
+        ok = send(conn, buffer.bytes(qb));
+    }
+    buffer.drop(heap, q);
+    if !ok {
+        return (buffer.empty(heap, 8), 6);
+    }
+    return receive(heap, conn);
+}
+
+// Prepare `sql` under `name` on this connection. Answers the reply (a ParseComplete and a
+// ReadyForQuery; `failure(reply) >= 0` if the server refused the SQL) and a status.
+pub fn prepare[&h, &c, &n, &s](heap: &!h Heap, conn: &!c Conn, name: &n [byte], sql: &s [byte]) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    let q = parse_named(heap, name, sql);
+    var ok = false;
+    borrow q as &qb in {
+        ok = send(conn, buffer.bytes(qb));
+    }
+    buffer.drop(heap, q);
+    if !ok {
+        return (buffer.empty(heap, 8), 6);
+    }
+    return receive(heap, conn);
+}
+
+// `prepare`, but only if the step before it went well: given that step's reply and status, answers
+// them unchanged if it failed (a nonzero status or an ErrorResponse) and otherwise drops the reply
+// and prepares. A chain of these prepares everything and stops at the first refusal, which is what
+// `pgen` writes as `prepare_all`.
+pub fn prepare_after[&h, &c, &n, &s](heap: &!h Heap, conn: &!c Conn, reply: buffer.Buffer, status: int, name: &n [byte], sql: &s [byte]) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    var failed = status != 0;
+    borrow reply as &rr in {
+        if failure(buffer.bytes(rr)) >= 0 {
+            failed = true;
+        }
+    }
+    if failed {
+        return (reply, status);
+    }
+    buffer.drop(heap, reply);
+    return prepare(heap, conn, name, sql);
+}
+
+// Run the statement prepared as `name`, with parameters `ps`: send and receive.
+pub fn run_named[&h, &c, &n, &p](heap: &!h Heap, conn: &!c Conn, name: &n [byte], ps: &p Params) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    let q = bind_named(heap, name, ps);
+    var ok = false;
+    borrow q as &qb in {
+        ok = send(conn, buffer.bytes(qb));
+    }
+    buffer.drop(heap, q);
+    if !ok {
+        return (buffer.empty(heap, 8), 6);
+    }
+    return receive(heap, conn);
+}

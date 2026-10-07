@@ -2,9 +2,9 @@
 
 [![ci](https://github.com/alpibrusl/lexsys-pg/actions/workflows/ci.yml/badge.svg)](https://github.com/alpibrusl/lexsys-pg/actions/workflows/ci.yml)
 
-A PostgreSQL client for [lex-sys](https://github.com/alpibrusl/lex-sys), written in lex-sys:
+A PostgreSQL client for [cancho](https://github.com/alpibrusl/cancho), written in cancho:
 the v3 frontend/backend wire protocol over a TCP connection. **No C and no foreign call** --
-`lex-sys authority` on a program using it reports the network (`net_out`, narrowable to one
+`cancho authority` on a program using it reports the network (`net_out`, narrowable to one
 `host:port`), `conn_read`, `conn_write`, `heap`, and nothing else: a service that talks to a
 database says so in its own signature, and cannot talk to anything else.
 
@@ -16,7 +16,7 @@ without reflection is [`docs/design.md`](docs/design.md) §6.
 
 **Slices 1 to 4 built:** startup, trust, cleartext-password and **SCRAM-SHA-256** login
 (the default of every PostgreSQL since 14), simple queries, extended queries with parameters,
-`describe`, prepared statements, and a generator of typed query functions (`tools/pgen.ls`, [below](#typed-queries-pgen)); checked against
+`describe`, prepared statements, and a generator of typed query functions (`tools/pgen.cho`, [below](#typed-queries-pgen)); checked against
 PostgreSQL 16 and the stock `psql` client. **Not yet:** MD5 login
 (answered with status 5), TLS, binary result formats, `COPY`. The helpers of layer 3 wait for the
 server; **`pg.pool`** ([below](#a-pool-that-does-not-wait)) is the connection that does not, and
@@ -27,7 +27,7 @@ poller's events; [below](#a-pool-that-comes-back) and [`docs/reconnect.md`](docs
 
 ## Requirements
 
-- The **lex-sys** compiler at the revision this repository's CI builds with (below; `a87f666`, which has `tcp_connect_start`, the dial that
+- The **cancho** compiler at the revision this repository's CI builds with (below; `a87f666`, which has `tcp_connect_start`, the dial that
   does not wait, that the reconnecting pool needs: a pool that is only given connections with `add` works with older ones). A package store records no hash of the `std`
   it was published against, so the compiler revision is part of the contract.
 - Rust, to build that compiler (its `rust-toolchain.toml` pins the toolchain).
@@ -38,15 +38,15 @@ poller's events; [below](#a-pool-that-comes-back) and [`docs/reconnect.md`](docs
 Get the compiler at the revision CI builds and tests with (read from `ci.yml`, so this text cannot drift from it), and a PostgreSQL:
 
 ```
-git clone https://github.com/alpibrusl/lex-sys
+git clone https://github.com/alpibrusl/cancho
 git clone https://github.com/alpibrusl/lexsys-pg && cd lexsys-pg
-REV=$(sed -n 's/^ *LEX_SYS_REV: *//p' .github/workflows/ci.yml)
-(cd ../lex-sys && git checkout "$REV" && cargo build --release -p lex-sys)
-export PATH=$PWD/../lex-sys/target/release:$PATH
+REV=$(sed -n 's/^ *CANCHO_REV: *//p' .github/workflows/ci.yml)
+(cd ../cancho && git checkout "$REV" && cargo build --release -p cancho)
+export PATH=$PWD/../cancho/target/release:$PATH
 
 docker run --rm -d -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16     # or any server; trust is simplest
 
-lex-sys build --std examples/psql.ls src/pg.ls -o psql
+cancho build --std examples/psql.cho src/pg.cho -o psql
 ```
 
 `psql <host> <port> <user> <database> <password|-> <sql> [parameter ...]` prints one line per row
@@ -111,8 +111,8 @@ a server that asks the client to compute a million-times-over key derivation.
 ## Typed queries: `pgen`
 
 Writing `pg.extended(heap, conn, "select ... where id = $1", ps)` by hand and counting columns is what a
-generator should do. `tools/pgen.ls` reads a file of SQL, asks the server what each statement's parameters and
-columns are (`describe`: parsed and planned, not run), and writes a lex-sys module with a typed function per
+generator should do. `tools/pgen.cho` reads a file of SQL, asks the server what each statement's parameters and
+columns are (`describe`: parsed and planned, not run), and writes a cancho module with a typed function per
 query. The SQL stays SQL -- joins, CTEs, `RETURNING`, `ON CONFLICT` all work on day one, because nothing is
 abstracted -- and a query that does not compile against the schema fails the *generation*, not production.
 
@@ -126,12 +126,12 @@ insert into users (name, age) values ($1, $2) returning id
 ```
 
 ```
-$ lex-sys build --std tools/pgen.ls src/pg.ls -o pgen
-$ ./pgen 127.0.0.1 5432 postgres postgres - queries.sql > queries.ls          # module `queries`, from the file name
-$ lex-sys build --std app.ls queries.ls src/pg.ls -o app
+$ cancho build --std tools/pgen.cho src/pg.cho -o pgen
+$ ./pgen 127.0.0.1 5432 postgres postgres - queries.sql > queries.cho          # module `queries`, from the file name
+$ cancho build --std app.cho queries.cho src/pg.cho -o app
 ```
 
-and the generated functions are what the program calls (`tests/gen_use.ls` is a complete one). The module also
+and the generated functions are what the program calls (`tests/gen_use.cho` is a complete one). The module also
 has `prepare_all`: call it **once, after login**, and it parses every query on that connection under the
 query's name; each query then runs by name, so PostgreSQL parses and plans it once instead of on every call
 (about half the server's time on a one-row lookup, [`docs/design.md`](docs/design.md) section 4). It answers
@@ -176,7 +176,7 @@ sent as NULL (an empty string and `0` are values, not NULL). [`docs/design.md`](
 
 ## A pool that does not wait
 
-`src/pool.ls` (module `pg.pool`) holds a few logged-in, non-blocking connections and pipelines requests over
+`src/pool.cho` (module `pg.pool`) holds a few logged-in, non-blocking connections and pipelines requests over
 them, so that a loop with other work (an HTTP server) does not stop while PostgreSQL answers. The loop owns the
 poller; the pool only asks to be told when its connections are ready:
 
@@ -194,9 +194,9 @@ while (tag = pool.next_done(pl)) >= 0 { ... pool.reply(pl), pool.status(pl) ... 
 
 The reply is what `pg.run_named` returns, so every accessor `pgen` wrote works on it. A connection the server
 closes, or that sends something that is not the protocol, answers every request still on it with a `status` that is
-not 0, in its place in the order. `examples/` has no program for it: `lexsys-web`'s `users_pg` is the user, with
-`lex-sys`'s `http.server` (`hold`/`answer`). The package is a store of its own,
-`.lex-sys-vcs-pool`, requiring `size` and `kind` from `.lex-sys-vcs`.
+not 0, in its place in the order. `examples/` has no program for it: `cancho-web`'s `users_pg` is the user, with
+`cancho`'s `http.server` (`hold`/`answer`). The package is a store of its own,
+`.cancho-vcs-pool`, requiring `size` and `kind` from `.cancho-vcs`.
 
 ### A pool that comes back
 
@@ -220,23 +220,23 @@ let wait = pool.next_wake(pl, now);                      // -1, or the ms until 
 ```
 
 `revive` is for a program that holds the whole network (`Net("")`). One that narrowed its network to the database calls `tick`, `tcp_connect_start`
-and `adopt` (or `dial_failed`) itself, so that `lex-sys authority` still says `net_out("127.0.0.1:5432")` and not more (`tests/narrow_use.ls` is
+and `adopt` (or `dial_failed`) itself, so that `cancho authority` still says `net_out("127.0.0.1:5432")` and not more (`tests/narrow_use.cho` is
 that program, and the test reads its authority): the pool never dials. A host *name* is resolved by a call that waits (the compiler's, in
 `tcp_connect_start`); give an address. [`docs/reconnect.md`](docs/reconnect.md) has the states, the status codes, every measurement and what is not done.
 
 ## Using it from your program
 
-`pg` is a package: lock the names you call and fetch them, no copy of `pg.ls` in your tree
+`pg` is a package: lock the names you call and fetch them, no copy of `pg.cho` in your tree
 (`fetch` refuses a store that no longer matches the lock):
 
 ```
-lex-sys vcs lock  --store ../lexsys-pg/.lex-sys-vcs -o pg.lock \
+cancho vcs lock  --store ../lexsys-pg/.cancho-vcs -o pg.lock \
     login simple extended describing params param param_null drop_params size kind fields value tag error_field base64_encode
-lex-sys vcs fetch --lock pg.lock --store ../lexsys-pg/.lex-sys-vcs -o deps/
-lex-sys build --std app.ls deps/*.ls -o app
+cancho vcs fetch --lock pg.lock --store ../lexsys-pg/.cancho-vcs -o deps/
+cancho build --std app.cho deps/*.cho -o app
 ```
 
-The shape of a program (`examples/psql.ls` is a complete one, including `fresh_nonce`: 18 bytes
+The shape of a program (`examples/psql.cho` is a complete one, including `fresh_nonce`: 18 bytes
 from a `/dev/urandom` capability narrowed to that one file, as base64 -- the `nonce` below):
 
 ```
@@ -295,7 +295,7 @@ a NULL is `(-1, -1)` while an empty string is a real, empty range.
 | Over a connection (blocking) | |
 |---|---|
 | `send(conn, bytes)`, `receive(heap, conn)` | write all of it; read up to `ReadyForQuery` |
-| `login(heap, conn, user, secret, database, nonce)` | startup, whatever authentication the server asks (trust, cleartext, SCRAM-SHA-256), up to `ReadyForQuery`. `nonce`: at least 18 unpredictable bytes written as printable characters without a comma -- `examples/psql.ls` reads 18 bytes from `/dev/urandom` and base64-encodes them; an empty one makes a SCRAM server be refused |
+| `login(heap, conn, user, secret, database, nonce)` | startup, whatever authentication the server asks (trust, cleartext, SCRAM-SHA-256), up to `ReadyForQuery`. `nonce`: at least 18 unpredictable bytes written as printable characters without a comma -- `examples/psql.cho` reads 18 bytes from `/dev/urandom` and base64-encodes them; an empty one makes a SCRAM server be refused |
 | `simple(heap, conn, sql)`, `extended(heap, conn, sql, &ps)`, `describing(heap, conn, sql)` | send and receive |
 | `prepare(heap, conn, name, sql)`, `run_named(heap, conn, name, &ps)` | prepare a statement on this connection; run it by name (see below) |
 | `prepare_after(heap, conn, reply, status, name, sql)` | `prepare`, but only if the step before it went well: a chain of these prepares everything and stops at the first refusal |
@@ -321,12 +321,12 @@ of the end-to-end tests. Channel binding (`SCRAM-SHA-256-PLUS`) needs TLS, which
 
 ## A connection pooler
 
-`pooler/pooler.ls` is a PostgreSQL connection pooler in the PgBouncer's `transaction` mode, written in lex-sys on the same loop as the cache: a few logged-in server connections
+`pooler/pooler.cho` is a PostgreSQL connection pooler in the PgBouncer's `transaction` mode, written in cancho on the same loop as the cache: a few logged-in server connections
 are lent to many clients one transaction at a time, clients are asked for a password with SCRAM-SHA-256 if one is given, and a named prepared statement is refused in the server's
 words (it would outlive the transaction on a connection the client will not see again).
 
 ```
-lex-sys build --std pooler/pooler.ls pooler/frame.ls pooler/scram.ls src/pg.ls -o pooler-bin
+cancho build --std pooler/pooler.cho pooler/frame.cho pooler/scram.cho src/pg.cho -o pooler-bin
 ./pooler-bin <listen port> <server host> <server port> <user> <database> <server password | -> <pool size> [<client password>]
 ```
 
@@ -336,10 +336,10 @@ every measurement with its caveats, is [`docs/pooler.md`](docs/pooler.md).
 ## Tests
 
 ```
-lex-sys test tests/pg_test.ls src/pg.ls --std                     # 23 unit tests, no server
+cancho test tests/pg_test.cho src/pg.cho --std                     # 23 unit tests, no server
 eval "$(sh tests/postgres.sh)"                                    # a throwaway postgres:16 with a role of each login kind
 python3 tests/e2e.py                                              # 46 tests against it (and a mock server)
-lex-sys test tests/pool_test.ls src/pool.ls src/pg.ls tests/generated/queries.ls --std   # 8 pool tests, no server
+cancho test tests/pool_test.cho src/pool.cho src/pg.cho tests/generated/queries.cho --std   # 8 pool tests, no server
 python3 tests/reconnect_test.py                                   # 34 tests of the reconnecting pool: PostgreSQL behind a proxy, and mocks
 ```
 
@@ -364,11 +364,11 @@ iteration short, a long HMAC key not hashed, a wrong key label, the proof comput
 iteration cap raised) each fail at least one of the two suites.
 
 The generator is checked four ways: its output for `tests/queries.sql` must equal the checked-in
-`tests/generated/queries.ls` (so that file cannot go stale); a program using that checked-in module
-(`tests/gen_use.ls`) runs a scenario against the seeded database, its output is compared line by line and the
+`tests/generated/queries.cho` (so that file cannot go stale); a program using that checked-in module
+(`tests/gen_use.cho`) runs a scenario against the seeded database, its output is compared line by line and the
 tables it leaves behind are read back with `psql` (a hostile string passed as a parameter is stored as data and
 the table is still there); the types and the nullability it infers are asserted for each kind of parameter and
-column, and every module it writes is run through `lex-sys check`; and fourteen kinds of bad input each fail with
+column, and every module it writes is run through `cancho check`; and fourteen kinds of bad input each fail with
 a reason and write nothing. Thirteen deliberate bugs in the generator and the new decoders -- nullability
 inverted, the join check off, `"` or `\` not escaped in the SQL literal, `int8` or `bool` read as text, a repeated
 name allowed, a server error ignored, an integer read or written without its sign, the wrong word of a command tag, a
@@ -382,7 +382,7 @@ connection of four killed, a connection that dies the moment it is made, and moc
 loop reports the longest it was kept from waiting. NN deliberate bugs in the pool and the SCRAM pieces (`tests/mutants.py`) each fail a test.
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds the pinned compiler and runs all of it
-against a `postgres:16` service, and checks that the checked-in package store is the store of `src/pg.ls`.
+against a `postgres:16` service, and checks that the checked-in package store is the store of `src/pg.cho`.
 
 ## Documentation
 
@@ -395,12 +395,12 @@ against a `postgres:16` service, and checks that the checked-in package store is
 ## Layout
 
 ```
-src/pg.ls          the driver: login (trust, cleartext, SCRAM-SHA-256), simple and extended queries, describe, prepared statements
-src/pool.ls        pg.pool: a few non-blocking connections, pipelined, for a loop that must not wait, and that makes its own
-tools/pgen.ls      the generator of typed query functions from .sql files
-examples/          psql.ls and describe.ls: small command-line clients
+src/pg.cho          the driver: login (trust, cleartext, SCRAM-SHA-256), simple and extended queries, describe, prepared statements
+src/pool.cho        pg.pool: a few non-blocking connections, pipelined, for a loop that must not wait, and that makes its own
+tools/pgen.cho      the generator of typed query functions from .sql files
+examples/          psql.cho and describe.cho: small command-line clients
 pooler/            the connection pooler (PgBouncer's transaction mode)
-tests/             unit tests (lex-sys), end-to-end tests against PostgreSQL 16 and a mock server (Python)
+tests/             unit tests (cancho), end-to-end tests against PostgreSQL 16 and a mock server (Python)
 docs/              design, non-blocking, reconnect, pooler
 ```
 
@@ -412,8 +412,8 @@ by itself (a host *name* is still resolved by a call that waits; a connection th
 
 ## Contributing
 
-Every change goes through what CI runs: the unit tests, `lex-sys fmt --check`, the end-to-end tests against a `postgres:16`
-service, the pooler tests, and the check that the published package stores are the stores of `src/pg.ls` and `src/pool.ls`. Design
+Every change goes through what CI runs: the unit tests, `cancho fmt --check`, the end-to-end tests against a `postgres:16`
+service, the pooler tests, and the check that the published package stores are the stores of `src/pg.cho` and `src/pool.cho`. Design
 before code, in `docs/`, with claims measured; a claim that turns out false is corrected in place.
 
 ## Licence

@@ -8,7 +8,7 @@ on:
 env:
   # The compiler these sources are built and tested with. A package store records no hash
   # of the `std` it was published against, so the revision is part of the contract.
-  LEX_SYS_REV: a87f66615aff5817e7e9cbc317ae0d88c1785490
+  CANCHO_REV: a4572ea3b506e4bcec1c4be43deda1043c11ba9f
 
 jobs:
   test:
@@ -20,21 +20,21 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          repository: alpibrusl/lex-sys
-          ref: ${{ env.LEX_SYS_REV }}
-          path: lex-sys
+          repository: alpibrusl/cancho
+          ref: ${{ env.CANCHO_REV }}
+          path: cancho
 
       - name: Cache the compiler
         id: compiler
         uses: actions/cache@v4
         with:
-          path: lex-sys/target/release/lex-sys
-          key: lex-sys-${{ env.LEX_SYS_REV }}
+          path: cancho/target/release/cancho
+          key: cancho-${{ env.CANCHO_REV }}
 
-      - name: Build lex-sys
+      - name: Build cancho
         if: steps.compiler.outputs.cache-hit != 'true'
-        working-directory: lex-sys
-        run: cargo build --release -p lex-sys
+        working-directory: cancho
+        run: cargo build --release -p cancho
 
       - name: The reference client
         run: which psql || (sudo apt-get update -q && sudo apt-get install -y -q postgresql-client)
@@ -46,17 +46,17 @@ jobs:
 
       - name: Unit tests (no server)
         working-directory: pg
-        run: ../lex-sys/target/release/lex-sys test tests/pg_test.ls src/pg.ls --std
+        run: ../cancho/target/release/cancho test tests/pg_test.cho src/pg.cho --std
 
       # What the pool decides with no server (the arguments of `reconnect`, what is due when, the waits), and that the script
       # `pgen` writes is a Parse and a Sync for each statement.
       - name: Pool unit tests (no server)
         working-directory: pg
-        run: ../lex-sys/target/release/lex-sys test tests/pool_test.ls src/pool.ls src/pg.ls tests/generated/queries.ls --std
+        run: ../cancho/target/release/cancho test tests/pool_test.cho src/pool.cho src/pg.cho tests/generated/queries.cho --std
 
       - name: Formatting
         working-directory: pg
-        run: ../lex-sys/target/release/lex-sys fmt --check src tests tools examples pooler
+        run: ../cancho/target/release/cancho fmt --check src tests tools examples pooler
 
       # The real server and the stock psql client as the reference: every query must print
       # the same rows, errors and tags must be the server's, parameters must stay data; and
@@ -65,7 +65,7 @@ jobs:
       - name: End-to-end tests against PostgreSQL 16
         working-directory: pg
         env:
-          LEX_SYS: ${{ github.workspace }}/lex-sys/target/release/lex-sys
+          CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
         run: |
           eval "$(cat /tmp/pg.env.sh)"
           python3 tests/e2e.py
@@ -77,7 +77,7 @@ jobs:
       - name: Reconnecting pool tests (kill, cut, restore)
         working-directory: pg
         env:
-          LEX_SYS: ${{ github.workspace }}/lex-sys/target/release/lex-sys
+          CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
         run: |
           eval "$(cat /tmp/pg.env.sh)"
           python3 tests/reconnect_test.py
@@ -87,10 +87,10 @@ jobs:
       - name: End-to-end tests through the proxy (pooler P0)
         working-directory: pg
         env:
-          LEX_SYS: ${{ github.workspace }}/lex-sys/target/release/lex-sys
+          CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
         run: |
           mkdir -p build
-          ../lex-sys/target/release/lex-sys build --std pooler/proxy.ls -o build/proxy
+          ../cancho/target/release/cancho build --std pooler/proxy.cho -o build/proxy
           build/proxy 6433 127.0.0.1 5432 &
           sleep 1
           eval "$(cat /tmp/pg.env.sh)"
@@ -101,37 +101,37 @@ jobs:
       # raw protocol: transaction boundaries, queueing, pipelining, refusals, server failures, volume, hostile bytes.
       - name: Pooler framing tests (every cut of every message)
         working-directory: pg
-        run: ../lex-sys/target/release/lex-sys test tests/frame_test.ls pooler/frame.ls --std
+        run: ../cancho/target/release/cancho test tests/frame_test.cho pooler/frame.cho --std
 
       - name: Pooler SCRAM tests (RFC 7677, against the driver's HMAC and base64 at every length)
         working-directory: pg
-        run: ../lex-sys/target/release/lex-sys test tests/scram_test.ls pooler/scram.ls src/pg.ls --std
+        run: ../cancho/target/release/cancho test tests/scram_test.cho pooler/scram.cho src/pg.cho --std
 
       - name: Pooler end-to-end tests (P1)
         working-directory: pg
         run: |
           mkdir -p build
-          ../lex-sys/target/release/lex-sys build --std pooler/pooler.ls pooler/frame.ls pooler/scram.ls src/pg.ls -o build/pooler
+          ../cancho/target/release/cancho build --std pooler/pooler.cho pooler/frame.cho pooler/scram.cho src/pg.cho -o build/pooler
           eval "$(cat /tmp/pg.env.sh)"
           PGDATABASE=postgres python3 pooler/tests/pooler_e2e.py build/pooler
 
       # A consumer locks names from the checked-in store; it must be the store of this source.
-      - name: The published store is the store of src/pg.ls
+      - name: The published store is the store of src/pg.cho
         working-directory: pg
         run: |
           rm -rf /tmp/store
-          ../lex-sys/target/release/lex-sys vcs publish --std --store /tmp/store src/pg.ls > /dev/null
-          diff -r /tmp/store .lex-sys-vcs
+          ../cancho/target/release/cancho vcs publish --std --store /tmp/store src/pg.cho > /dev/null
+          diff -r /tmp/store .cancho-vcs
 
       # `pg.pool` is a package of its own, published beside `pg` and requiring the names it uses
       # (`size`, `kind`, the login's messages and SCRAM's pieces) from `pg`'s store; the same rule: the checked-in store is the store of the source.
-      - name: The published store is the store of src/pool.ls
+      - name: The published store is the store of src/pool.cho
         working-directory: pg
         run: |
           # published beside the checked-in one: the store records the path of the store it requires
           # relative to itself, so a copy elsewhere would differ in that one line
-          rm -rf .lex-sys-vcs-pool-check
-          lex=../lex-sys/target/release/lex-sys
-          $lex vcs lock --store .lex-sys-vcs -o /tmp/pg-for-pool.lock auth_code base64_encode error_field hmac_sha256 kind parse_append password pbkdf2_begin pbkdf2_more sasl_initial sasl_response scram_client_final_with scram_client_first scram_iterations scram_salt size startup > /dev/null
-          $lex vcs publish --std --store .lex-sys-vcs-pool-check --requires /tmp/pg-for-pool.lock:.lex-sys-vcs src/pool.ls > /dev/null
-          diff -r .lex-sys-vcs-pool-check .lex-sys-vcs-pool
+          rm -rf .cancho-vcs-pool-check
+          lex=../cancho/target/release/cancho
+          $lex vcs lock --store .cancho-vcs -o /tmp/pg-for-pool.lock auth_code base64_encode error_field hmac_sha256 kind parse_append password pbkdf2_begin pbkdf2_more sasl_initial sasl_response scram_client_final_with scram_client_first scram_iterations scram_salt size startup > /dev/null
+          $lex vcs publish --std --store .cancho-vcs-pool-check --requires /tmp/pg-for-pool.lock:.cancho-vcs src/pool.cho > /dev/null
+          diff -r .cancho-vcs-pool-check .cancho-vcs-pool

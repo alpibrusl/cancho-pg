@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""End-to-end tests of `pg` against a real PostgreSQL, through examples/psql.ls.
+"""End-to-end tests of `pg` against a real PostgreSQL, through examples/psql.cho.
 
     PGHOST=127.0.0.1 PGPORT=5432 PGUSER=postgres PGDATABASE=postgres python3 tests/e2e.py
-    LEX_SYS=/path/to/lex-sys   (default: lex-sys on PATH)       BIN=build/psql  (skip the build)
+    CANCHO=/path/to/cancho   (default: cancho on PATH)       BIN=build/psql  (skip the build)
 
 The reference is the stock `psql` client: for every query in `QUERIES` both clients are
-run and must print the same rows (`psql -At -F '|' -P null='\\N'` and psql.ls print the
+run and must print the same rows (`psql -At -F '|' -P null='\\N'` and psql.cho print the
 same format). They are the same bytes only if `pg` decodes every message the server sends
 for these types and sizes -- 20,000 rows and a 100,000-character value cross many reads --
 which is what a hand-written wire-protocol decoder is most likely to get wrong.
@@ -37,24 +37,24 @@ POOL_DRIVE = None
 
 def build():
     global BIN, DESCRIBE, PGEN, GEN_USE, POOL_DRIVE
-    lex = os.environ.get("LEX_SYS", "lex-sys")
+    lex = os.environ.get("CANCHO", "cancho")
     os.makedirs(os.path.join(ROOT, "build"), exist_ok=True)
     def one(name):
         out = os.path.join(ROOT, "build", name)
-        subprocess.run([lex, "build", "--std", os.path.join(ROOT, "examples", name + ".ls"),
-                        os.path.join(ROOT, "src", "pg.ls"), "-o", out], check=True)
+        subprocess.run([lex, "build", "--std", os.path.join(ROOT, "examples", name + ".cho"),
+                        os.path.join(ROOT, "src", "pg.cho"), "-o", out], check=True)
         return out
     BIN = BIN or one("psql")
     DESCRIBE = one("describe")
     lex_files = lambda out, main, *more: subprocess.run(
-        [lex, "build", "--std", main, *more, os.path.join(ROOT, "src", "pg.ls"), "-o", out], check=True)
+        [lex, "build", "--std", main, *more, os.path.join(ROOT, "src", "pg.cho"), "-o", out], check=True)
     PGEN = os.path.join(ROOT, "build", "pgen")
-    lex_files(PGEN, os.path.join(ROOT, "tools", "pgen.ls"))
+    lex_files(PGEN, os.path.join(ROOT, "tools", "pgen.cho"))
     # the program that uses the *checked-in* generated module, so a stale one is a failure
     GEN_USE = os.path.join(ROOT, "build", "gen_use")
-    lex_files(GEN_USE, os.path.join(ROOT, "tests", "gen_use.ls"), os.path.join(ROOT, "tests", "generated", "queries.ls"))
+    lex_files(GEN_USE, os.path.join(ROOT, "tests", "gen_use.cho"), os.path.join(ROOT, "tests", "generated", "queries.cho"))
     POOL_DRIVE = os.path.join(ROOT, "build", "pool_drive")
-    lex_files(POOL_DRIVE, os.path.join(ROOT, "tests", "pool_drive.ls"), os.path.join(ROOT, "src", "pool.ls"))
+    lex_files(POOL_DRIVE, os.path.join(ROOT, "tests", "pool_drive.cho"), os.path.join(ROOT, "src", "pool.cho"))
 
 
 def describe(sql, user=USER, db=DB):
@@ -63,7 +63,7 @@ def describe(sql, user=USER, db=DB):
 
 
 def ours(sql, *params, user=USER, db=DB, password="-"):
-    """(stdout, exit status) of psql.ls."""
+    """(stdout, exit status) of psql.cho."""
     p = subprocess.run([BIN, HOST, PORT, user, db, password, sql, *params],
                        capture_output=True, text=True, timeout=60)
     return p.stdout, p.returncode
@@ -347,10 +347,10 @@ def pgen(queries_path, db=DB):
 
 
 class Generator(unittest.TestCase):
-    """`tools/pgen.ls`: typed queries from SQL, by asking the server to describe each statement."""
+    """`tools/pgen.cho`: typed queries from SQL, by asking the server to describe each statement."""
 
     QUERIES = os.path.join(ROOT, "tests", "queries.sql")
-    GENERATED = os.path.join(ROOT, "tests", "generated", "queries.ls")
+    GENERATED = os.path.join(ROOT, "tests", "generated", "queries.cho")
 
     @classmethod
     def setUpClass(cls):
@@ -366,7 +366,7 @@ class Generator(unittest.TestCase):
         out, err, st = pgen(os.path.join("tests", "queries.sql"))
         self.assertEqual(st, 0, err)
         with open(self.GENERATED) as f:
-            self.assertEqual(out, f.read(), "tests/generated/queries.ls is stale: regenerate it with pgen")
+            self.assertEqual(out, f.read(), "tests/generated/queries.cho is stale: regenerate it with pgen")
 
     def test_generated_functions_run_and_read_back(self):
         # a fresh seed each time: the scenario inserts and renames
@@ -440,15 +440,15 @@ class Generator(unittest.TestCase):
                 f.write(queries)
             out, err, st = pgen(q)
             if st == 0 and check:
-                m = os.path.join(d, "t.ls")
+                m = os.path.join(d, "t.cho")
                 with open(m, "w") as f:
                     f.write(out)
-                lex = os.environ.get("LEX_SYS", "lex-sys")
-                c = subprocess.run([lex, "check", "--std", m, os.path.join(ROOT, "src", "pg.ls")],
+                lex = os.environ.get("CANCHO", "cancho")
+                c = subprocess.run([lex, "check", "--std", m, os.path.join(ROOT, "src", "pg.cho")],
                                    capture_output=True, text=True)
                 # a module with no `main` is complete: that is the one thing a check may say
-                self.assertEqual(c.stdout + c.stderr.replace(m, "t.ls").replace(os.path.join(ROOT, "src", "pg.ls"), "pg.ls"),
-                                 "t.ls: error: no `main` function\n", "the generated module does not compile:\n" + out)
+                self.assertEqual(c.stdout + c.stderr.replace(m, "t.cho").replace(os.path.join(ROOT, "src", "pg.cho"), "pg.cho"),
+                                 "t.cho: error: no `main` function\n", "the generated module does not compile:\n" + out)
             return out, err, st
 
     def test_types_come_from_the_server(self):
@@ -637,7 +637,7 @@ class ImpostorServer(unittest.TestCase):
 
 
 def pool_run(port, lanes, count, mode="plain", depth=64, budget=6000, host=HOST, user=USER, db=DB, out_cap=65536, nbytes=0):
-    """Run tests/pool_drive.ls: (the `done` lines as (tag, status, value), the `finished` line, the exit code)."""
+    """Run tests/pool_drive.cho: (the `done` lines as (tag, status, value), the `finished` line, the exit code)."""
     p = subprocess.run([POOL_DRIVE, host, str(port), user, db, str(lanes), str(count), mode, str(depth), str(budget), str(out_cap), str(nbytes)],
                        capture_output=True, text=True, timeout=120)
     done, finished = [], None

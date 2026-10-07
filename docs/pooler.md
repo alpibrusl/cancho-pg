@@ -1,4 +1,4 @@
-# A PostgreSQL connection pooler in lex-sys
+# A PostgreSQL connection pooler in cancho
 
 > **Status: P0 to P3 built (sections 7 to 10); what is still not here is in section 10.** Sections 1-6 were written before the code
 > and say what is built, in what order, what each step must show to be kept, and what would make the whole project not
@@ -12,15 +12,15 @@ clients connect to it as if it were the server; it keeps a few real connections 
 length of one **transaction**, then takes it back (PgBouncer's `pool_mode = transaction`). The mature tools are
 PgBouncer (C, 2007), PgCat (Rust) and Odyssey (C).
 
-A pooler is a good fit for lex-sys for reasons that are about the language, not about speed:
+A pooler is a good fit for cancho for reasons that are about the language, not about speed:
 
 * it is a **protocol proxy**: it frames messages and forwards bytes. It never needs to understand SQL, so it needs
   the part of the wire protocol this repository already has (framing, the startup exchange, `ReadyForQuery`'s
   status byte) and none of the part that is hard (types, formats);
-* it is a **network service that should be small and provably limited**. `lex-sys authority` on it names the
+* it is a **network service that should be small and provably limited**. `cancho authority` on it names the
   network and the heap and nothing else: no filesystem, no foreign code. For a component that holds every
   database credential in the deployment, that sentence is the product;
-* it reuses what `lexsys-cache` already proved on this runtime: a loop on `std.conns` and `Poller`, sans-io parsers
+* it reuses what `cancho-cache` already proved on this runtime: a loop on `std.conns` and `Poller`, sans-io parsers
   tested from bytes, a differential harness against the reference implementation, and pinned-core benchmarks.
 
 What it is **not** is a faster PgBouncer. PgBouncer is one thread and tuned for fifteen years; at the
@@ -106,7 +106,7 @@ reported as bound by the load generator or by PostgreSQL itself carries no ratio
 6. *Hostile bytes.* A client sending a message length of 0, 3, 2^31-1, a truncated message, garbage startup, a million
    connections that open and close, a client that never reads: the pooler stays up and answers the next client. Mutation
    testing of the framing and release logic, as for the cache.
-7. *`lex-sys authority`* names the network and the heap, and the CI check that it names no filesystem and no foreign
+7. *`cancho authority`* names the network and the heap, and the CI check that it names no filesystem and no foreign
    code is kept.
 
 **Performance gate (P1; the one that decides whether this is worth keeping).** `pgbench -S` (select-only) at 1, 10 and 100
@@ -126,7 +126,7 @@ Stopped, and written up as a negative result, if any of these holds after the sl
 
 * **P0:** the framing and forwarding layer cannot reach 0.9x of PgBouncer's CPU per forwarded byte on a large result (the
   forwarding path is where a runtime without a zero-copy `splice` loses first). It would then be the language, not the
-  design, and the finding would go to lex-sys.
+  design, and the finding would go to cancho.
 * **P1:** correctness test 3 cannot be made to pass without parsing SQL.
 * **P1:** CPU per transaction above 2x PgBouncer's after the obvious fixes: a pooler that costs twice the tool it replaces
   has only the authority story left, and that is not enough for a component on the hot path.
@@ -137,14 +137,14 @@ Stopped, and written up as a negative result, if any of these holds after the sl
 
 `lexsys-pg` already has the message encoders and decoders, SCRAM (client side, with HMAC and PBKDF2 that P2 reuses for the
 server side), and the test rig (a real PostgreSQL, `psql`, a mock server). The pooler is a second *program* here, not a
-second layer of the driver: `examples/` or a `pooler/` directory with its own entry point, sharing `src/pg.ls` for
+second layer of the driver: `examples/` or a `pooler/` directory with its own entry point, sharing `src/pg.cho` for
 what it needs and adding nothing to the driver's public surface.
 
 ## 7. P0, built and measured
 
-`pooler/proxy.ls` (about 330 lines) is the transparent proxy: one loop on `std.conns` and `Poller` (the cache's), a client paired with a server connection
+`pooler/proxy.cho` (about 330 lines) is the transparent proxy: one loop on `std.conns` and `Poller` (the cache's), a client paired with a server connection
 opened when it is accepted, bytes forwarded in 32 KiB chunks, a 256 KiB queue per connection for what the kernel will not take, a connection read from only while
-its peer's queue has room, and a peer closed once what is queued for it has gone. It understands nothing of the protocol. `lex-sys build` of it needs nothing outside
+its peer's queue has room, and a peer closed once what is queued for it has gone. It understands nothing of the protocol. `cancho build` of it needs nothing outside
 `std` (`Net("")`, `conn_*`, the poller, the heap).
 
 **Correctness (section 4's list, the part P0 can show).** `tests/e2e.py`, 46 tests (29 queries compared with stock `psql`, hostile parameters, trust, cleartext and SCRAM-SHA-256 logins including a non-ASCII
@@ -171,7 +171,7 @@ fifty (fails 0.9)**, and the two ten-client cells, flagged PostgreSQL-bound by t
 (rounds of 2 to 4 ms appear under every target, direct included).
 
 **What was ruled out, and what is not explained.** The pooler's own cost is not the difference: its CPU per transaction is lower, and its core is 53% busy at fifty clients. `strace -c` shows the same syscalls per
-transaction (2.0 `sendto`, 2.0 `recvfrom`, 0.22 `epoll_wait`) for both. PgBouncer sets `TCP_NODELAY` and `SO_KEEPALIVE` on its sockets and the proxy sets neither (lex-sys has no way to set a socket option on a
+transaction (2.0 `sendto`, 2.0 `recvfrom`, 0.22 `epoll_wait`) for both. PgBouncer sets `TCP_NODELAY` and `SO_KEEPALIVE` on its sockets and the proxy sets neither (cancho has no way to set a socket option on a
 `Conn`); a throwaway `LD_PRELOAD` shim that set `TCP_NODELAY` on both of the proxy's sockets made **no difference** (36-38k plain, 36-37k with it, at ten clients), so it is not that. What does differ is PostgreSQL's own cost per transaction: measured on the
 backends' CPU times, about 44 us of user time per transaction behind the proxy and 46 direct, against 33-35 behind PgBouncer (system time 19 / 20 / 14-15), with one context switch per transaction in each case (two runs of each; a second proxy run read 21 us and 0.47 switches per transaction, which a handful of backends' counters not being sampled would explain and which is left out of these figures, so the proxy's 44 rests on one run). PgBouncer's traffic makes PostgreSQL ~25% cheaper per transaction, and
 PgBouncer is faster than a direct connection at ten clients, which a proxy cannot be by doing less. Two guesses, neither tested: bursts of requests arriving back to back help the backends' caches, or something in how it writes to the server socket changes the kernel work done on PostgreSQL's side.
@@ -188,14 +188,14 @@ says nothing holds a server connection (P1 and P3).
 
 **A correction found while building P1 (section 8): P0 stalls for 44 ms on any result of more than one TCP segment.** P0's benchmark used one-row lookups and a 200 MB stream, and
 neither shows it: a stream is not latency-bound and a lookup is one segment. Measured with one request outstanding, a 70,000-byte result takes 0.48 ms directly and **44.0 ms through the P0 proxy** (Nagle's algorithm
-holds a small write while an earlier one is unacknowledged, and the peer's delayed acknowledgement answers 40 ms later). The cause is that lex-sys had no way to set `TCP_NODELAY`; `conn_nodelay` (lex-sys #187) is the fix, and with it P0 takes 0.55 ms. The
+holds a small write while an earlier one is unacknowledged, and the peer's delayed acknowledgement answers 40 ms later). The cause is that cancho had no way to set `TCP_NODELAY`; `conn_nodelay` (cancho #187) is the fix, and with it P0 takes 0.55 ms. The
 "throughput" numbers above are the proxy before this fix, for results that fit one segment, and are not wrong, but "the proxy is transparent" was true only for those.
 
 ## 8. P1, built and measured
 
-`pooler/pooler.ls` is transaction pooling: a pool of logged-in server connections (`pg.login`, so trust, cleartext and SCRAM), clients answered by the pooler itself at startup (the parameters come from the first server connection;
+`pooler/pooler.cho` is transaction pooling: a pool of logged-in server connections (`pg.login`, so trust, cleartext and SCRAM), clients answered by the pooler itself at startup (the parameters come from the first server connection;
 `BackendKeyData` is the pooler's own), a server connection lent for one transaction and taken back when `ReadyForQuery` arrives with status idle and the client is owed no more, and clients that find none free queued in order with what
-they sent held back. `pooler/frame.ls` is the two state machines it rests on: what to do with a client's next message (`client_step`: forward, drop, terminate, refuse a named `Parse`, count the `Query` and `Sync` that each owe a
+they sent held back. `pooler/frame.cho` is the two state machines it rests on: what to do with a client's next message (`client_step`: forward, drop, terminate, refuse a named `Parse`, count the `Query` and `Sync` that each owe a
 `ReadyForQuery`) and a scan of the server's stream for `ReadyForQuery` and its status (`scan`). Neither copies a message body.
 
 **Not in P1** (as designed in section 2, and what that costs): clients are not authenticated (P2: it is for a trusted network); a client's user and database must be the pool's (one pool); `CancelRequest` is not mapped and the
@@ -205,13 +205,13 @@ with `0A000`, which is correct and also means `pgbench -M prepared` and any driv
 
 **Correctness.**
 
-* `tests/frame_test.ls`: 6 tests that feed generated streams to both machines cut at every chunk size from one byte up (a clean stream, a stream with a refused statement and the `Sync` that ends it, bodies of every length, messages that cannot be the protocol,
-  runs of empty messages, three `ReadyForQuery`s in one look). 13 mutants of `frame.ls` (a refusal inverted, `Sync` not owed, the length limit gone, the status read from the wrong byte, ...) are each killed.
+* `tests/frame_test.cho`: 6 tests that feed generated streams to both machines cut at every chunk size from one byte up (a clean stream, a stream with a refused statement and the `Sync` that ends it, bodies of every length, messages that cannot be the protocol,
+  runs of empty messages, three `ReadyForQuery`s in one look). 13 mutants of `frame.cho` (a refusal inverted, `Sync` not owed, the length limit gone, the status read from the wrong byte, ...) are each killed.
 * `pooler/tests/pooler_e2e.py`: 25 tests against a real PostgreSQL over the raw protocol, each starting its own pooler: the startup looks like a server's; clients take turns on one connection; an open transaction keeps its connection and the others wait; a rolled-back one is not seen; **a client that leaves in a transaction leaves nothing open** (the connection
   is dropped, not reused, and `pg_stat_activity` shows no idle-in-transaction); a failed transaction holds until `ROLLBACK`; waiting clients are served in arrival order; pipelined queries and two `Sync`s in one write release only after the last; the unnamed extended protocol works with hostile parameters; a named statement is refused in the server's
   words (`0A000`), also inside a transaction (where the answer is `E`), and the connection goes on; wrong user, wrong database, `SSLRequest`; a server connection that dies idle is replaced, and one that dies mid-transaction closes its client and no one else's; a client that never reads does not stop the others; a 50,000-row result and a 5 MB query arrive whole; **a busy server that does
   not read while the client keeps sending 6 MB (backpressure through every buffer) loses nothing**; 60 clients on 4 connections each get their own answers; and hostile bytes (garbage startups and messages, lengths of 0, 3 and 2^31-1, 500 connections that open and close, 50 that say nothing, more clients than the limit) leave it answering.
-* Mutation testing of `pooler.ls`: 16 mutants (release on any `ReadyForQuery`, the owed count ignored, a dirty server kept when its client leaves, no skip to `Sync` after a refusal, the wrong status after it, the user or database unchecked, waiting clients not served on release, last-in-first-out, reads not resumed after a drain, held-back input not sent after a drain,
+* Mutation testing of `pooler.cho`: 16 mutants (release on any `ReadyForQuery`, the owed count ignored, a dirty server kept when its client leaves, no skip to `Sync` after a refusal, the wrong status after it, the user or database unchecked, waiting clients not served on release, last-in-first-out, reads not resumed after a drain, held-back input not sent after a drain,
   no capacity check towards the server, a dead server not uncounted, no parameters in the startup, `Terminate` keeping the server, a server's end of stream leaving its client hanging). **The first version of the tests let four survive** (the two backpressure mutants, the end-of-stream one, and a dirty-server mutant that did not compile and had to be written another way); the slow-server test was added for the first two, the death test was
   changed to require the connection to be *closed* (it had passed on a read that timed out), and all 16 are now killed.
 * `pgbench` select-only and TPC-B, simple and extended, run through it with no failed transactions; `psql` is the same server on every connection.
@@ -250,7 +250,7 @@ authenticated) and P3 (cancel, timeouts, limits, a connection that is replaced w
 
 ## 9. P2, built: clients are asked for a password
 
-`pooler/scram.ls` and the startup state machine in `pooler/pooler.ls`. Given a client password as the last argument (`pooler <listen> <host> <port> <user> <database> <server password | -> <pool size> <client password>`), the pooler answers a startup with
+`pooler/scram.cho` and the startup state machine in `pooler/pooler.cho`. Given a client password as the last argument (`pooler <listen> <host> <port> <user> <database> <server password | -> <pool size> <client password>`), the pooler answers a startup with
 `AuthenticationSASL` and runs SCRAM-SHA-256 (RFC 5802, 7677) against the client before the client is told it is in; without one (or `-`) clients are trusted, as in P1. The pooler never holds the password after start: it derives the salt, `StoredKey` and `ServerKey` once (16 random bytes of salt,
 4096 iterations, as PostgreSQL does) and a login is two HMACs, a SHA-256 and a constant-time comparison. The client's proof is checked, the exchange's nonces are checked (the final message's must be the one the pooler made, so a captured final message is useless in another session even with the same client nonce),
 the channel-binding flag is checked, and the server signature the client is sent is the one only a holder of the password can make.
@@ -259,7 +259,7 @@ It works over plain slices, with no heap, because the request loop has none; the
 
 **Checked.**
 
-* `tests/scram_test.ls`: the RFC 7677 exchange (the proof is accepted, the server signature is the RFC's); the heap-free HMAC and base64 against the driver's own at every key length from 0 to 64 and every message length in steps of 13 up to 200, and base64 at every length to 40; each of the 44 characters of the proof changed in turn, another message,
+* `tests/scram_test.cho`: the RFC 7677 exchange (the proof is accepted, the server signature is the RFC's); the heap-free HMAC and base64 against the driver's own at every key length from 0 to 64 and every message length in steps of 13 up to 200, and base64 at every length to 40; each of the 44 characters of the proof changed in turn, another message,
   another password and another iteration count refused, and no signature written for a refusal. 9 mutants killed (one, a comparison that stops at the first difference, cannot be told apart by a test and is left to review).
 * `pooler/tests/pooler_e2e.py`, class `Authentication` (14 tests): **`libpq` (`psql`, `pgbench`) logs in** with the right password (it checks the server signature too, so this is the independent oracle) and not with a wrong or no password; an independent Python SCRAM client does the same and verifies the signature; a wrong password, a proof with one bit changed, another nonce, no proof,
   an empty proof, a proof replayed from another session with the same client nonce, channel binding requested, the `-PLUS` mechanism, a bad channel-binding flag, a first message with a wrong declared length, and messages that are not password messages (each refused with the SQLSTATE PostgreSQL would use: `28P01`, `28000`, `08P01`); an exchange cut off at every third byte, 50 half-finished exchanges, and
@@ -268,7 +268,7 @@ It works over plain slices, with no heap, because the request loop has none; the
 * A test that was wrong, found by running the whole suite instead of one class: "waiting clients are served in the order they came" recorded the order in which Python threads woke up, which two answers a fraction of a millisecond apart can swap (it failed two runs in eight when the database was `postgres`). It now orders the answers by the server's own `clock_timestamp()`, and three full runs of 39 tests pass.
 
 **What it costs and what it does not do.** The login is one extra round trip pair and two HMACs; the pooler's request path is untouched after it. **The password is a command-line argument**, which any user on the machine can read from the process list: it is for tests and for a network of one. Reading it from a file needs
-a file capability the pooler does not hold (`lex-sys authority` shows exactly what it holds, which is the point), and that is the next thing to design, not done. One user, one secret: the client password is separate from the password the pooler logs in to the server with, and there is no per-user list (a second pool is a second process). The password is used as the bytes given, not run through SASLprep (so an ASCII
+a file capability the pooler does not hold (`cancho authority` shows exactly what it holds, which is the point), and that is the next thing to design, not done. One user, one secret: the client password is separate from the password the pooler logs in to the server with, and there is no per-user list (a second pool is a second process). The password is used as the bytes given, not run through SASLprep (so an ASCII
 password is correct and a non-ASCII one that needs normalising is not). Cleartext and MD5 authentication are not offered, only SCRAM; and an unauthenticated client holds one of the 200 client slots until it is cut off, because there are no timeouts yet (P3): fifty half-open exchanges are survived, 200 would fill the slots.
 
 ## 10. P3, built: timeouts and cancel
@@ -291,9 +291,9 @@ Running two test runs at once on the same ports made eight tests error at once; 
 
 **Still not here, and why.**
 
-* **A server connection is made with a blocking connect.** When one dies it is replaced by logging in while the loop waits; that is a millisecond to a local server and the connect's timeout to one that is not answering, during which no client is served. lex-sys has no non-blocking connect (`tcp_connect` waits), so this needs a language change, as `conn_nodelay` and `copy_within` did: a `tcp_connect` that
+* **A server connection is made with a blocking connect.** When one dies it is replaced by logging in while the loop waits; that is a millisecond to a local server and the connect's timeout to one that is not answering, during which no client is served. cancho has no non-blocking connect (`tcp_connect` waits), so this needs a language change, as `conn_nodelay` and `copy_within` did: a `tcp_connect` that
   returns when the connection is started and says when it is complete through the poller.
-* **No shutdown that drains.** lex-sys has no signal handling, so a stop is a kill: clients are cut, which is what a restart of the pooler costs now.
+* **No shutdown that drains.** cancho has no signal handling, so a stop is a kill: clients are cut, which is what a restart of the pooler costs now.
 * **The password is a command-line argument** (section 9), the same for the timeouts' arguments being positional, which is awkward and will be replaced by a configuration read from a file once there is a file capability to hold for it.
 * **One pool**: one user, one database, one server, and 200 clients at most (fixed at build); a second pool is a second process.
 * **No TLS** on either side, no `LISTEN`/`NOTIFY` (messages to an idle server connection are dropped), no session pooling mode (a client that needs session state needs a server connection of its own).
