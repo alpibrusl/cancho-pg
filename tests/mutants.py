@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Single-edit mutants of src/pool.ls and src/pg.ls: each one must make a test fail.
+"""Single-edit mutants of src/pool.cho and src/pg.cho: each one must make a test fail.
 
-    LEX_SYS=... PGHOST=... python3 tests/mutants.py [name ...]      (default: all; the server env of tests/e2e.py)
+    CANCHO=... PGHOST=... python3 tests/mutants.py [name ...]      (default: all; the server env of tests/e2e.py)
 
 For each mutant: save the file, make the edit, run the unit tests (no server) and then tests/reconnect_test.py until the first
 failure, restore the file from the saved copy and check with `cmp` that it is the same bytes. Prints one line per mutant
@@ -15,10 +15,10 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LEX = os.environ.get("LEX_SYS", "lex-sys")
+LEX = os.environ.get("CANCHO", "cancho")
 
-POOL = "src/pool.ls"
-PG = "src/pg.ls"
+POOL = "src/pool.cho"
+PG = "src/pg.cho"
 
 # (name, file, old text, new text)
 MUTANTS = [
@@ -61,9 +61,9 @@ def run(cmd, **kw):
 
 def suites():
     """The suites, in the order a mutant is most likely to fail them. Yields (name, command)."""
-    yield "pg_test", [LEX, "test", "tests/pg_test.ls", "src/pg.ls", "--std"]
-    yield "pool_test", [LEX, "test", "tests/pool_test.ls", "src/pool.ls", "src/pg.ls", "tests/generated/queries.ls", "--std"]
-    yield "scram_test", [LEX, "test", "tests/scram_test.ls", "pooler/scram.ls", "src/pg.ls", "--std"]
+    yield "pg_test", [LEX, "test", "tests/pg_test.cho", "src/pg.cho", "--std"]
+    yield "pool_test", [LEX, "test", "tests/pool_test.cho", "src/pool.cho", "src/pg.cho", "tests/generated/queries.cho", "--std"]
+    yield "scram_test", [LEX, "test", "tests/scram_test.cho", "pooler/scram.cho", "src/pg.cho", "--std"]
     yield "reconnect_test", [sys.executable, "tests/reconnect_test.py", "-f"]
 
 

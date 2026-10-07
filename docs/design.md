@@ -1,15 +1,15 @@
-# lexsys-pg: a PostgreSQL client in lex-sys
+# lexsys-pg: a PostgreSQL client in cancho
 
 > **Status: slices 1-4 built; the non-blocking connection is built ([`nonblocking.md`](nonblocking.md)) and reconnects by itself ([`reconnect.md`](reconnect.md))** -- the v3 wire protocol (startup, trust, cleartext-password and
 > SCRAM-SHA-256 login, simple and extended queries with parameters, describe), checked against
-> a real PostgreSQL 16 and the stock `psql` client, the typed-query generator `tools/pgen.ls` (§8), and prepared statements (§4, §9). Not built: MD5 login, TLS,
+> a real PostgreSQL 16 and the stock `psql` client, the typed-query generator `tools/pgen.cho` (§8), and prepared statements (§4, §9). Not built: MD5 login, TLS,
 > binary result formats, `COPY`. §5 says what comes after, in
 > order, and §6 answers *what sits on top of a driver in a language without reflection*.
 
 ## 1. What it is
 
-A client for PostgreSQL's frontend/backend protocol, written in lex-sys over the `Conn`
-builtins. No C, no foreign call. `lex-sys authority` on a program using it names the network
+A client for PostgreSQL's frontend/backend protocol, written in cancho over the `Conn`
+builtins. No C, no foreign call. `cancho authority` on a program using it names the network
 (`net_out`, narrowable to one `host:port`), `conn_read`, `conn_write` and `heap`, and nothing
 else -- which is the point of writing it in the language rather than linking `libpq`: a service
 that talks to a database says so in its own signature, and cannot talk to anything else.
@@ -32,11 +32,11 @@ It is a *driver*. It does not know what a table is.
    `describing`.
 
 Layers 1 and 2 are pure: they are tested with no server, from canned bytes laid out per the
-protocol documentation and the RFC vectors (`tests/pg_test.ls`, 20 tests). Layer 3 is the only place that waits.
+protocol documentation and the RFC vectors (`tests/pg_test.cho`, 20 tests). Layer 3 is the only place that waits.
 
 ## 3. How it was checked
 
-* **Against the reference client.** `tests/e2e.py` runs 29 queries through both `examples/psql.ls`
+* **Against the reference client.** `tests/e2e.py` runs 29 queries through both `examples/psql.cho`
   and the stock `psql -At -F '|'` and requires identical rows: integers of every width,
   `numeric`, `float8` including `NaN` and `Infinity`, booleans, `NULL` and the empty string,
   tabs and newlines in text, dates, timestamps, intervals, `bytea`, `uuid`, arrays, `json`,
@@ -61,7 +61,7 @@ protocol documentation and the RFC vectors (`tests/pg_test.ls`, 20 tests). Layer
   PBKDF2 iterations, it must be refused without being answered. A hostile server would otherwise choose
   how long the client computes. The client's nonce is read off the wire through a tap on two logins and
   must differ and be at least 24 characters.
-* **Describe.** Parameter and column oids printed by `examples/describe.ls` are compared with
+* **Describe.** Parameter and column oids printed by `examples/describe.cho` are compared with
   `pg_type` on the same server.
 * **Mutation checks, SCRAM.** Seven deliberate bugs -- the server-signature check replaced by `true`, the
   nonce-extension check removed, PBKDF2 one iteration short, a long HMAC key not hashed first, the
@@ -82,14 +82,14 @@ protocol documentation and the RFC vectors (`tests/pg_test.ls`, 20 tests). Layer
   deprecated in PostgreSQL 18, needs an MD5 `std` does not have, and a database that still uses
   it can use SCRAM. `SCRAM-SHA-256-PLUS` needs TLS. SASLprep (RFC 4013) of the password is not
   applied; see the README for what that excludes.
-* **TLS.** There is none in pure lex-sys. The honest options are a sidecar (`stunnel`,
-  `pgbouncer`) in front of the database, OpenSSL through the existing FFI (`lex-sys`'s
+* **TLS.** There is none in pure cancho. The honest options are a sidecar (`stunnel`,
+  `pgbouncer`) in front of the database, OpenSSL through the existing FFI (`cancho`'s
   `examples/tls_client` shows it works, and puts C back on the authority report), or a TLS 1.3
-  implementation in lex-sys, which is a project of its own. Managed PostgreSQL requires it; a
+  implementation in cancho, which is a project of its own. Managed PostgreSQL requires it; a
   database on the same host or the same private network does not.
 * **A non-blocking connection.** Every helper in layer 3 waits for the server. In an event loop
   that is one thread serving every client (`http.server`), a query inside a handler stops all of
-  them for a round trip. **Measured** (`lexsys-web`, docs/benchmarks.md "On PostgreSQL"): about
+  them for a round trip. **Measured** (`cancho-web`, docs/benchmarks.md "On PostgreSQL"): about
   **90 microseconds** for a one-row lookup to a PostgreSQL on its own core, which caps a service
   that makes one such query per request at about **10,000 a second** -- 81% of what PostgreSQL itself
   answers over the same protocol -- and about **370 microseconds** for a durable `INSERT` (the
@@ -113,10 +113,10 @@ protocol documentation and the RFC vectors (`tests/pg_test.ls`, 20 tests). Layer
 
 1. **Slice 1 (built).** The protocol, tested against a real server.
 2. **SCRAM-SHA-256 (built).** HMAC, PBKDF2 and base64 are here, as public functions beside the
-   rest of `pg` (they belong in `lex-sys`'s `std` if they prove out; see §7), with the RFC 4231,
+   rest of `pg` (they belong in `cancho`'s `std` if they prove out; see §7), with the RFC 4231,
    RFC 4648 and RFC 7677 vectors as unit tests, a real server, and an impostor.
 3. **A typed-query generator (built, §8)**: SQL files in, plain lex functions out. **Migrations and table-driven CRUD** (§6 C) are next.
-4. **A users service on PostgreSQL (built)** in `lexsys-web`, its end-to-end tests and Schemathesis
+4. **A users service on PostgreSQL (built)** in `cancho-web`, its end-to-end tests and Schemathesis
    unchanged, benchmarked against FastAPI with SQLAlchemy and with asyncpg and against `pgbench`: a
    read is 3.5x lean FastAPI and at 81% of what PostgreSQL itself does over this protocol; a write is
    `fsync`-bound at about 2,700 a second. What it found is in §4 and §8.
@@ -126,7 +126,7 @@ protocol documentation and the RFC vectors (`tests/pg_test.ls`, 20 tests). Layer
    measurements say the case is not throughput (three copies of the blocking service already reach PostgreSQL's
    ceiling on reads) but shared state, slow queries and group commit for writes; the document states, before it
    is built, what the benchmark must show for it to be worth keeping.
-6. **A connection pooler** (PgBouncer's job, in lex-sys): designed in [`pooler.md`](pooler.md), not built, with its slices, its gate against PgBouncer 1.22 and the conditions under which it is stopped written down first.
+6. **A connection pooler** (PgBouncer's job, in cancho): designed in [`pooler.md`](pooler.md), not built, with its slices, its gate against PgBouncer 1.22 and the conditions under which it is stopped written down first.
 7. **TLS**, once the sidecar-or-FFI-or-implement question has an asker.
 
 ## 6. If we cannot have SQLAlchemy, what is the best thing to have?
@@ -166,10 +166,10 @@ the simple protocol.
 point, and generated functions have exact signatures: a handler that calls `user_by_id` says in
 its own row that it touches `conn_read`/`conn_write`, and a code reviewer reads the SQL it runs in
 a file rather than inferring it from a builder expression. The generated code is content-addressed
-like all lex-sys code, so "what queries does this service run" is a question with a stable answer.
-And it connects to what exists: the generator can also emit `lexsys-schema` nodes for a result
+like all cancho code, so "what queries does this service run" is a question with a stable answer.
+And it connects to what exists: the generator can also emit `cancho-schema` nodes for a result
 row or an `INSERT`'s parameters, so the same declaration that validates a request body (`NewUser`)
-types the query that stores it, and the OpenAPI document `lexsys-web` writes comes from the
+types the query that stores it, and the OpenAPI document `cancho-web` writes comes from the
 same nodes. That recovers the "one declaration" property an ORM sells, from the direction this
 language can support.
 
@@ -179,14 +179,14 @@ every expression, with an annotation to override. (2) Dynamic queries -- a searc
 five optional filters -- are not statements known in advance; that is where a small builder (A) is
 the right tool, restricted to assembling a `WHERE` from a fixed set of parameterised predicates,
 never from identifiers or values. (3) The generator is another tool to run; it can be written in
-lex-sys on this driver (it needs a file read and a connection), so it adds no second language.
+cancho on this driver (it needs a file read and a connection), so it adds no second language.
 (4) There are no relationships, no identity map, no unit of work, no lazy loading. That is the
 real loss compared with SQLAlchemy and it is deliberate: those features are what make an ORM's
 performance unpredictable and its SQL invisible, and a service that wants to know exactly what
 it runs is not asking for them.
 
 *C, the boilerplate.* `get`, `insert`, `update`, `delete` by primary key are the same four
-statements for every table. A table is data (a name, columns with `lexsys-schema` nodes, a key),
+statements for every table. A table is data (a name, columns with `cancho-schema` nodes, a key),
 and the four statements are generated from it at start-up or by the same generator -- the 80% of
 a CRUD API that was identical, without pretending the other 20% is.
 
@@ -199,7 +199,7 @@ builder (A) until an endpoint needs it.
 1. **Where the helpers' blocking boundary is drawn** once the non-blocking connection exists:
    whether `pg.simple` and `pg.extended` stay as the blocking convenience over the same state
    machine, or become the state machine's driver for tests only.
-2. **`std` or here** for HMAC, PBKDF2 and base64: `lex-sys` has `sha256`; these three are generally
+2. **`std` or here** for HMAC, PBKDF2 and base64: `cancho` has `sha256`; these three are generally
    useful and probably belong beside it. They would be built here first, where they have a
    test (SCRAM) and an asker.
 3. **The package's name.** `pg` is short and accurate; the generator and CRUD layer will be a
@@ -207,7 +207,7 @@ builder (A) until an endpoint needs it.
 
 ## 8. The generator, as built
 
-`tools/pgen.ls` is §6's option B: `pgen <conn> queries.sql > queries.ls`. It is a lex-sys program on this
+`tools/pgen.cho` is §6's option B: `pgen <conn> queries.sql > queries.cho`. It is a cancho program on this
 driver (a file read, a connection, `describe`), so there is no second language.
 
 **What a query becomes.** A `-- name: user_by_id id` line, then one statement. The server describes the
@@ -218,7 +218,7 @@ that reply. The reply is the server's whole answer in one buffer, rows are visit
 
 **Decisions, and what they cost.**
 
-* **No result type per query.** sqlc has `:one`, `:many` and `:exec`, and a row struct per query. lex-sys has no
+* **No result type per query.** sqlc has `:one`, `:many` and `:exec`, and a row struct per query. cancho has no
   generics and a struct per query is a second kind of generated code; a reply with accessors does the same job
   for all three shapes, and `pg.first_row` is `:one`. It costs a few lines at each call site.
 * **Only `bool` and the integers are mapped.** Every other type is text in and text out. That is the honest
@@ -233,14 +233,14 @@ that reply. The reply is the server's whole answer in one buffer, rows are visit
   `joined` (the test now has that column).
 * **NULL parameters are marked, and cost a flag.** `age?` in the annotation adds an `age_given: bool` after the
   parameter, and the generated function sends `param_null` when it is false. A `$n` that is not marked cannot be
-  NULL, so a caller cannot forget; the flag rather than an `Option` because lex-sys has no generics. The
-  first service on the generator (`lexsys-web`'s users on PostgreSQL) asked for it: four of the five columns of
+  NULL, so a caller cannot forget; the flag rather than an `Option` because cancho has no generics. The
+  first service on the generator (`cancho-web`'s users on PostgreSQL) asked for it: four of the five columns of
   an `INSERT` are optional.
 * **Refuse, write nothing.** Output is accumulated and written only if every query passed, so a half-generated
   module never exists, and a refusal names the query and the reason (the server's SQLSTATE for SQL it rejects).
   Names are checked for collisions across *all* generated functions: a column `a` of query `q` and a query
   `q_a` would both be `q_a`.
-* **The module is checked in.** `tests/generated/queries.ls` is what the generator wrote, and a test fails if the
+* **The module is checked in.** `tests/generated/queries.cho` is what the generator wrote, and a test fails if the
   generator would write anything else, which makes "the SQL changed, the generated code did not" a red build.
   A consumer does the same with its own queries.
 
@@ -252,14 +252,14 @@ parameter description ran before the check for an `ErrorResponse`; the order is 
 test asserts the SQLSTATE. (4) A mutation run caught a unit test that looped forever rather than failing (a row
 visited twice); that is a pass for the mutation and a reminder that the runner has no timeout.
 
-**What the first consumer found.** `lexsys-web`'s users service on PostgreSQL asked for optional parameters
+**What the first consumer found.** `cancho-web`'s users service on PostgreSQL asked for optional parameters
 (four of five columns of its `INSERT` are optional; added, above) and, through Schemathesis, found that
 PostgreSQL `text` cannot hold U+0000 although a JSON string, and so the OpenAPI document, allows it. The fix is
 not in the database layer: a constraint the store imposes belongs in the schema the document is generated from
-(`lexsys-schema` design.md §13), so the generated queries stay free of validation.
+(`cancho-schema` design.md §13), so the generated queries stay free of validation.
 
-**Not built.** Table-driven CRUD from `lexsys-schema` nodes (§6 C), migrations, dynamic filters (§6 A), array parameters, prepared statements (every call parses again; a `Parse` once and `Bind` many is the first thing a
-benchmark will ask for), and generating `lexsys-schema` nodes from result rows.
+**Not built.** Table-driven CRUD from `cancho-schema` nodes (§6 C), migrations, dynamic filters (§6 A), array parameters, prepared statements (every call parses again; a `Parse` once and `Bind` many is the first thing a
+benchmark will ask for), and generating `cancho-schema` nodes from result rows.
 
 ## 9. Prepared statements, as built
 

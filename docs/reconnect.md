@@ -1,6 +1,6 @@
 # A pool that comes back
 
-> **Status: built (`src/pool.ls`, package `pg.pool`), tested against PostgreSQL 16 and against mock servers, and measured.**
+> **Status: built (`src/pool.cho`, package `pg.pool`), tested against PostgreSQL 16 and against mock servers, and measured.**
 > It is the `revive` that [`nonblocking.md`](nonblocking.md) section 4.2 promised and section 9.3 listed as missing, with one
 > difference that the measurements below justify: the attempt is not "a blocking connect and login, bounded". Nothing in it waits.
 
@@ -71,9 +71,9 @@ answers every request on it that had no reply with a status (`last_loss`). In bo
 
 ### 2.3 What `reconnect` is given, and why
 
-* **`seed`**: 16 or more unpredictable bytes, read once by the caller from `/dev/urandom` (as `examples/psql.ls` does for its nonce). The
+* **`seed`**: 16 or more unpredictable bytes, read once by the caller from `/dev/urandom` (as `examples/psql.cho` does for its nonce). The
   nonce of each SCRAM login is 18 bytes of HMAC-SHA-256 under the seed of a counter and the lane, in base64. The pool has no file capability and gets none: that
-  keeps `lex-sys authority` of a program as it was. An empty seed refuses SCRAM servers (status 7, as `pg.login` with no nonce) and works with trust and cleartext.
+  keeps `cancho authority` of a program as it was. An empty seed refuses SCRAM servers (status 7, as `pg.login` with no nonce) and works with trust and cleartext.
 * **`password`** and the rest of the login are copied into the pool, which is where the pool keeps the secret it needs on every reconnect; `close` frees them.
 * **`request_ms`** is the only defence against a connection that stops without a close (a cable cut, a firewall that drops state): TCP would
   find out in minutes to hours, and the pool has no socket option to change that. 0 means no timeout; otherwise it must exceed the slowest query,
@@ -82,11 +82,11 @@ answers every request on it that had no reply with a status (`last_loss`). In bo
 
 ### 2.4 Why the pool does not dial
 
-`lex-sys authority` of a program that uses `pg` says `net_out("host:port")` because the program narrowed its `Net` to one address and `pg` takes a
+`cancho authority` of a program that uses `pg` says `net_out("host:port")` because the program narrowed its `Net` to one address and `pg` takes a
 `Conn`, never a `Net`. A library function that dials must take `Net("")` (the language has no way to be generic over the bound), and a program
 that passes a narrowed `Net` to it is a type error. So the pool never holds or takes a `Net`: the loop dials, with its own, narrowed capability,
 and hands the connection over (`adopt`). `revive` is that loop for a program that has the whole network anyway, and it is the only function
-of the pool whose row names `net_out("")`; a program that does not call it does not get it (`tests/narrow_use.ls`, checked by
+of the pool whose row names `net_out("")`; a program that does not call it does not get it (`tests/narrow_use.cho`, checked by
 `reconnect_test.py`, reports `net_out("127.0.0.1:5432")` and nothing wider). Nothing was added to what the pool performs: `heap`, `conn_read`, `conn_write`,
 `poll`, and the `net_out` of the program's own dial.
 
@@ -96,7 +96,7 @@ of the pool whose row names `net_out("")`; a program that does not call it does 
   reconnect to a host *name* can stall its loop for as long as the resolver takes; give the pool an address. Nothing in the pool can fix that.
 * **No generic over `Net(b)`**: a library that dials cannot be used by a program with a narrowed network (known: `agent-toolbox.md` L5). Section 2.4 is the workaround.
 * **Standard output is fully buffered when it is a pipe** (`io.write_all` is `putchar`), so a driver whose output a test reads as it comes must write to standard
-  error; `tests/reconnect_drive.ls` does. Minimal reproducer: `io.write_all(io, "x\n")` then a sleep, with stdout a pipe: the line arrives when the program exits.
+  error; `tests/reconnect_drive.cho` does. Minimal reproducer: `io.write_all(io, "x\n")` then a sleep, with stdout a pipe: the line arrives when the program exits.
 * **A failed `test.assert` is reported as "trapped: killed by signal 4"** with no location, the same as a real trap; the first hour of a bug in a test was spent on a
   size that was 100, not more than 100.
 
@@ -134,7 +134,7 @@ if pool.live(pl) == 0 { /readyz: 503 }                                   // with
 ```
 
 `revive` takes the pool by value (a `conns.Table` that grows is consumed by `put`, as in `http.server`'s `wait`), so it is called between the
-borrows of the turn. `tests/reconnect_drive.ls` is a whole loop.
+borrows of the turn. `tests/reconnect_drive.cho` is a whole loop.
 
 ## 5. Decisions
 
@@ -156,15 +156,15 @@ borrows of the turn. `tests/reconnect_drive.ls` is a whole loop.
 
 Everything below ran on one machine (4 cores, a Firecracker VM, other work running on it: a load average of 3 to 4.5 during these runs, so the
 worst turns are not the pool's alone), against PostgreSQL 16 (a private cluster, trust, cleartext and SCRAM roles as `tests/postgres.sh` makes them), compiler `a87f666`.
-`tests/reconnect_measure.py` prints the tables; `tests/pbkdf2_cost.ls` the cost of a piece.
+`tests/reconnect_measure.py` prints the tables; `tests/pbkdf2_cost.cho` the cost of a piece.
 
 ### 6.1 The tests
 
 | | |
 |---|---|
-| `tests/pg_test.ls` (23, no server) | PBKDF2 in pieces equals PBKDF2 for every cut; SCRAM by its parts equals RFC 7677; the challenge checks answer what the whole answers |
-| `tests/pool_test.ls` (8, no server) | which statuses are `lost`; the arguments `reconnect` refuses; nothing due before `start`; the waits 100, 200, 400, 800, 800; two lanes wait separately; `pgen`'s script is a Parse and a Sync each |
-| `tests/reconnect_test.py` (34) | the pool against PostgreSQL behind `tests/tcpproxy.py` (killed idle, killed with requests in flight, cut and restored, reset, black-holed, silent, frozen; one of three killed; four of four; flapping; a wrong password; SCRAM and cleartext; an unknown database) and against mock servers (the login in pieces of one byte, a server that is starting up, garbage, a hang-up, MD5, a message out of turn, a refused statement, SCRAM with an impostor of three kinds, a wrong password, a million iterations, 50 million, `SCRAM-SHA-256-PLUS` only, no seed, cleartext, a nonce for every login); `lex-sys authority` of a narrowed program; the blocking baseline |
+| `tests/pg_test.cho` (23, no server) | PBKDF2 in pieces equals PBKDF2 for every cut; SCRAM by its parts equals RFC 7677; the challenge checks answer what the whole answers |
+| `tests/pool_test.cho` (8, no server) | which statuses are `lost`; the arguments `reconnect` refuses; nothing due before `start`; the waits 100, 200, 400, 800, 800; two lanes wait separately; `pgen`'s script is a Parse and a Sync each |
+| `tests/reconnect_test.py` (34) | the pool against PostgreSQL behind `tests/tcpproxy.py` (killed idle, killed with requests in flight, cut and restored, reset, black-holed, silent, frozen; one of three killed; four of four; flapping; a wrong password; SCRAM and cleartext; an unknown database) and against mock servers (the login in pieces of one byte, a server that is starting up, garbage, a hang-up, MD5, a message out of turn, a refused statement, SCRAM with an impostor of three kinds, a wrong password, a million iterations, 50 million, `SCRAM-SHA-256-PLUS` only, no seed, cleartext, a nonce for every login); `cancho authority` of a narrowed program; the blocking baseline |
 | `tests/e2e.py` (46) and the pooler suites | unchanged, and green |
 
 ### 6.2 Does the loop wait? (the gate: no caller blocks longer than a stated bound)
@@ -180,14 +180,14 @@ worst turns are not the pool's alone), against PostgreSQL 16 (a private cluster,
 | a database that drops every packet, 4 s and 8 s (pool of 2) | 1 ms | 2 and 1 turns of 1 ms | 613, 1029 |
 | a SCRAM challenge of 1,000,000 iterations (mock, 3 s) | 4-8 ms at load 3.5 (the test bound is 50) | | 8,400-9,500 |
 
-The piece of key derivation that a turn does costs 265-342 us (128 iterations; `tests/pbkdf2_cost.ls`, at a load of 3), and the 4096 iterations
+The piece of key derivation that a turn does costs 265-342 us (128 iterations; `tests/pbkdf2_cost.cho`, at a load of 3), and the 4096 iterations
 in one go 8.1-9.7 ms. So the bound a turn is held to is about one piece per login that is deriving a key (a pool of 4 logging in together: about
 1.3 ms) plus the ordinary work of a turn; and the largest turn seen, 12 ms, is one in 2247 at a load average of 4.5, i.e. the scheduler (the same
 scenario at a load of 2.7: 2 ms). The test asserts a gross bound of 50 ms and, as the structural check that the derivation is in pieces,
 that a SCRAM login of 4096 iterations takes at least 30 turns of the loop and at most 150 ms. A mutant that derives the key in one turn
 fails both the million-iteration test and the structural one.
 
-**The same job done the blocking way** (`tests/stall_baseline.ls`: tick every 10 ms, then at 0.5 s `tcp_connect` and `pg.login`): against a server that accepts and
+**The same job done the blocking way** (`tests/stall_baseline.cho`: tick every 10 ms, then at 0.5 s `tcp_connect` and `pg.login`): against a server that accepts and
 does not answer, or a listener that drops the packets, the last tick is at 500 ms and none follows for the 7.5 s the test then waited before killing it: the loop is gone as
 long as the server is. The pool, in those two scenarios, has a longest turn of 1 ms.
 
@@ -229,9 +229,9 @@ A wrong password (SCRAM role, waits 100 to 800 ms): attempts at 0, 100, 300, 700
 | no caller blocks | 6.2 |
 | n > 1 independent | `test_each_connection_of_a_pool_is_remade_on_its_own` (one of three ended: live 3, 2, 3; the other two answered with no gap over 0.2 s; one loss, one reconnect), `..._all_the_connections_killed_at_once...` (four remade), `pool_test`'s two lanes with separate waits |
 | existing tests unchanged | `tests/e2e.py` 46 of 46 (the pool tests among them), through the pooler proxy as well, the pooler suites, `pg_test` 20 of 20 plus 3 new; none was edited |
-| fmt and CI | `lex-sys fmt --check` clean; every step of `ci.yml` run locally against a private PostgreSQL 16 (the stores included) |
-| mutants | 30 single-edit mutants of `pool.ls` and `pg.ls`, section 6.5, all killed |
-| `lexsys-hooks` | its sources, as checked out, build against this `pg.ls` and `pool.ls` unchanged |
+| fmt and CI | `cancho fmt --check` clean; every step of `ci.yml` run locally against a private PostgreSQL 16 (the stores included) |
+| mutants | 30 single-edit mutants of `pool.cho` and `pg.cho`, section 6.5, all killed |
+| `lexsys-hooks` | its sources, as checked out, build against this `pg.cho` and `pool.cho` unchanged |
 
 ### 6.5 The mutants (`tests/mutants.py`; each is applied to the file, which is restored from a saved copy and compared with `cmp`)
 

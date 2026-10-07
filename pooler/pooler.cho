@@ -1,0 +1,1550 @@
+edition 5;
+
+import std.buffer;
+import std.bytes;
+import std.conns;
+import std.crypto;
+import std.io;
+import frame;
+import pg;
+import scram;
+
+// `pooler` -- slice P1 of the connection pooler (`docs/pooler.md`): transaction pooling.
+//
+//     pooler <listen port> <server host> <server port> <user> <database> <password | -> <pool size> [<client password | -> [<login ms> [<idle in transaction ms> [<queue wait ms>]]]]
+//
+// Timeouts, in milliseconds, 0 for none: a client that has not finished its startup and login in `login` ms (default 60,000), one that holds a server connection
+// in a transaction and says nothing for `idle in transaction` ms (default none), one that waits for a server connection for `queue wait` ms (default 120,000) is told so and
+// cut off. `CancelRequest` is mapped: a client's `BackendKeyData` is the pooler's own, and a cancel that quotes it is sent to whichever server connection the client holds then.
+//
+// The password is the one the pooler logs in to the server with. A client password makes the pooler ask its clients for it (SCRAM-SHA-256, as PostgreSQL does: the
+// pooler holds the salted keys, never the password, and the exchange is the one `libpq` speaks); without it, or with `-`, clients are trusted, which is for a
+// network nobody else is on.
+//
+// A pool of `pool size` connections to the server is logged in when it starts (`pg.login`: trust, cleartext or SCRAM, whatever the server
+// asks), and a client is lent one for the length of one transaction. A client that connects is answered by the pooler itself (the
+// authentication is "ok", the parameters are the ones the first server connection reported), holds no server connection while it is
+// idle, is given one when it sends its first message of a request, and gives it back when the server answers `ReadyForQuery` with
+// status idle and the pooler is not waiting for another. Clients that find none free wait, in order, with what they have sent
+// held back. Messages are not copied or rewritten: what the client sent goes to the server and what the server sent goes to the client,
+// and `pooler/frame.cho` is how the pooler knows where one ends and what the server answered with.
+//
+// What it refuses, in the protocol's own words: a prepared statement with a name (it would outlive the transaction on a connection the
+// client will not get back), a client whose user or database is not the pool's. What it does not do yet: authenticate clients (P2: it
+// is for a trusted network unless a client password is given), map `CancelRequest`, time anything out (P3), open its connections without blocking (a connection that is
+// replaced is logged in while the loop waits).
+//
+// One thread, one poller. Sizes are fixed at start.
+
+// Clients at once, at most.
+fn max_clients() -> [] int {
+    return 200;
+}
+
+// Server connections, at most.
+fn max_pool() -> [] int {
+    return 64;
+}
+
+// Slots in the table: clients, the pool, and the few that are being replaced.
+fn max_slots() -> [] int {
+    return 200 + 2 * 64;
+}
+
+// What is read from a connection at a time, what a client's input buffer holds, and what may wait to be sent to one connection.
+fn chunk() -> [] int {
+    return 32768;
+}
+
+fn input_size() -> [] int {
+    return 32768;
+}
+
+fn queue_size() -> [] int {
+    return 131072;
+}
+
+// Per connection `k`, `state[24k..24k+24]` is:
+//
+//      0  1 if the slot is in use
+//      1  1 for a client, 2 for a server
+//      2  the slot it is paired with (a client's server, a server's client), or -1
+//      3  a client's bytes buffered
+//      4  bytes waiting to be sent to it
+//      5  what it is watched for (1 read, 2 write, 3 both, 0 neither)
+//      6  1 if it closes once what is queued for it has gone
+//      7  a client: 0 before its startup message has been answered, 2 and 3 in the two steps of SCRAM, 1 after. A server: 1 if it is idle
+//      8  a client: how much of the message being passed on is still to come
+//      9  a client: 1 while its messages are dropped up to a Sync
+//     10  a client: the ReadyForQuerys the server still owes it
+//     11  a client: 1 if it is in the queue for a server
+//     12  a client: its number
+//     13  a server: the scan of what it sends (`frame.scan_size()` ints). A client in SCRAM: the length of its first message, and of the pooler's answer
+//     14  (see 13)
+//     15  a client: when it is cut off if nothing happens (ms; 0: never)   16  what that is for (1 login, 2 idle in a transaction, 3 waiting for a server)   17  its cancel secret
+//     19, 20  a server: its own process id and secret, for a cancel
+fn stride() -> [] int {
+    return 24;
+}
+
+// `meta`:
+//
+//     0  servers idle      1  the queue's head   2  clients queued   3  bytes of parameters to replay   4  the next client number
+//     5  servers in the pool   6  the size asked for   7  the server's port   8  user's length   9  password's   10  database's   11  host's
+//     12  the client password's length (0: clients are trusted)   13  random bytes held   14  how many of them are used
+//     15  the time now (ms)   16  login timeout   17  idle-in-transaction timeout   18  queue-wait timeout   19  cancels waiting to be sent
+fn meta_size() -> [] int {
+    return 24;
+}
+
+// `config`: the user at 0, the password at 128, the database at 384, the host at 512, the client password at 640.
+fn config_size() -> [] int {
+    return 768;
+}
+
+res struct Core {
+    poller: Poller,
+    events: Box[[int]],
+    state: Box[[int]],
+    meta: Box[[int]],
+    // Servers idle (a stack of slots) and clients waiting (a ring of slots).
+    idle: Box[[int]],
+    queue: Box[[int]],
+    inbuf: Box[[byte]],
+    rbuf: Box[[byte]],
+    pends: Box[[byte]],
+    // The ParameterStatus messages every client is told, and a scratch for the messages the pooler writes itself.
+    hello: Box[[byte]],
+    scratch: Box[[byte]],
+    config: Box[[byte]],
+    // The client password's salt (16 bytes) and its StoredKey (32) and ServerKey (32); random bytes from the kernel for the nonces of logins; and per client the
+    // part of the SCRAM exchange that has to be remembered (the client's first message and the pooler's answer).
+    keys: Box[[byte]],
+    rand: Box[[byte]],
+    authbuf: Box[[byte]],
+    // Cancels to send to the server: (its process id, its secret) pairs.
+    cancels: Box[[int]],
+}
+
+// ---------------------------------------------------------------------
+// Bytes to a connection
+// ---------------------------------------------------------------------
+
+// Hand `data` to the kernel without waiting for room, and keep what it did not take. Answers the new number of bytes queued,
+// or -1 if the queue cannot hold the rest or the connection has failed.
+fn emit[&c, &d, &e](table: &!c conns.Table, slot: int, data: &d [byte], pend: &!e [byte], pending: int) -> [conn_write] int {
+    var at = 0;
+    if pending == 0 {
+        match conns.write(table, slot, data) {
+            Sent::Wrote(n) => {
+                at = n;
+            }
+            Sent::Again => {
+            }
+            Sent::Failed(e) => {
+                return 0 - 1;
+            }
+        }
+    }
+    if at >= len(data) {
+        return pending;
+    }
+    if pending + len(data) - at > len(pend) {
+        return 0 - 1;
+    }
+    var i = at;
+    while i < len(data) {
+        pend[pending + i - at] = data[i];
+        i = i + 1;
+    }
+    return pending + len(data) - at;
+}
+
+// Send `data` to connection `k` (behind what is already queued for it). False if that failed.
+fn send_to[&t, &c, &d](tab: &!t conns.Table, core: &!c Core, k: int, data: &d [byte]) -> [conn_write] bool {
+    let st = contents(core.state);
+    let pd = contents(core.pends);
+    let p = stride() * k;
+    let pending = emit(tab, k, data, pd[k * queue_size()..k * queue_size() + queue_size()], st[p + 4]);
+    if pending < 0 {
+        return false;
+    }
+    st[p + 4] = pending;
+    return true;
+}
+
+fn put_be32[&b](buf: &!b [byte], at: int, n: int) -> [] int {
+    buf[at] = byte_of(n / 16777216 % 256);
+    buf[at + 1] = byte_of(n / 65536 % 256);
+    buf[at + 2] = byte_of(n / 256 % 256);
+    buf[at + 3] = byte_of(n % 256);
+    return at + 4;
+}
+
+fn put_text[&b, &t](buf: &!b [byte], at: int, text: &t [byte]) -> [] int {
+    var i = 0;
+    while i < len(text) {
+        buf[at + i] = text[i];
+        i = i + 1;
+    }
+    buf[at + len(text)] = byte_of(0);
+    return at + len(text) + 1;
+}
+
+// An ErrorResponse into `buf` at `at`: severity, SQLSTATE and message. Answers where it ends.
+fn put_error[&b, &s, &c, &m](buf: &!b [byte], at: int, severity: &s [byte], code: &c [byte], message: &m [byte]) -> [] int {
+    buf[at] = byte_of('E');
+    var o = at + 5;
+    buf[o] = byte_of('S');
+    o = put_text(buf, o + 1, severity);
+    buf[o] = byte_of('V');
+    o = put_text(buf, o + 1, severity);
+    buf[o] = byte_of('C');
+    o = put_text(buf, o + 1, code);
+    buf[o] = byte_of('M');
+    o = put_text(buf, o + 1, message);
+    buf[o] = byte_of(0);
+    o = o + 1;
+    put_be32(buf, at + 1, o - at - 1);
+    return o;
+}
+
+// ReadyForQuery with `status` into `buf` at `at`.
+fn put_ready[&b](buf: &!b [byte], at: int, status: int) -> [] int {
+    buf[at] = byte_of('Z');
+    put_be32(buf, at + 1, 5);
+    buf[at + 5] = byte_of(status);
+    return at + 6;
+}
+
+// ---------------------------------------------------------------------
+// Closing, watching, queueing
+// ---------------------------------------------------------------------
+
+fn shut[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [] int {
+    let st = contents(core.state);
+    conns.close(tab, k);
+    st[stride() * k] = 0;
+    return 0;
+}
+
+// Take server `s` out of the pool (it is closed; the loop logs another in).
+fn drop_server[&t, &c](tab: &!t conns.Table, core: &!c Core, s: int) -> [] int {
+    let st = contents(core.state);
+    let mt = contents(core.meta);
+    if st[stride() * s] == 1 {
+        // If it was idle it is on the stack.
+        if st[stride() * s + 7] == 1 {
+            var i = 0;
+            let id = contents(core.idle);
+            while i < mt[0] {
+                if id[i] == s {
+                    id[i] = id[mt[0] - 1];
+                    mt[0] = mt[0] - 1;
+                } else {
+                    i = i + 1;
+                }
+            }
+        }
+        shut(tab, core, s);
+        mt[5] = mt[5] - 1;
+    }
+    return 0;
+}
+
+// Watch `k` for what it now waits on.
+fn settle[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [poll] int {
+    let st = contents(core.state);
+    let p = stride() * k;
+    if k < 0 || st[p] == 0 {
+        return 0;
+    }
+    var want = 0;
+    if st[p + 1] == 1 {
+        // A client is read while it has room for more and is not on its way out.
+        if st[p + 6] == 0 && st[p + 3] < input_size() {
+            want = 1;
+        }
+    } else if st[p + 7] == 1 {
+        // An idle server is read to notice it has gone.
+        want = 1;
+    } else if st[p + 2] >= 0 && st[stride() * st[p + 2] + 4] + chunk() <= queue_size() {
+        // A busy one while its client's queue has room for what it would say.
+        want = 1;
+    }
+    if st[p + 4] > 0 {
+        want = want + 2;
+    }
+    if want != st[p + 5] {
+        conns.rewatch(tab, core.poller, k, k + 1, want);
+        st[p + 5] = want;
+    }
+    return 0;
+}
+
+fn queue_push[&c](core: &!c Core, k: int) -> [] int {
+    let mt = contents(core.meta);
+    let q = contents(core.queue);
+    let st = contents(core.state);
+    if mt[2] < len(q) {
+        q[(mt[1] + mt[2]) % len(q)] = k;
+        mt[2] = mt[2] + 1;
+        st[stride() * k + 11] = 1;
+        if mt[18] > 0 {
+            st[stride() * k + 15] = mt[15] + mt[18];
+            st[stride() * k + 16] = 3;
+        }
+    }
+    return 0;
+}
+
+// The next client still waiting, or -1.
+fn queue_pop[&c](core: &!c Core) -> [] int {
+    let mt = contents(core.meta);
+    let q = contents(core.queue);
+    let st = contents(core.state);
+    while mt[2] > 0 {
+        let k = q[mt[1]];
+        mt[1] = (mt[1] + 1) % len(q);
+        mt[2] = mt[2] - 1;
+        if st[stride() * k] == 1 && st[stride() * k + 11] == 1 {
+            st[stride() * k + 11] = 0;
+            return k;
+        }
+    }
+    return 0 - 1;
+}
+
+// Pair client `c` with idle server `s`.
+fn assign[&t, &x](tab: &!t conns.Table, core: &!x Core, c: int, s: int) -> [poll] int {
+    let st = contents(core.state);
+    st[stride() * c + 2] = s;
+    st[stride() * c + 15] = 0;
+    st[stride() * s + 2] = c;
+    st[stride() * s + 7] = 0;
+    var i = 0;
+    while i < frame.scan_size() {
+        st[stride() * s + 13 + i] = 0;
+        i = i + 1;
+    }
+    settle(tab, core, s);
+    settle(tab, core, c);
+    return 0;
+}
+
+// Take an idle server off the stack, or -1.
+fn take_idle[&c](core: &!c Core) -> [] int {
+    let mt = contents(core.meta);
+    if mt[0] == 0 {
+        return 0 - 1;
+    }
+    mt[0] = mt[0] - 1;
+    return contents(core.idle)[mt[0]];
+}
+
+// ---------------------------------------------------------------------
+// A client's messages
+// ---------------------------------------------------------------------
+
+// The big-endian int32 at `at`.
+fn be32[&b](m: &b [byte], at: int) -> [] int {
+    return int_of(m[at]) * 16777216 + int_of(m[at + 1]) * 65536 + int_of(m[at + 2]) * 256 + int_of(m[at + 3]);
+}
+
+// Whether the C string at `at` in `m` is `want`; answers where it ends (after its 0), or -1 if it is not terminated.
+fn cstr_end[&b](m: &b [byte], at: int) -> [] int {
+    var i = at;
+    while i < len(m) {
+        if int_of(m[i]) == 0 {
+            return i + 1;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn same_text[&a, &b](x: &a [byte], y: &b [byte]) -> [] bool {
+    if len(x) != len(y) {
+        return false;
+    }
+    var i = 0;
+    while i < len(x) {
+        if x[i] != y[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Check a startup message's parameters (`m` is the message after its code): the user, and the database (the user's name if there is none) must be
+// the pool's. 0 if they are, 1 if not the user, 2 if not the database, 3 if the message is malformed.
+fn check_startup[&b, &c](m: &b [byte], config: &c [byte], user_len: int, db_len: int) -> [] int {
+    var user = 0 - 1;
+    var user_to = 0;
+    var db = 0 - 1;
+    var db_to = 0;
+    var at = 0;
+    while at < len(m) && int_of(m[at]) != 0 {
+        let k_end = cstr_end(m, at);
+        if k_end < 0 {
+            return 3;
+        }
+        let v_end = cstr_end(m, k_end);
+        if v_end < 0 {
+            return 3;
+        }
+        let key = m[at..k_end - 1];
+        if same_text(key, "user") {
+            user = k_end;
+            user_to = v_end - 1;
+        }
+        if same_text(key, "database") {
+            db = k_end;
+            db_to = v_end - 1;
+        }
+        at = v_end;
+    }
+    if user < 0 {
+        return 3;
+    }
+    if !same_text(m[user..user_to], config[0..user_len]) {
+        return 1;
+    }
+    if db >= 0 {
+        if !same_text(m[db..db_to], config[384..384 + db_len]) {
+            return 2;
+        }
+    } else if !same_text(config[0..user_len], config[384..384 + db_len]) {
+        return 2;
+    }
+    return 0;
+}
+
+// Put the client on its way out: it is closed once what is queued for it has gone, with its server (if it holds one) dropped from the pool, because
+// what state the client left it in is not known.
+fn finish_client[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [poll] int {
+    let st = contents(core.state);
+    let p = stride() * k;
+    if st[p] == 0 {
+        return 0;
+    }
+    let s = st[p + 2];
+    if s >= 0 {
+        st[p + 2] = 0 - 1;
+        st[stride() * s + 2] = 0 - 1;
+        drop_server(tab, core, s);
+    }
+    st[p + 11] = 0;
+    if st[p + 4] > 0 && st[p + 6] == 0 {
+        st[p + 6] = 1;
+        settle(tab, core, k);
+    } else {
+        shut(tab, core, k);
+    }
+    return 0;
+}
+
+// Hand server `s`, which has finished a transaction (or is new), to the next client waiting, or to the stack.
+fn give_back[&t, &c](tab: &!t conns.Table, core: &!c Core, s: int) -> [conn_write, poll] int {
+    let st = contents(core.state);
+    let mt = contents(core.meta);
+    let k = st[stride() * s + 2];
+    if k >= 0 {
+        st[stride() * k + 2] = 0 - 1;
+    }
+    st[stride() * s + 2] = 0 - 1;
+    st[stride() * s + 7] = 1;
+    contents(core.idle)[mt[0]] = s;
+    mt[0] = mt[0] + 1;
+    settle(tab, core, s);
+    // The clients that were waiting, in the order they came.
+    var more = true;
+    while more && mt[0] > 0 {
+        let q = queue_pop(core);
+        if q < 0 {
+            more = false;
+        } else {
+            let server = take_idle(core);
+            assign(tab, core, q, server);
+            process(tab, core, q);
+        }
+    }
+    return 0;
+}
+
+// Tell client `k` it is in: AuthenticationOk, the parameters, a BackendKeyData of its own, ReadyForQuery idle. `lead` is bytes already written to `sc`.
+fn send_hello[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int, lead: int) -> [conn_write] int {
+    let st = contents(core.state);
+    let mt = contents(core.meta);
+    let sc = contents(core.scratch);
+    let hl = contents(core.hello);
+    let p = stride() * k;
+    var o = lead;
+    sc[o] = byte_of('R');
+    put_be32(sc, o + 1, 8);
+    put_be32(sc, o + 5, 0);
+    o = o + 9;
+    var i = 0;
+    while i < mt[3] {
+        sc[o + i] = hl[i];
+        i = i + 1;
+    }
+    o = o + mt[3];
+    sc[o] = byte_of('K');
+    put_be32(sc, o + 1, 12);
+    put_be32(sc, o + 5, st[p + 12]);
+    put_be32(sc, o + 9, st[p + 17]);
+    o = o + 13;
+    o = put_ready(sc, o, 73);
+    send_to(tab, core, k, sc[0..o]);
+    st[p + 7] = 1;
+    st[p + 15] = 0;
+    return 0;
+}
+
+// What a client that fails to authenticate is told, and then it is on its way out.
+fn auth_failed[&t, &c, &d, &m](tab: &!t conns.Table, core: &!c Core, k: int, code: &d [byte], message: &m [byte]) -> [conn_write, poll] int {
+    let sc = contents(core.scratch);
+    let o = put_error(sc, 0, "FATAL", code, message);
+    send_to(tab, core, k, sc[0..o]);
+    finish_client(tab, core, k);
+    return 0;
+}
+
+// The size of the part of a client's SCRAM exchange that is remembered (its first message and the answer to it).
+fn auth_size() -> [] int {
+    return 512;
+}
+
+// One message of the client's SCRAM-SHA-256 exchange (`view` starts at it): the first (phase 2) is answered with the pooler's challenge, the second (phase 3) is
+// checked and answered with the server signature and the start of the session. Answers how many bytes it took, 0 if the message has not all arrived, -1 if the client
+// was refused (it is on its way out).
+fn auth_step[&t, &c, &v](tab: &!t conns.Table, core: &!c Core, k: int, view: &v [byte]) -> [conn_write, poll] int {
+    let st = contents(core.state);
+    let mt = contents(core.meta);
+    let sc = contents(core.scratch);
+    let ks = contents(core.keys);
+    let rn = contents(core.rand);
+    let ab = contents(core.authbuf);
+    let p = stride() * k;
+    let base = k * auth_size();
+    if len(view) < 5 {
+        return 0;
+    }
+    let size = be32(view, 1);
+    if int_of(view[0]) != 112 || size < 4 || size > 2048 {
+        auth_failed(tab, core, k, "08P01", "expected a password message");
+        return 0 - 1;
+    }
+    if len(view) < 1 + size {
+        return 0;
+    }
+    let body = view[5..1 + size];
+    let total = 1 + size;
+    if st[p + 7] == 2 {
+        // SASLInitialResponse: the mechanism, the length of the client-first message, the message.
+        let m_end = cstr_end(body, 0);
+        if m_end < 0 || !same_text(body[0..m_end - 1], "SCRAM-SHA-256") || len(body) < m_end + 4 {
+            auth_failed(tab, core, k, "28000", "the authentication mechanism is not supported (only SCRAM-SHA-256)");
+            return 0 - 1;
+        }
+        let first = body[m_end + 4..len(body)];
+        if be32(body, m_end) != len(first) || len(first) < 8 || int_of(first[1]) != 44 || int_of(first[2]) != 44 || int_of(first[0]) != 110 && int_of(first[0]) != 121 {
+            auth_failed(tab, core, k, "28000", "channel binding and an authorization identity are not supported");
+            return 0 - 1;
+        }
+        let bare = first[3..len(first)];
+        let (rf, rt) = pg.scram_attr(bare, 114);
+        if rf < 0 || rt - rf < 8 || rt - rf > 64 || len(bare) > 256 || int_of(bare[0]) != 110 {
+            auth_failed(tab, core, k, "08P01", "malformed SCRAM message");
+            return 0 - 1;
+        }
+        if mt[13] - mt[14] < 18 {
+            auth_failed(tab, core, k, "53000", "the pooler has no random bytes to make a nonce of");
+            return 0 - 1;
+        }
+        var i = 0;
+        while i < len(bare) {
+            ab[base + i] = bare[i];
+            i = i + 1;
+        }
+        ab[base + len(bare)] = byte_of(44);
+        var at = base + len(bare) + 1;
+        let sf_start = at;
+        ab[at] = byte_of(114);
+        ab[at + 1] = byte_of(61);
+        at = at + 2;
+        i = rf;
+        while i < rt {
+            ab[at] = bare[i];
+            at = at + 1;
+            i = i + 1;
+        }
+        at = at + scram.b64_encode(rn[mt[14]..mt[14] + 18], ab[at..at + 24]);
+        mt[14] = mt[14] + 18;
+        let tail = ",s=";
+        i = 0;
+        while i < 3 {
+            ab[at + i] = tail[i];
+            i = i + 1;
+        }
+        at = at + 3;
+        at = at + scram.b64_encode(ks[0..16], ab[at..at + 24]);
+        let iters = ",i=4096";
+        i = 0;
+        while i < 7 {
+            ab[at + i] = iters[i];
+            i = i + 1;
+        }
+        at = at + 7;
+        st[p + 13] = len(bare);
+        st[p + 14] = at - sf_start;
+        // AuthenticationSASLContinue: 'R', its length, 11, the server-first message.
+        sc[0] = byte_of('R');
+        put_be32(sc, 1, 8 + at - sf_start);
+        put_be32(sc, 5, 11);
+        i = 0;
+        while i < at - sf_start {
+            sc[9 + i] = ab[sf_start + i];
+            i = i + 1;
+        }
+        send_to(tab, core, k, sc[0..9 + at - sf_start]);
+        st[p + 7] = 3;
+        return total;
+    }
+    // SASLResponse: the client-final message, "c=biws,r=<nonce>,p=<proof>".
+    var cut = len(body) - 3;
+    while cut >= 0 && !(int_of(body[cut]) == 44 && int_of(body[cut + 1]) == 112 && int_of(body[cut + 2]) == 61) {
+        cut = cut - 1;
+    }
+    let bare_len = st[p + 13];
+    let sf_len = st[p + 14];
+    let server_first = ab[base + bare_len + 1..base + bare_len + 1 + sf_len];
+    if cut < 0 {
+        auth_failed(tab, core, k, "08P01", "malformed SCRAM message");
+        return 0 - 1;
+    }
+    let without_proof = body[0..cut];
+    let proof = body[cut + 3..len(body)];
+    let (cf_from, cf_to) = pg.scram_attr(without_proof, 99);
+    let (nf, nt) = pg.scram_attr(without_proof, 114);
+    let (sn_from, sn_to) = pg.scram_attr(server_first, 114);
+    if cf_from < 0 || nf < 0 || !(same_text(without_proof[cf_from..cf_to], "biws") || same_text(without_proof[cf_from..cf_to], "eSws")) || !same_text(without_proof[nf..nt], server_first[sn_from..sn_to]) {
+        auth_failed(tab, core, k, "28P01", "password authentication failed");
+        return 0 - 1;
+    }
+    var good = false;
+    region a {
+        let message = alloc_slice[a](bare_len + 1 + sf_len + 1 + len(without_proof), byte_of(0));
+        var i = 0;
+        while i < bare_len {
+            message[i] = ab[base + i];
+            i = i + 1;
+        }
+        message[bare_len] = byte_of(44);
+        i = 0;
+        while i < sf_len {
+            message[bare_len + 1 + i] = server_first[i];
+            i = i + 1;
+        }
+        message[bare_len + 1 + sf_len] = byte_of(44);
+        i = 0;
+        while i < len(without_proof) {
+            message[bare_len + 2 + sf_len + i] = without_proof[i];
+            i = i + 1;
+        }
+        let signature = alloc_slice[a](32, byte_of(0));
+        if scram.verify(ks[16..48], ks[48..80], message, proof, signature) {
+            good = true;
+            // AuthenticationSASLFinal: 'R', its length, 12, "v=" and the server signature; then the session starts.
+            sc[0] = byte_of('R');
+            put_be32(sc, 1, 4 + 4 + 2 + 44);
+            put_be32(sc, 5, 12);
+            sc[9] = byte_of(118);
+            sc[10] = byte_of(61);
+            scram.b64_encode(signature, sc[11..55]);
+            send_hello(tab, core, k, 55);
+        }
+    }
+    if !good {
+        auth_failed(tab, core, k, "28P01", "password authentication failed");
+        return 0 - 1;
+    }
+    return total;
+}
+
+// Everything the client in slot `k` has sent that can be dealt with: its startup message, then its messages, decided by `frame.client_step`.
+fn process[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [conn_write, poll] int {
+    let st = contents(core.state);
+    let mt = contents(core.meta);
+    let bf = contents(core.inbuf);
+    let pd = contents(core.pends);
+    let sc = contents(core.scratch);
+    let cf = contents(core.config);
+    let p = stride() * k;
+    let base = k * input_size();
+    var used = 0;
+    // The bytes just before `used` that have been decided on and not yet sent to the server: messages that arrived together go together, in one write
+    // (a write per message is what Nagle's algorithm waits on an acknowledgement for).
+    var batch = 0;
+    var going = true;
+    while going && st[p] == 1 && st[p + 6] == 0 {
+        let view = bf[base + used..base + st[p + 3]];
+        if st[p + 7] == 0 {
+            // Before it is answered: SSLRequest, GSSENCRequest, CancelRequest or the startup message itself.
+            if len(view) < 8 {
+                going = false;
+            } else {
+                let size = be32(view, 0);
+                let code = be32(view, 4);
+                if size < 8 || size > 8192 {
+                    finish_client(tab, core, k);
+                    going = false;
+                } else if len(view) < size {
+                    going = false;
+                } else if code == 80877103 || code == 80877104 {
+                    sc[0] = byte_of('N');
+                    send_to(tab, core, k, sc[0..1]);
+                    used = used + size;
+                } else if code == 80877102 {
+                    // CancelRequest: the process id and secret this pooler gave a client; if that client holds a server connection, its own is sent a cancel (by the loop).
+                    if size == 16 {
+                        let pid = be32(view, 8);
+                        let secret = be32(view, 12);
+                        var j = 0;
+                        while j < max_slots() {
+                            let q = stride() * j;
+                            if st[q] == 1 && st[q + 1] == 1 && st[q + 12] == pid && st[q + 17] == secret && st[q + 2] >= 0 && mt[19] < 16 {
+                                let sv = stride() * st[q + 2];
+                                contents(core.cancels)[2 * mt[19]] = st[sv + 19];
+                                contents(core.cancels)[2 * mt[19] + 1] = st[sv + 20];
+                                mt[19] = mt[19] + 1;
+                            }
+                            j = j + 1;
+                        }
+                    }
+                    finish_client(tab, core, k);
+                    going = false;
+                } else if code / 65536 != 3 {
+                    var o = put_error(sc, 0, "FATAL", "0A000", "unsupported frontend protocol");
+                    send_to(tab, core, k, sc[0..o]);
+                    finish_client(tab, core, k);
+                    going = false;
+                } else {
+                    let verdict = check_startup(view[8..size], cf, mt[8], mt[10]);
+                    if verdict != 0 {
+                        var o = 0;
+                        if verdict == 1 {
+                            o = put_error(sc, 0, "FATAL", "28000", "this pooler serves one user: the one it is configured with");
+                        } else if verdict == 2 {
+                            o = put_error(sc, 0, "FATAL", "3D000", "this pooler serves one database: the one it is configured with");
+                        } else {
+                            o = put_error(sc, 0, "FATAL", "08P01", "invalid startup message");
+                        }
+                        send_to(tab, core, k, sc[0..o]);
+                        finish_client(tab, core, k);
+                        going = false;
+                    } else if mt[3] == 0 || mt[5] == 0 {
+                        let o = put_error(sc, 0, "FATAL", "08006", "the pooler has no connection to the server");
+                        send_to(tab, core, k, sc[0..o]);
+                        finish_client(tab, core, k);
+                        going = false;
+                    } else if mt[12] > 0 {
+                        // Ask for the password: AuthenticationSASL, with the one mechanism.
+                        var o = 0;
+                        sc[o] = byte_of('R');
+                        put_be32(sc, o + 1, 4 + 4 + 14 + 1);
+                        put_be32(sc, o + 5, 10);
+                        o = put_text(sc, o + 9, "SCRAM-SHA-256");
+                        sc[o] = byte_of(0);
+                        o = o + 1;
+                        send_to(tab, core, k, sc[0..o]);
+                        st[p + 7] = 2;
+                        used = used + size;
+                    } else {
+                        send_hello(tab, core, k, 0);
+                        used = used + size;
+                    }
+                }
+            }
+        } else if st[p + 7] == 2 || st[p + 7] == 3 {
+            let taken = auth_step(tab, core, k, view);
+            if taken <= 0 {
+                going = false;
+            } else {
+                used = used + taken;
+            }
+        } else {
+            let (act, n, rest, owed) = frame.client_step(view, st[p + 8], st[p + 9]);
+            if act != frame.forward() && batch > 0 {
+                send_to(tab, core, st[p + 2], bf[base + used - batch..base + used]);
+                settle(tab, core, st[p + 2]);
+                batch = 0;
+            }
+            if act == frame.need_more() {
+                going = false;
+            } else if act == frame.forward() {
+                if st[p + 2] < 0 {
+                    let s = take_idle(core);
+                    if s < 0 {
+                        // Wait for one, with what the client has sent held back.
+                        if st[p + 11] == 0 {
+                            queue_push(core, k);
+                        }
+                        going = false;
+                    } else {
+                        assign(tab, core, k, s);
+                    }
+                }
+                if going {
+                    let s = st[p + 2];
+                    if st[stride() * s + 4] + batch + n > queue_size() {
+                        // The server is not taking what is being sent; try again when it does.
+                        going = false;
+                    } else {
+                        batch = batch + n;
+                        st[p + 15] = 0;
+                        st[p + 10] = st[p + 10] + owed;
+                        st[p + 8] = rest;
+                        used = used + n;
+                    }
+                }
+            } else if act == frame.terminate() {
+                used = used + n;
+                finish_client(tab, core, k);
+                going = false;
+            } else if act == frame.refuse_named() {
+                // The error a server would give, and then, as it would, nothing until the Sync.
+                let o = put_error(sc, 0, "ERROR", "0A000", "prepared statements with a name are not supported by this pooler (transaction pooling)");
+                send_to(tab, core, k, sc[0..o]);
+                st[p + 9] = 1;
+                st[p + 8] = rest;
+                used = used + n;
+            } else if act == frame.drop_bytes() {
+                st[p + 8] = rest;
+                used = used + n;
+            } else if act == frame.synced() {
+                // 'E': if the client holds a server it is in a transaction that, as far as the client knows, has failed.
+                var status = 73;
+                if st[p + 2] >= 0 {
+                    status = 69;
+                }
+                let o = put_ready(sc, 0, status);
+                send_to(tab, core, k, sc[0..o]);
+                st[p + 9] = 0;
+                used = used + n;
+            } else {
+                finish_client(tab, core, k);
+                going = false;
+            }
+        }
+    }
+    if batch > 0 && st[p] == 1 && st[p + 2] >= 0 {
+        send_to(tab, core, st[p + 2], bf[base + used - batch..base + used]);
+        settle(tab, core, st[p + 2]);
+        batch = 0;
+    }
+    if st[p] == 1 {
+        var at = 0;
+        while at < st[p + 3] - used {
+            bf[base + at] = bf[base + used + at];
+            at = at + 1;
+        }
+        st[p + 3] = st[p + 3] - used;
+        if st[p + 4] < 0 {
+            finish_client(tab, core, k);
+        } else {
+            settle(tab, core, k);
+        }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------
+// The poller's events
+// ---------------------------------------------------------------------
+
+// Connection `k` can be written to: send what is queued for it.
+fn drain[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [conn_write, poll] int {
+    let st = contents(core.state);
+    let pd = contents(core.pends);
+    let p = stride() * k;
+    let obase = k * queue_size();
+    match conns.write(tab, k, pd[obase..obase + st[p + 4]]) {
+        Sent::Wrote(sent) => {
+            var at = 0;
+            while at < st[p + 4] - sent {
+                pd[obase + at] = pd[obase + sent + at];
+                at = at + 1;
+            }
+            st[p + 4] = st[p + 4] - sent;
+            if st[p + 4] == 0 && st[p + 6] == 1 {
+                shut(tab, core, k);
+            } else {
+                settle(tab, core, k);
+                let peer = st[p + 2];
+                if peer >= 0 {
+                    settle(tab, core, peer);
+                    if st[p + 1] == 2 {
+                        // A server took what was queued: its client's held-back input may go now.
+                        process(tab, core, peer);
+                    }
+                }
+            }
+        }
+        Sent::Again => {
+        }
+        Sent::Failed(e) => {
+            if st[p + 1] == 1 {
+                st[p + 4] = 0;
+                finish_client(tab, core, k);
+            } else {
+                let client = st[p + 2];
+                drop_server(tab, core, k);
+                if client >= 0 {
+                    st[stride() * client + 2] = 0 - 1;
+                    finish_client(tab, core, client);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// Server `s` can be read: an idle one is noticed leaving, a busy one's bytes go to its client.
+fn from_server[&t, &c](tab: &!t conns.Table, core: &!c Core, s: int) -> [conn_read, conn_write, poll] int {
+    let st = contents(core.state);
+    let rb = contents(core.rbuf);
+    let p = stride() * s;
+    match conns.read(tab, s, rb[0..chunk()]) {
+        Received::Data(got) => {
+            let k = st[p + 2];
+            if k >= 0 {
+                let boundary = frame.scan(rb[0..got], st[p + 13..p + 13 + frame.scan_size()]);
+                if !send_to(tab, core, k, rb[0..got]) {
+                    drop_server(tab, core, s);
+                    st[stride() * k + 2] = 0 - 1;
+                    finish_client(tab, core, k);
+                } else {
+                    let q = stride() * k;
+                    if boundary && st[p + 18] > 0 {
+                        // `ReadyForQuery`s seen, and the status of the last. Back to the pool when the client is owed no more and the transaction is over.
+                        st[q + 10] = st[q + 10] - st[p + 18];
+                        if st[q + 10] < 0 {
+                            st[q + 10] = 0;
+                        }
+                        let status = st[p + 16];
+                        st[p + 16] = 0;
+                        st[p + 18] = 0;
+                        if st[q + 10] == 0 && status == 73 {
+                            give_back(tab, core, s);
+                        } else if st[q + 10] == 0 && mt_idle_tx(core) > 0 {
+                            // In a transaction and owed nothing: it is the client's move.
+                            st[q + 15] = contents(core.meta)[15] + mt_idle_tx(core);
+                            st[q + 16] = 2;
+                        }
+                    }
+                    settle(tab, core, k);
+                    settle(tab, core, s);
+                }
+            }
+            // An idle server that says something (an asynchronous message) is not listened to.
+        }
+        Received::End => {
+            let k = st[p + 2];
+            drop_server(tab, core, s);
+            if k >= 0 {
+                st[stride() * k + 2] = 0 - 1;
+                finish_client(tab, core, k);
+            }
+        }
+        Received::Again => {
+        }
+        Received::Failed(e) => {
+            let k = st[p + 2];
+            drop_server(tab, core, s);
+            if k >= 0 {
+                st[stride() * k + 2] = 0 - 1;
+                finish_client(tab, core, k);
+            }
+        }
+    }
+    return 0;
+}
+
+// The client in `k` can be read.
+fn from_client[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int) -> [conn_read, conn_write, poll] int {
+    let st = contents(core.state);
+    let bf = contents(core.inbuf);
+    let p = stride() * k;
+    let base = k * input_size();
+    match conns.read(tab, k, bf[base + st[p + 3]..base + input_size()]) {
+        Received::Data(got) => {
+            st[p + 3] = st[p + 3] + got;
+            process(tab, core, k);
+        }
+        Received::End => {
+            finish_client(tab, core, k);
+        }
+        Received::Again => {
+        }
+        Received::Failed(e) => {
+            finish_client(tab, core, k);
+        }
+    }
+    return 0;
+}
+
+// The poller said connection `k` is ready.
+fn step[&t, &c](tab: &!t conns.Table, core: &!c Core, k: int, readiness: int) -> [conn_read, conn_write, poll] int {
+    let st = contents(core.state);
+    let p = stride() * k;
+    if readiness % 4 >= 2 && st[p + 4] > 0 {
+        drain(tab, core, k);
+    }
+    if st[p] == 1 && readiness % 2 == 1 {
+        if st[p + 5] % 2 == 1 {
+            if st[p + 1] == 1 {
+                from_client(tab, core, k);
+            } else {
+                from_server(tab, core, k);
+            }
+        } else if st[p + 1] == 1 {
+            // Said something while it was not being listened to: on its way out.
+            finish_client(tab, core, k);
+        } else {
+            let client = st[p + 2];
+            drop_server(tab, core, k);
+            if client >= 0 {
+                st[stride() * client + 2] = 0 - 1;
+                finish_client(tab, core, client);
+            }
+        }
+    }
+    return 0;
+}
+
+// Take every client waiting on the listener, up to the limit.
+fn accept_all[&h, &l, &c](heap: &!h Heap, conn: conns.Table, listener: &!l Listener, core: &!c Core) -> [heap, conn_accept, poll] conns.Table {
+    let st = contents(core.state);
+    let mt = contents(core.meta);
+    var table = conn;
+    var more = true;
+    while more {
+        match tcp_accept(listener) {
+            Accepted::Ok(client) => {
+                var clients = 0;
+                var k = 0;
+                while k < max_slots() {
+                    if st[stride() * k] == 1 && st[stride() * k + 1] == 1 {
+                        clients = clients + 1;
+                    }
+                    k = k + 1;
+                }
+                if clients >= max_clients() {
+                    conn_close(client);
+                } else {
+                    let (grown, slot) = conns.put(heap, table, client);
+                    table = grown;
+                    if slot >= 0 && slot < max_slots() {
+                        let p = stride() * slot;
+                        var i = 0;
+                        while i < stride() {
+                            st[p + i] = 0;
+                            i = i + 1;
+                        }
+                        st[p] = 1;
+                        st[p + 1] = 1;
+                        st[p + 2] = 0 - 1;
+                        st[p + 5] = 1;
+                        mt[4] = mt[4] + 1;
+                        st[p + 12] = mt[4];
+                        // The secret a cancel for this client must quote: 31 random bits.
+                        let rn = contents(core.rand);
+                        if mt[13] - mt[14] >= 4 {
+                            st[p + 17] = (int_of(rn[mt[14]]) * 16777216 + int_of(rn[mt[14] + 1]) * 65536 + int_of(rn[mt[14] + 2]) * 256 + int_of(rn[mt[14] + 3])) % 2147483648;
+                            mt[14] = mt[14] + 4;
+                        } else {
+                            st[p + 17] = (mt[4] * 40503 + 12345) % 2147483648;
+                        }
+                        if mt[16] > 0 {
+                            st[p + 15] = mt[15] + mt[16];
+                            st[p + 16] = 1;
+                        }
+                        borrow mut table as &!ct in {
+                            if conns.nonblocking(ct, slot) != 0 || conns.nodelay(ct, slot) != 0 || conns.watch(ct, core.poller, slot, slot + 1, 1) != 0 {
+                                shut(ct, core, slot);
+                            }
+                        }
+                    } else if slot >= 0 {
+                        borrow mut table as &!ct in {
+                            conns.close(ct, slot);
+                        }
+                    }
+                }
+            }
+            Accepted::Again => {
+                more = false;
+            }
+            Accepted::Failed(e) => {
+                more = false;
+            }
+        }
+    }
+    return table;
+}
+
+// ---------------------------------------------------------------------
+// The pool
+// ---------------------------------------------------------------------
+
+// The idle-in-transaction timeout (ms; 0: none).
+fn mt_idle_tx[&c](core: &!c Core) -> [] int {
+    return contents(core.meta)[17];
+}
+
+// Cut off the clients whose time has run out, each with the error PostgreSQL would give for it. A client that holds a server connection in a transaction takes it with it
+// (finish_client drops a server a client was on, because what state it left it in is not known).
+fn expire[&t, &c](tab: &!t conns.Table, core: &!c Core) -> [conn_write, poll] int {
+    let st = contents(core.state);
+    let mt = contents(core.meta);
+    let sc = contents(core.scratch);
+    var k = 0;
+    while k < max_slots() {
+        let p = stride() * k;
+        if st[p] == 1 && st[p + 1] == 1 && st[p + 15] != 0 && mt[15] >= st[p + 15] {
+            var o = 0;
+            if st[p + 16] == 1 {
+                o = put_error(sc, 0, "FATAL", "08P01", "login timeout: the startup was not completed in time");
+            } else if st[p + 16] == 2 {
+                o = put_error(sc, 0, "FATAL", "25P03", "terminating connection due to idle-in-transaction timeout");
+            } else {
+                o = put_error(sc, 0, "FATAL", "53000", "no server connection became free in time");
+            }
+            st[p + 15] = 0;
+            send_to(tab, core, k, sc[0..o]);
+            finish_client(tab, core, k);
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// Send the cancels that clients asked for to the server, each on a connection of its own, as a client library does: 16 bytes, no answer.
+fn send_cancels[&n, &c](net: &n Net(""), core: &!c Core) -> [net_out(""), conn_write] int {
+    let mt = contents(core.meta);
+    let cn = contents(core.cancels);
+    let cf = contents(core.config);
+    var i = 0;
+    while i < mt[19] {
+        match tcp_connect(net, cf[512..512 + mt[11]], mt[7]) {
+            Dialed::Ok(c) => {
+                var conn = c;
+                region a {
+                    let m = alloc_slice[a](16, byte_of(0));
+                    put_be32(m, 0, 16);
+                    put_be32(m, 4, 80877102);
+                    put_be32(m, 8, cn[2 * i]);
+                    put_be32(m, 12, cn[2 * i + 1]);
+                    borrow mut conn as &!ch in {
+                        match conn_write(ch, m) {
+                            Sent::Wrote(w) => {
+                            }
+                            Sent::Again => {
+                            }
+                            Sent::Failed(e) => {
+                            }
+                        }
+                    }
+                }
+                conn_close(conn);
+            }
+            Dialed::Failed(e) => {
+            }
+        }
+        i = i + 1;
+    }
+    mt[19] = 0;
+    return 0;
+}
+
+// An unpredictable client nonce for SCRAM: 18 bytes from the kernel, as base64 (as `examples/psql.cho`).
+fn fresh_nonce[&h, &f](heap: &!h Heap, fs: &f Fs("/dev/urandom")) -> [heap, fs_read("/dev/urandom")] buffer.Buffer {
+    var nonce = buffer.empty(heap, 1);
+    region a {
+        let raw = alloc_slice[a](18, byte_of(0));
+        let got = fs_read(fs, "/dev/urandom", raw);
+        if got == 18 {
+            buffer.drop(heap, nonce);
+            nonce = pg.base64_encode(heap, raw);
+        }
+    }
+    return nonce;
+}
+
+// Keep, from the first login's reply, the ParameterStatus messages every client will be told.
+fn keep_parameters[&c, &r](core: &!c Core, reply: &r [byte]) -> [] int {
+    let mt = contents(core.meta);
+    let hl = contents(core.hello);
+    var at = 0;
+    var o = 0;
+    while pg.size(reply, at) > 0 {
+        let size = pg.size(reply, at);
+        if pg.kind(reply, at) == 83 && o + size <= len(hl) {
+            var i = 0;
+            while i < size {
+                hl[o + i] = reply[at + i];
+                i = i + 1;
+            }
+            o = o + size;
+        }
+        at = at + size;
+    }
+    mt[3] = o;
+    return 0;
+}
+
+// Keep a few hundred random bytes in hand for the nonces of logins: `meta[13]` held, `meta[14]` used. Reads from the kernel when fewer than 512 are left.
+fn top_up[&c, &f](core: &!c Core, fs: &f Fs("/dev/urandom")) -> [fs_read("/dev/urandom")] int {
+    let mt = contents(core.meta);
+    let rn = contents(core.rand);
+    if mt[13] - mt[14] >= 512 {
+        return 0;
+    }
+    var i = 0;
+    while i < mt[13] - mt[14] {
+        rn[i] = rn[mt[14] + i];
+        i = i + 1;
+    }
+    mt[13] = mt[13] - mt[14];
+    mt[14] = 0;
+    let got = fs_read(fs, "/dev/urandom", rn[mt[13]..len(rn)]);
+    if got > 0 {
+        mt[13] = mt[13] + got;
+    }
+    return 0;
+}
+
+// Log in connections until the pool is the size asked for, or one cannot be made (tried again on the next turn).
+fn refill[&h, &n, &z, &c](heap: &!h Heap, conn: conns.Table, net: &n Net(""), rng: &z Fs("/dev/urandom"), core: &!c Core) -> [heap, net_out(""), conn_read, conn_write, fs_read("/dev/urandom"), poll] conns.Table {
+    let mt = contents(core.meta);
+    let st = contents(core.state);
+    let cf = contents(core.config);
+    var table = conn;
+    var trying = true;
+    while trying && mt[5] < mt[6] {
+        trying = false;
+        match tcp_connect(net, cf[512..512 + mt[11]], mt[7]) {
+            Dialed::Ok(c) => {
+                var server = c;
+                let nonce = fresh_nonce(heap, rng);
+                var status = 1;
+                var key_pid = 0;
+                var key_secret = 0;
+                borrow nonce as &nr in {
+                    borrow mut server as &!sh in {
+                        let (reply, s) = pg.login(heap, sh, cf[0..mt[8]], cf[128..128 + mt[9]], cf[384..384 + mt[10]], buffer.bytes(nr));
+                        status = s;
+                        // The process id and secret this connection has on the server: what a cancel for whoever is using it must quote.
+                        borrow reply as &kr in {
+                            let km = buffer.bytes(kr);
+                            var ka = 0;
+                            while pg.size(km, ka) > 0 {
+                                if pg.kind(km, ka) == 75 && pg.size(km, ka) >= 13 {
+                                    key_pid = be32(km, ka + 5);
+                                    key_secret = be32(km, ka + 9);
+                                }
+                                ka = ka + pg.size(km, ka);
+                            }
+                        }
+                        if s == 0 && mt[3] == 0 {
+                            borrow reply as &rb in {
+                                keep_parameters(core, buffer.bytes(rb));
+                            }
+                        }
+                        buffer.drop(heap, reply);
+                    }
+                }
+                buffer.drop(heap, nonce);
+                if status != 0 {
+                    conn_close(server);
+                } else {
+                    let (grown, slot) = conns.put(heap, table, server);
+                    table = grown;
+                    if slot >= 0 && slot < max_slots() {
+                        let p = stride() * slot;
+                        var i = 0;
+                        while i < stride() {
+                            st[p + i] = 0;
+                            i = i + 1;
+                        }
+                        st[p] = 1;
+                        st[p + 1] = 2;
+                        st[p + 2] = 0 - 1;
+                        st[p + 5] = 1;
+                        st[p + 7] = 1;
+                        st[p + 19] = key_pid;
+                        st[p + 20] = key_secret;
+                        borrow mut table as &!ct in {
+                            if conns.nonblocking(ct, slot) != 0 || conns.nodelay(ct, slot) != 0 || conns.watch(ct, core.poller, slot, slot + 1, 1) != 0 {
+                                shut(ct, core, slot);
+                            } else {
+                                contents(core.idle)[mt[0]] = slot;
+                                mt[0] = mt[0] + 1;
+                                mt[5] = mt[5] + 1;
+                                trying = true;
+                            }
+                        }
+                    } else if slot >= 0 {
+                        borrow mut table as &!ct in {
+                            conns.close(ct, slot);
+                        }
+                    }
+                }
+            }
+            Dialed::Failed(e) => {
+            }
+        }
+    }
+    return table;
+}
+
+fn run[&h, &l, &n, &z, &g, &k](heap: &!h Heap, listener: &!l Listener, net: &n Net(""), rng: &z Fs("/dev/urandom"), args: &g Args, clock: &k Clock) -> [heap, conn_accept, conn_read, conn_write, net_out(""), fs_read("/dev/urandom"), poll, args, clock] int {
+    match poller_new() {
+        Polling::Ok(p) => {
+            var poller = p;
+            borrow mut poller as &!pw in {
+                poller_add_listener(pw, listener, 0);
+            }
+            let slots = max_slots() + 2;
+            var core = Core { poller: poller, events: box_slice(heap, 128, 0), state: box_slice(heap, stride() * slots, 0), meta: box_slice(heap, meta_size(), 0), idle: box_slice(heap, max_pool() + 2, 0), queue: box_slice(heap, max_clients() + 2, 0), inbuf: box_slice(heap, slots * input_size(), byte_of(0)), rbuf: box_slice(heap, chunk(), byte_of(0)), pends: box_slice(heap, slots * queue_size(), byte_of(0)), hello: box_slice(heap, 4096, byte_of(0)), scratch: box_slice(heap, 4096, byte_of(0)), config: box_slice(heap, config_size(), byte_of(0)), keys: box_slice(heap, 80, byte_of(0)), rand: box_slice(heap, 4096, byte_of(0)), authbuf: box_slice(heap, slots * auth_size(), byte_of(0)), cancels: box_slice(heap, 32, 0) };
+            borrow mut core as &!cw in {
+                // The configuration: where the server is, who to be, how many connections.
+                let cf = contents(cw.config);
+                let mt = contents(cw.meta);
+                let host = arg(args, 2);
+                let user = arg(args, 4);
+                let database = arg(args, 5);
+                let secret = arg(args, 6);
+                var i = 0;
+                while i < len(user) {
+                    cf[i] = user[i];
+                    i = i + 1;
+                }
+                i = 0;
+                while i < len(secret) && !(len(secret) == 1 && int_of(secret[0]) == 45) {
+                    cf[128 + i] = secret[i];
+                    i = i + 1;
+                }
+                if len(secret) == 1 && int_of(secret[0]) == 45 {
+                    mt[9] = 0;
+                } else {
+                    mt[9] = len(secret);
+                }
+                i = 0;
+                while i < len(database) {
+                    cf[384 + i] = database[i];
+                    i = i + 1;
+                }
+                i = 0;
+                while i < len(host) {
+                    cf[512 + i] = host[i];
+                    i = i + 1;
+                }
+                mt[8] = len(user);
+                mt[10] = len(database);
+                mt[11] = len(host);
+                mt[7] = number_of(arg(args, 3));
+                mt[6] = number_of(arg(args, 7));
+                if arg_count(args) > 8 && !(len(arg(args, 8)) == 1 && int_of(arg(args, 8)[0]) == 45) {
+                    let cp = arg(args, 8);
+                    i = 0;
+                    while i < len(cp) && i < 120 {
+                        cf[640 + i] = cp[i];
+                        i = i + 1;
+                    }
+                    mt[12] = i;
+                }
+                // The timeouts: the login, idle in a transaction, waiting for a server connection.
+                mt[16] = 60000;
+                mt[17] = 0;
+                mt[18] = 120000;
+                if arg_count(args) > 9 {
+                    mt[16] = number_of(arg(args, 9));
+                }
+                if arg_count(args) > 10 {
+                    mt[17] = number_of(arg(args, 10));
+                }
+                if arg_count(args) > 11 {
+                    mt[18] = number_of(arg(args, 11));
+                }
+            }
+            borrow mut core as &!cw in {
+                top_up(cw, rng);
+            }
+            borrow mut core as &!cw in {
+                // The salted keys of the client password, once: 16 random bytes of salt, 4096 iterations (what PostgreSQL does).
+                let mt = contents(cw.meta);
+                if mt[12] > 0 {
+                    let ks = contents(cw.keys);
+                    let rn = contents(cw.rand);
+                    let cf = contents(cw.config);
+                    var i = 0;
+                    while i < 16 {
+                        ks[i] = rn[i];
+                        i = i + 1;
+                    }
+                    mt[14] = 16;
+                    let salted = pg.pbkdf2_sha256(heap, cf[640..640 + mt[12]], ks[0..16], 4096);
+                    borrow salted as &sr in {
+                        region ra {
+                            let ck = alloc_slice[ra](32, byte_of(0));
+                            scram.hmac(buffer.bytes(sr), "Client Key", ck);
+                            crypto.sha256(ck, ks[16..48]);
+                            scram.hmac(buffer.bytes(sr), "Server Key", ks[48..80]);
+                        }
+                    }
+                    buffer.drop(heap, salted);
+                }
+            }
+            var tab = conns.empty(heap, 64);
+            while true {
+                borrow mut core as &!cw in {
+                    top_up(cw, rng);
+                    tab = refill(heap, tab, net, rng, cw);
+                }
+                var ready = 0 - 1;
+                borrow mut core as &!cw in {
+                    var wait_ms = 1000;
+                    if contents(cw.meta)[16] > 0 || contents(cw.meta)[17] > 0 || contents(cw.meta)[18] > 0 {
+                        wait_ms = 100;
+                    }
+                    if contents(cw.meta)[5] < contents(cw.meta)[6] {
+                        wait_ms = 200;
+                    }
+                    ready = poller_wait(cw.poller, contents(cw.events), wait_ms);
+                    contents(cw.meta)[15] = clock_ms(clock);
+                }
+                var j = 0;
+                while j < ready {
+                    var token = 0 - 1;
+                    var readiness = 0;
+                    borrow core as &cr in {
+                        token = contents(cr.events)[2 * j];
+                        readiness = contents(cr.events)[2 * j + 1];
+                    }
+                    if token == 0 {
+                        borrow mut core as &!cw in {
+                            tab = accept_all(heap, tab, listener, cw);
+                        }
+                    } else {
+                        borrow mut tab as &!tw in {
+                            borrow mut core as &!cw in {
+                                if contents(cw.state)[stride() * (token - 1)] == 1 {
+                                    step(tw, cw, token - 1, readiness);
+                                }
+                            }
+                        }
+                    }
+                    j = j + 1;
+                }
+                borrow mut tab as &!tw in {
+                    borrow mut core as &!cw in {
+                        expire(tw, cw);
+                        send_cancels(net, cw);
+                    }
+                }
+            }
+            conns.drop(heap, tab);
+            let Core { poller, events, state, meta, idle, queue, inbuf, rbuf, pends, hello, scratch, config, keys, rand, authbuf, cancels } = core;
+            poller_close(poller);
+            unbox_slice(heap, events);
+            unbox_slice(heap, state);
+            unbox_slice(heap, meta);
+            unbox_slice(heap, idle);
+            unbox_slice(heap, queue);
+            unbox_slice(heap, inbuf);
+            unbox_slice(heap, rbuf);
+            unbox_slice(heap, pends);
+            unbox_slice(heap, hello);
+            unbox_slice(heap, scratch);
+            unbox_slice(heap, config);
+            unbox_slice(heap, keys);
+            unbox_slice(heap, rand);
+            unbox_slice(heap, authbuf);
+            unbox_slice(heap, cancels);
+            return 0;
+        }
+        Polling::Failed(e) => {
+            return 4;
+        }
+    }
+}
+
+fn number_of[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 || len(text) > 5 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c < '0' || c > '9' {
+            return 0 - 1;
+        }
+        n = n * 10 + (c - '0');
+        i = i + 1;
+    }
+    return n;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock } = split(world);
+    release(ffi);
+    let rng = narrow(fs, "/dev/urandom");
+    var listen_port = 0 - 1;
+    var pool = 0 - 1;
+    var server_port = 0 - 1;
+    borrow args as &g in {
+        if arg_count(g) >= 8 && arg_count(g) <= 12 {
+            listen_port = number_of(arg(g, 1));
+            server_port = number_of(arg(g, 3));
+            pool = number_of(arg(g, 7));
+        }
+    }
+    var status = 2;
+    if listen_port > 0 && listen_port < 65536 && server_port > 0 && server_port < 65536 && pool > 0 && pool <= max_pool() {
+        status = 3;
+        borrow args as &g in {
+            borrow rng as &z in {
+                borrow net as &nn in {
+                    match tcp_listen(nn, listen_port, 1024, 0) {
+                        Listening::Ok(l) => {
+                            var listener = l;
+                            borrow mut listener as &!lh in {
+                                listener_nonblocking(lh);
+                                borrow mut heap as &!h in {
+                                    borrow clock as &ck in {
+                                        status = run(h, lh, nn, z, g, ck);
+                                    }
+                                }
+                            }
+                            listener_close(listener);
+                        }
+                        Listening::Failed(e) => {
+                            status = 3;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(rng);
+    release(clock);
+    release(net);
+    release(args);
+    release(io);
+    release(heap);
+    return status;
+}

@@ -1,6 +1,6 @@
 # A connection that does not block the loop
 
-> **Status: built (`src/pool.ls`, package `pg.pool`), measured, and the design's own criteria checked in
+> **Status: built (`src/pool.cho`, package `pg.pool`), measured, and the design's own criteria checked in
 > section 9. Reconnecting, which sections 4.2 and 9.3 left for later, is built: [`reconnect.md`](reconnect.md).** Sections 1-8 are the design as written before it was built, with the places where a
 > measurement afterwards showed the text to be wrong **corrected in place** (marked *Corrected*). The case
 > for building it was said to be "not throughput", and the first measurement of the finished thing
@@ -56,8 +56,8 @@ needs none of them, run copies.
 
 ## 3. What exists, and what does not
 
-Verified in `lex-sys` at the revision `lexsys-web` pins (`bbeb75f`), by reading `std/conns.ls`,
-`docs/native-sockets.md` and `packages/http-server/server.ls`:
+Verified in `cancho` at the revision `cancho-web` pins (`bbeb75f`), by reading `std/conns.cho`,
+`docs/native-sockets.md` and `packages/http-server/server.cho`:
 
 * **A resource that holds many connections.** `Conn` is a resource and no ordinary table can hold one;
   `std.conns.Table` does: `put`, `read`, `write`, `nonblocking`, `watch` / `rewatch` (register a slot with a
@@ -82,7 +82,7 @@ What does **not** exist, in `http.server`:
   token for anything else would be read as a connection or trap. Application handles need a range the server
   leaves alone and reports.
 
-These are changes to a package in `lex-sys`, with its own documentation, tests and published store, and every
+These are changes to a package in `cancho`, with its own documentation, tests and published store, and every
 downstream lock pins its source hash. They are the larger half of the work and belong in that repository's own
 design document (a `docs/http-server.md` section) when this is built.
 
@@ -182,7 +182,7 @@ that block. `prepare_all` stays and is called per connection by `pool.open`.
 
 Criteria, written down now so the benchmark that follows cannot be read generously:
 
-1. **Correct before fast.** Every end-to-end test of `users_pg` passes unchanged (the 29 of `lexsys-web`,
+1. **Correct before fast.** Every end-to-end test of `users_pg` passes unchanged (the 29 of `cancho-web`,
    Schemathesis included), and a differential run of the blocking and the non-blocking service over the same
    request sequence returns the same answers.
 2. **The property that is the point.** While one request's query is pending -- a `pg_sleep(1)` behind a test-only
@@ -205,7 +205,7 @@ benchmark.
 
 ## 7. Order of work
 
-1. `http.server`: the five additions of 4.1, in `lex-sys`, with their own tests (a held request is answered later;
+1. `http.server`: the five additions of 4.1, in `cancho`, with their own tests (a held request is answered later;
    a held connection takes no new request; a closed held slot answers -1; a foreign token is reported and never
    indexed) and a section in `docs/http-server.md`.
 2. `pg.Pool` with `n = 1`, tested against a real server and against a mock that answers in pieces, late and not at all.
@@ -227,22 +227,22 @@ benchmark.
 
 ## 9. What was built, and what it measured
 
-`pg.pool` (`src/pool.ls`): a `Pool` owns logged-in, non-blocking connections in a `conns.Table`; `submit` queues an
+`pg.pool` (`src/pool.cho`): a `Pool` owns logged-in, non-blocking connections in a `conns.Table`; `submit` queues an
 encoded request (`pg.bind_named`) on the connection with the fewest in flight, `flush` sends what a loop turn queued
 (one write per connection), `pump` does the I/O the poller reported, `next_done` hands back each answered request's tag
 with `reply` (what `pg.run_named` would have returned) and `status`. Logging in and preparing statements stay the
 caller's (the blocking helpers, before `add`), so the pool needs nothing from `pg` but `size` and `kind`. Sizes are
 fixed when the pool is made. `pgen` writes a `<name>_start` per query, the encoded request without a connection.
 
-`http.server` got what section 4.1 said it needed (`lex-sys` PR 182, `docs/http-server.md` section 10): `hold` and
+`http.server` got what section 4.1 said it needed (`cancho` PR 182, `docs/http-server.md` section 10): `hold` and
 `answer` with generation-checked tickets, the server's poller, `first_token`, and the application's events
-(`foreign`). The service is `lexsys-web`'s `examples/users_pg`, with a ninth argument (the number of connections)
+(`foreign`). The service is `cancho-web`'s `examples/users_pg`, with a ninth argument (the number of connections)
 that switches its loop from "wait for the database" to "hold the request, queue the query, go on".
 
 ### 9.1 The six criteria of section 6
 
 One machine (4 cores, a Firecracker VM), server on core 0, PostgreSQL on core 1, the load generator on cores 2 and 3,
-as in `lexsys-web`'s `docs/benchmarks.md`. Requests a second, the same session for every row.
+as in `cancho-web`'s `docs/benchmarks.md`. Requests a second, the same session for every row.
 
 | | criterion | result | |
 |---|---|---|---|
@@ -251,11 +251,11 @@ as in `lexsys-web`'s `docs/benchmarks.md`. Requests a second, the same session f
 | 3 | one process, one connection, at least 22,000 `GET one user` | **63,980 / 65,894 / 64,262** (three runs, median of three rounds each); blocking, one copy: 15,638; three copies: 25,180 | met, by 2.9x |
 | 4 | a pool of four reaches at least what four copies did (about 6,300 creates a second) over at least ten runs, spread reported | pool of four: **median 8,091** (6,836-10,776); four blocking copies in the same session: **median 5,818** (4,528-8,329) | met on the median; the ranges overlap |
 | 5 | killing PostgreSQL's backends mid-flight answers every waiting request 503, loses none, duplicates none, and the routes that need no database keep working | six waiting requests, all backends but two ended: **six 503s**, `/health` 200 afterwards, a database route 503 (no reconnecting yet) | met |
-| 6 | the `http.server` additions under about 150 lines, the pool under about 500 | `http.server`: **167 lines added** to `server.ls` (97 of code, the rest comments), 6 removed; `pool.ls`: **557 lines, 415 of code** | met counting code; **over counting every line** (167 and 557) |
+| 6 | the `http.server` additions under about 150 lines, the pool under about 500 | `http.server`: **167 lines added** to `server.cho` (97 of code, the rest comments), 6 removed; `pool.cho`: **557 lines, 415 of code** | met counting code; **over counting every line** (167 and 557) |
 
 Criterion 6 did not say whether comments count. On code lines both are inside the budget; on raw lines both are over,
 the pool by 57, and the held-connection rules touch five existing functions of `http.server` as well as adding new
-ones (the diff is `git diff bbeb75f 0a2a43c -- packages/http-server/server.ls` in `lex-sys`).
+ones (the diff is `git diff bbeb75f 0a2a43c -- packages/http-server/server.cho` in `cancho`).
 
 More numbers, for the record (median of three 5-second rounds; pool in one process, pinned the same way):
 
@@ -277,7 +277,7 @@ connections, from the first measurement, sit above the ten-run ranges here); loo
 ### 9.2 The client, against others
 
 One connection, the same prepared primary-key lookup, client pinned to core 0 and PostgreSQL to core 1 (this
-session; `tests/pool_drive.ls` `row` mode against the clients below, 200,000 lookups, three runs):
+session; `tests/pool_drive.cho` `row` mode against the clients below, 200,000 lookups, three runs):
 
 | client | one query at a time | pipelined |
 |---|---:|---:|
@@ -316,7 +316,7 @@ how requests are batched on the wire, or in the cost of waking a blocked client.
 connection, the server's error as an answer, an idle loop that sleeps, backends killed mid-flight, a request larger
 than the socket's buffers) and 7 against a mock that answers in pieces of one byte, late, two replies in one write,
 never, hangs up part way, sends garbage, or sends a reply larger than the slab. Eleven single-edit mutations of
-`pool.ls` were each run against them. **The first set left four standing**: two lines of the write path that only a
+`pool.cho` were each run against them. **The first set left four standing**: two lines of the write path that only a
 request larger than the kernel's buffers reaches, the compaction of the output queue, and the accounting of replies
 that arrive together with the hang-up. Tests were written for each (a mock that does not read for a second, 3 MB
 requests, a driver that takes answers only once the poller has been quiet) and all eleven are caught.
