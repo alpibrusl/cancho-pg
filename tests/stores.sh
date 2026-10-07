@@ -1,0 +1,64 @@
+#!/bin/sh
+# The three package stores of this repository, published afresh from the sources (docs/tls.md section 9):
+#
+#   .cancho-vcs       pg       src/pg.cho, requiring nothing
+#   .cancho-vcs-pool  pg.pool  src/pool.cho, requiring the names it calls of pg's store and of cancho's tls and tls_record
+#   .cancho-vcs-ssl   pg.ssl   src/ssl.cho, the same
+#
+#   sh tests/stores.sh          publish into a fresh directory and compare each store with the committed one (CI runs this)
+#   sh tests/stores.sh write    publish, and make the committed stores those (after a change to a source, or of the compiler)
+#
+# A store records the stores it requires: pg's by its path relative to itself (so all three are published side by side, as
+# they are committed), cancho's by origin (the repository and the commit cancho.toml pins). CANCHO names the compiler.
+set -eu
+cd "$(dirname "$0")/.."
+LEX=${CANCHO:-cancho}
+REV=$(sed -n 's/^cancho = "\([0-9a-f]*\)"$/\1/p' cancho.toml)
+[ -n "$REV" ] || { echo "no cancho revision in cancho.toml" >&2; exit 1; }
+CANCHO=https://github.com/alpibrusl/cancho
+OUT=$(mktemp -d)
+# keep the published stores for a look when a check fails
+echo "publishing into $OUT" >&2
+
+# what pg.pool and pg.ssl call of pg (a store's requirement is a lock of names)
+POOL_PG="auth_code base64_encode error_field hmac_sha256 kind parse_append password pbkdf2_begin pbkdf2_more sasl_initial
+  sasl_response scram_client_final_with scram_client_first scram_iterations scram_salt size ssl_answer ssl_request_code startup"
+SSL_PG="auth_code bind_named describe execute failure kind login_asks parse_named password query sasl_initial sasl_response
+  scram_challenge scram_client_final scram_client_first scram_verdict size ssl_answer ssl_request_code sslmode_disable
+  sslmode_verify_full startup status_tag"
+# and of cancho's engine
+POOL_TLS="close drop eof event event_closed event_established event_failed failure feed open open_with_tickets recv seed
+  send start take trust would_block"
+SSL_TLS="close eof event event_closed event_established event_failed failure feed finish open recv refusal_tag seed send
+  start take trust would_block"
+RECORD="peer_closed too_many_messages"
+
+$LEX vcs publish --std --store "$OUT/.cancho-vcs" src/pg.cho >/dev/null
+$LEX vcs lock --git "$CANCHO" --rev "$REV" --path packages/tls/.cancho-vcs/tls -o "$OUT/pool-tls.lock" $POOL_TLS >/dev/null
+$LEX vcs lock --git "$CANCHO" --rev "$REV" --path packages/tls/.cancho-vcs/tls -o "$OUT/ssl-tls.lock" $SSL_TLS >/dev/null
+$LEX vcs lock --git "$CANCHO" --rev "$REV" --path packages/tls/.cancho-vcs/tls_record -o "$OUT/record.lock" $RECORD >/dev/null
+$LEX vcs lock --store "$OUT/.cancho-vcs" -o "$OUT/pool-pg.lock" $POOL_PG >/dev/null
+$LEX vcs lock --store "$OUT/.cancho-vcs" -o "$OUT/ssl-pg.lock" $SSL_PG >/dev/null
+$LEX vcs publish --std --store "$OUT/.cancho-vcs-pool" --requires "$OUT/pool-pg.lock:$OUT/.cancho-vcs" \
+    --requires "$OUT/pool-tls.lock" --requires "$OUT/record.lock" src/pool.cho >/dev/null
+$LEX vcs publish --std --store "$OUT/.cancho-vcs-ssl" --requires "$OUT/ssl-pg.lock:$OUT/.cancho-vcs" \
+    --requires "$OUT/ssl-tls.lock" --requires "$OUT/record.lock" src/ssl.cho >/dev/null
+
+if [ "${1:-check}" = write ]; then
+    for s in .cancho-vcs .cancho-vcs-pool .cancho-vcs-ssl; do
+        mkdir -p "$s"
+        rsync -a --delete "$OUT/$s/" "$s/"
+    done
+    echo "written" >&2
+    exit 0
+fi
+status=0
+for s in .cancho-vcs .cancho-vcs-pool .cancho-vcs-ssl; do
+    if diff -r "$OUT/$s" "$s"; then
+        echo "$s: the store of the source" >&2
+    else
+        echo "$s: NOT the store of the source (sh tests/stores.sh write)" >&2
+        status=1
+    fi
+done
+exit $status

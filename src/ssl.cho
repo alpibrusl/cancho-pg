@@ -1,0 +1,640 @@
+edition 5;
+
+module pg.ssl;
+
+// `pg.ssl` -- a blocking connection to PostgreSQL that may be TLS (docs/tls.md section 6), over cancho's own TLS
+// client (`packages/tls`): no foreign call, no capability inside. A `Link` is a `Conn` and an engine of one slot.
+//
+//     let (link, status) = ssl.open(heap, conn, mode, server_name, entropy, pem, clock_unix_ms(clock));
+//     let (hello, s) = ssl.login(heap, link, user, secret, database, nonce);      // as pg.login
+//     let (reply, s) = ssl.simple(heap, link, "select 1");                       // extended, describing, prepare, run_named, request
+//     conn_close(ssl.close(heap, link));
+//
+// `mode` is `pg.sslmode_disable()` (no TLS: the `Conn` is read and written as `pg` does) or `pg.sslmode_verify_full()`:
+// SSLRequest, the server's one-byte answer, the TLS handshake with the server's chain verified to a root of `pem` (a PEM
+// bundle the program read), its name `server_name` (a DNS name or an IP literal, not necessarily the address dialled)
+// and its dates at `unix_ms`; then everything goes through the engine. A program has one code path for both modes.
+//
+// The program reads `entropy` (32 bytes of `/dev/urandom`) and `pem` with its own capabilities, narrowed to those files:
+// this module reads nothing, so `cancho authority` of a program says which files it trusts.
+//
+// Status codes are `pg`'s (`pg.status_tag` names them), plus 13 the server will not do TLS (answered `N`), 14 its answer
+// to SSLRequest was not one byte `S` or `N`, 15 the TLS handshake or a record failed (`failure` is the engine's code,
+// `reason` its tag: `x509-name-mismatch`, `x509-unknown-issuer` ...), 16 TLS could not start (a mode that is not offered,
+// entropy that is not 32 bytes, a trust store with no root, a server name empty or over 255 bytes).
+//
+// The engine is not independently reviewed (cancho #209).
+
+import std.buffer;
+import std.bytes;
+import pg;
+import tls;
+import tls_record;
+
+pub res struct Link {
+    conn: Conn,
+    eng: tls.Engine,
+    // [0] 1 once TLS is established, [1] the engine's refusal (0: none), [2] the mode, [3] ciphertext read and not yet fed:
+    // from, [4] to (in `net`)
+    st: Box[[int]],
+    net: Box[[byte]],
+}
+
+// Bytes read from the socket in one go.
+fn net_max() -> [] int {
+    return 4096;
+}
+
+// Ciphertext taken from the engine in one go: a whole record with room.
+fn out_max() -> [] int {
+    return 20480;
+}
+
+// Whether the link is TLS (established).
+pub fn secure[&l](link: &l Link) -> [] bool {
+    return contents(link.st)[0] == 1;
+}
+
+// The engine's refusal code when a status was 15 or 16 (0 if there was none): `tls.refusal_tag` names it.
+pub fn failure[&l](link: &l Link) -> [] int {
+    return contents(link.st)[1];
+}
+
+// The name of what `status` means on this link: the engine's tag for a TLS refusal that has one, else `pg.status_tag`.
+pub fn reason[&l](link: &l Link, status: int) -> [] &static [byte] {
+    let code = contents(link.st)[1];
+    if (status == 15 || status == 16) && code < 0 {
+        return tls.refusal_tag(code);
+    }
+    return pg.status_tag(status);
+}
+
+fn refuse[&l](link: &!l Link, status: int, code: int) -> [] int {
+    contents(link.st)[1] = code;
+    return status;
+}
+
+// ---------------------------------------------------------------------
+// Opening and closing
+// ---------------------------------------------------------------------
+
+// Take `conn` (connected, blocking, nothing sent on it yet) and, for `verify-full`, make it TLS. Answers the link and 0, or
+// a status: 1 the server closed, 3 a read failed, 6 a write failed, 13, 14, 15, 16 (above). The link is answered whatever
+// the status, and `close` gives the `Conn` back.
+pub fn open[&h, &n, &e, &p](heap: &!h Heap, conn: Conn, mode: int, server_name: &n [byte], entropy: &e [byte], pem: &p [byte], unix_ms: int) -> [heap] (Link, int) {
+    var link = Link { conn: conn, eng: tls.open(heap, 1), st: box_slice(heap, 8, 0), net: box_slice(heap, net_max(), byte_of(0)) };
+    var status = 0;
+    borrow mut link as &!lw in {
+        contents(lw.st)[2] = mode;
+        if mode != pg.sslmode_disable() {
+            status = negotiate(lw, mode, server_name, entropy, pem, unix_ms);
+        }
+    }
+    return (link, status);
+}
+
+fn negotiate[&l, &n, &e, &p](link: &!l Link, mode: int, server_name: &n [byte], entropy: &e [byte], pem: &p [byte], unix_ms: int) -> [conn_read, conn_write] int {
+    if mode != pg.sslmode_verify_full() || len(server_name) < 1 || len(server_name) > 255 {
+        return refuse(link, 16, 0);
+    }
+    let seeded = tls.seed(link.eng, entropy);
+    if seeded != 0 {
+        return refuse(link, 16, seeded);
+    }
+    let roots = tls.trust(link.eng, pem);
+    if roots < 1 {
+        var code = 0;
+        if roots < 0 {
+            code = roots;
+        }
+        return refuse(link, 16, code);
+    }
+    // TLS writes a record at a time: the client's Finished and the StartupMessage go out as two writes with no read between,
+    // and Nagle's algorithm would hold the second until the server's delayed acknowledgement of the first (40 ms on Linux).
+    conn_nodelay(link.conn);
+    var answer = 0;
+    region r {
+        let request = alloc_slice[r](8, byte_of(0));
+        let code = pg.ssl_request_code();
+        request[3] = byte_of(8);
+        request[4] = byte_of(code / 16777216 % 256);
+        request[5] = byte_of(code / 65536 % 256);
+        request[6] = byte_of(code / 256 % 256);
+        request[7] = byte_of(code % 256);
+        if !write_all(link.conn, request) {
+            answer = 6;
+        } else {
+            // More room than the one byte the server sends: a second byte in the same read is the CVE-2021-23222 shape.
+            let got = alloc_slice[r](16, byte_of(0));
+            match conn_read(link.conn, got) {
+                Received::Data(k) => {
+                    answer = pg.ssl_answer(got[0..k]);
+                }
+                Received::End => {
+                    answer = 1;
+                }
+                Received::Again => {
+                    answer = 2;
+                }
+                Received::Failed(e) => {
+                    answer = 3;
+                }
+            }
+        }
+    }
+    if answer != 0 {
+        return answer;
+    }
+    let started = tls.start(link.eng, 0, server_name, unix_ms);
+    if started != 0 {
+        return refuse(link, 15, started);
+    }
+    while true {
+        let fl = drain(link);
+        if fl != 0 {
+            return fl;
+        }
+        let ev = tls.event(link.eng, 0);
+        if ev == tls.event_established() {
+            contents(link.st)[0] = 1;
+            return 0;
+        }
+        if ev == tls.event_failed() {
+            return refuse(link, 15, tls.failure(link.eng, 0));
+        }
+        if ev == tls.event_closed() {
+            return refuse(link, 15, tls_record.peer_closed());
+        }
+        let got = fill(link);
+        if got == 1 {
+            // The socket ended in the middle of the handshake: the engine says how (`tls-peer-closed`, or an alert it had).
+            tls.eof(link.eng, 0);
+            var code = tls.failure(link.eng, 0);
+            if code == 0 {
+                code = tls_record.peer_closed();
+            }
+            return refuse(link, 15, code);
+        }
+        if got != 0 {
+            return got;
+        }
+    }
+    return 15;
+}
+
+// End the link: for TLS, close_notify, written as far as the kernel takes it; the engine's secrets are overwritten and it is
+// freed. Answers the `Conn`, for `conn_close` (send `pg.terminate` first for a clean end of the session).
+pub fn close[&h](heap: &!h Heap, link: Link) -> [heap, conn_write] Conn {
+    var l = link;
+    borrow mut l as &!lw in {
+        if contents(lw.st)[0] == 1 {
+            tls.finish(lw.eng, 0);
+            drain(lw);
+        }
+    }
+    let Link { conn, eng, st, net } = l;
+    tls.close(heap, eng);
+    unbox_slice(heap, st);
+    unbox_slice(heap, net);
+    return conn;
+}
+
+// ---------------------------------------------------------------------
+// Moving bytes
+// ---------------------------------------------------------------------
+
+fn write_all[&c, &b](conn: &!c Conn, bytes: &b [byte]) -> [conn_write] bool {
+    var at = 0;
+    while at < len(bytes) {
+        match conn_write(conn, bytes[at..len(bytes)]) {
+            Sent::Wrote(w) => {
+                at = at + w;
+            }
+            Sent::Again => {
+                return false;
+            }
+            Sent::Failed(e) => {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Write everything the engine has for the socket. 0, or 6.
+fn drain[&l](link: &!l Link) -> [conn_write] int {
+    var status = 0;
+    region r {
+        let out = alloc_slice[r](out_max(), byte_of(0));
+        var n = tls.take(link.eng, 0, out);
+        while n > 0 && status == 0 {
+            if !write_all(link.conn, out[0..n]) {
+                status = 6;
+            } else {
+                n = tls.take(link.eng, 0, out);
+            }
+        }
+    }
+    return status;
+}
+
+// Give the engine ciphertext: what an earlier read left over, else one read of the socket. 0 some was given (or the engine
+// failed on it: its `event` says so); 1 the socket ended; 2 it would block; 3 the read failed; 15 the engine took none of
+// it and has nothing to say, which a correct engine does not do (refused rather than loop).
+fn fill[&l](link: &!l Link) -> [conn_read] int {
+    let st = contents(link.st);
+    if st[3] < st[4] {
+        let c = tls.feed(link.eng, 0, contents(link.net)[st[3]..st[4]]);
+        if c < 0 {
+            st[3] = 0;
+            st[4] = 0;
+            return 0;
+        }
+        if c == 0 {
+            return refuse(link, 15, tls_record.too_many_messages());
+        }
+        st[3] = st[3] + c;
+        if st[3] >= st[4] {
+            st[3] = 0;
+            st[4] = 0;
+        }
+        return 0;
+    }
+    match conn_read(link.conn, contents(link.net)) {
+        Received::Data(k) => {
+            let c = tls.feed(link.eng, 0, contents(link.net)[0..k]);
+            if c >= 0 && c < k {
+                st[3] = c;
+                st[4] = k;
+            }
+            return 0;
+        }
+        Received::End => {
+            return 1;
+        }
+        Received::Again => {
+            return 2;
+        }
+        Received::Failed(e) => {
+            return 3;
+        }
+    }
+}
+
+// Send all of `bytes`: through the engine, a record at a time, or straight to the socket. 0, 6 a write failed, 15 the engine
+// refused (`failure`).
+fn put[&l, &b](link: &!l Link, bytes: &b [byte]) -> [conn_write] int {
+    if contents(link.st)[0] != 1 {
+        if write_all(link.conn, bytes) {
+            return 0;
+        }
+        return 6;
+    }
+    var at = 0;
+    while at < len(bytes) {
+        let n = tls.send(link.eng, 0, bytes[at..len(bytes)]);
+        if n < 0 {
+            return refuse(link, 15, n);
+        }
+        let fl = drain(link);
+        if fl != 0 {
+            return fl;
+        }
+        if n == 0 && tls.send(link.eng, 0, bytes[at..at]) < 0 {
+            return refuse(link, 15, tls.failure(link.eng, 0));
+        }
+        at = at + n;
+    }
+    return 0;
+}
+
+// Write all of `bytes`; false if the connection failed (as `pg.send`).
+pub fn send[&l, &b](link: &!l Link, bytes: &b [byte]) -> [conn_write] bool {
+    return put(link, bytes) == 0;
+}
+
+// Plaintext into `into`: the count (more than 0), or the negative of a status: -1 the server closed (for TLS: its
+// close_notify, or the socket ended without one), -2 would block, -3 a read failed, -15 the engine refused.
+fn take_in[&l, &i](link: &!l Link, into: &!i [byte]) -> [conn_read, conn_write] int {
+    if contents(link.st)[0] != 1 {
+        match conn_read(link.conn, into) {
+            Received::Data(k) => {
+                return k;
+            }
+            Received::End => {
+                return 0 - 1;
+            }
+            Received::Again => {
+                return 0 - 2;
+            }
+            Received::Failed(e) => {
+                return 0 - 3;
+            }
+        }
+    }
+    while true {
+        let n = tls.recv(link.eng, 0, into);
+        if n > 0 {
+            return n;
+        }
+        if n == 0 {
+            return 0 - 1;
+        }
+        if n != tls.would_block() {
+            if n == tls_record.peer_closed() {
+                return 0 - 1;
+            }
+            refuse(link, 15, n);
+            return 0 - 15;
+        }
+        // The engine may have something to answer (a KeyUpdate): write it before waiting for more.
+        let fl = drain(link);
+        if fl != 0 {
+            return 0 - 3;
+        }
+        let got = fill(link);
+        if got == 1 {
+            // The end of the socket: after close_notify the next `recv` says 0; before it, `tls-peer-closed`.
+            tls.eof(link.eng, 0);
+        } else if got != 0 {
+            return 0 - got;
+        }
+    }
+    return 0 - 3;
+}
+
+// Read into `acc` until it holds a ReadyForQuery (as `pg`'s `read_until`, over the link).
+fn read_until[&h, &l](heap: &!h Heap, link: &!l Link, acc: buffer.Buffer, login: bool) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    var a = acc;
+    var scanned = 0;
+    var done = false;
+    var status = 0;
+    while !done {
+        borrow a as &ar in {
+            let m = buffer.bytes(ar);
+            while pg.size(m, scanned) > 0 && !done {
+                let k = pg.kind(m, scanned);
+                if k == 90 {
+                    done = true;
+                }
+                if login && k == 69 {
+                    done = true;
+                }
+                if login && k == 82 && pg.auth_code(m, scanned) != 0 {
+                    done = true;
+                }
+                scanned = scanned + pg.size(m, scanned);
+            }
+        }
+        if !done {
+            region r {
+                var buf = alloc_slice[r](4096, byte_of(0));
+                let n = take_in(link, buf);
+                if n > 0 {
+                    a = buffer.append(heap, a, buf[0..n]);
+                } else {
+                    status = 0 - n;
+                    done = true;
+                }
+            }
+        }
+    }
+    return (a, status);
+}
+
+// Read the server's answer to what was just sent: everything up to ReadyForQuery (as `pg.receive`).
+pub fn receive[&h, &l](heap: &!h Heap, link: &!l Link) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    return read_until(heap, link, buffer.empty(heap, 256), false);
+}
+
+// Send `message` (consumed) and read the reply up to ReadyForQuery: any request, such as what a `pgen` module's
+// `<name>_start` builds.
+fn exchange[&h, &l](heap: &!h Heap, link: &!l Link, message: buffer.Buffer) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    var sent = 0;
+    borrow message as &mb in {
+        sent = put(link, buffer.bytes(mb));
+    }
+    buffer.drop(heap, message);
+    if sent != 0 {
+        return (buffer.empty(heap, 8), sent);
+    }
+    return receive(heap, link);
+}
+
+// Send the bytes of a request (one or more messages ending in Sync, as `pg.bind_named` or a `pgen` module's
+// `<name>_start` builds them) and read the reply up to ReadyForQuery.
+pub fn request[&h, &l, &b](heap: &!h Heap, link: &!l Link, bytes: &b [byte]) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    let sent = put(link, bytes);
+    if sent != 0 {
+        return (buffer.empty(heap, 8), sent);
+    }
+    return receive(heap, link);
+}
+
+// ---------------------------------------------------------------------
+// The login and the queries (as `pg`'s, over the link)
+// ---------------------------------------------------------------------
+
+// `pg.login` over the link: startup, whatever authentication the server asks (trust, cleartext, SCRAM-SHA-256), up to
+// ReadyForQuery. The decisions are `pg`'s (`login_asks`, `scram_challenge`, `scram_verdict`); only the transport is this.
+pub fn login[&h, &l, &u, &s, &d, &n](heap: &!h Heap, link: &!l Link, user: &u [byte], secret: &s [byte], database: &d [byte], nonce: &n [byte]) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    let hello = pg.startup(heap, user, database);
+    var sent = 0;
+    borrow hello as &hb in {
+        sent = put(link, buffer.bytes(hb));
+    }
+    buffer.drop(heap, hello);
+    if sent != 0 {
+        return (buffer.empty(heap, 8), sent);
+    }
+    let (first, s1) = read_until(heap, link, buffer.empty(heap, 256), true);
+    if s1 != 0 {
+        return (first, s1);
+    }
+    var asked = 0;
+    borrow first as &fb in {
+        asked = pg.login_asks(buffer.bytes(fb));
+    }
+    if asked == 4 || asked == 5 {
+        return (first, asked);
+    }
+    if asked == 0 {
+        return (first, 0);
+    }
+    if asked == 10 {
+        if len(nonce) == 0 {
+            return (first, 7);
+        }
+        return scram_login(heap, link, secret, nonce, first);
+    }
+    buffer.drop(heap, first);
+    let reply = pg.password(heap, secret);
+    var put_ok = 0;
+    borrow reply as &rb in {
+        put_ok = put(link, buffer.bytes(rb));
+    }
+    buffer.drop(heap, reply);
+    if put_ok != 0 {
+        return (buffer.empty(heap, 8), put_ok);
+    }
+    let (second, s2) = read_until(heap, link, buffer.empty(heap, 256), true);
+    if s2 != 0 {
+        return (second, s2);
+    }
+    var bad = false;
+    borrow second as &sb in {
+        bad = pg.failure(buffer.bytes(sb)) >= 0;
+    }
+    if bad {
+        return (second, 4);
+    }
+    return (second, 0);
+}
+
+fn scram_login[&h, &l, &s, &n](heap: &!h Heap, link: &!l Link, secret: &s [byte], nonce: &n [byte], first: buffer.Buffer) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    buffer.drop(heap, first);
+    var sent = 0;
+    let msg = pg.scram_client_first(heap, "", nonce);
+    borrow msg as &mr in {
+        let m = pg.sasl_initial(heap, buffer.bytes(mr));
+        borrow m as &mb in {
+            sent = put(link, buffer.bytes(mb));
+        }
+        buffer.drop(heap, m);
+    }
+    buffer.drop(heap, msg);
+    if sent != 0 {
+        return (buffer.empty(heap, 8), sent);
+    }
+    let (second, s2) = read_until(heap, link, buffer.empty(heap, 256), true);
+    if s2 != 0 {
+        return (second, s2);
+    }
+    var challenge_from = 0 - 1;
+    var challenge_to = 0 - 1;
+    borrow second as &sr in {
+        let (f, t) = pg.scram_challenge(buffer.bytes(sr));
+        challenge_from = f;
+        challenge_to = t;
+    }
+    if challenge_from < 0 {
+        return (second, 0 - challenge_from);
+    }
+    var final = buffer.empty(heap, 8);
+    var expected = buffer.empty(heap, 8);
+    var st = 0;
+    borrow second as &sr in {
+        let (f, e, status) = pg.scram_client_final(heap, secret, "", nonce, buffer.bytes(sr)[challenge_from..challenge_to]);
+        buffer.drop(heap, final);
+        final = f;
+        buffer.drop(heap, expected);
+        expected = e;
+        st = status;
+    }
+    buffer.drop(heap, second);
+    if st != 0 {
+        buffer.drop(heap, final);
+        buffer.drop(heap, expected);
+        return (buffer.empty(heap, 8), 7);
+    }
+    var out = 0;
+    borrow final as &fr in {
+        let m = pg.sasl_response(heap, buffer.bytes(fr));
+        borrow m as &mb in {
+            out = put(link, buffer.bytes(mb));
+        }
+        buffer.drop(heap, m);
+    }
+    buffer.drop(heap, final);
+    if out != 0 {
+        buffer.drop(heap, expected);
+        return (buffer.empty(heap, 8), out);
+    }
+    let (third, s3) = read_until(heap, link, buffer.empty(heap, 256), true);
+    if s3 != 0 {
+        buffer.drop(heap, expected);
+        return (third, s3);
+    }
+    var verdict = 7;
+    borrow third as &tr in {
+        borrow expected as &er in {
+            verdict = pg.scram_verdict(buffer.bytes(tr), buffer.bytes(er));
+        }
+    }
+    buffer.drop(heap, expected);
+    if verdict != 0 {
+        return (third, verdict);
+    }
+    return read_until(heap, link, third, false);
+}
+
+// One simple-protocol query (as `pg.simple`).
+pub fn simple[&h, &l, &s](heap: &!h Heap, link: &!l Link, sql: &s [byte]) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    return exchange(heap, link, pg.query(heap, sql));
+}
+
+// The types of a statement's parameters and columns (as `pg.describing`).
+pub fn describing[&h, &l, &s](heap: &!h Heap, link: &!l Link, sql: &s [byte]) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    return exchange(heap, link, pg.describe(heap, sql));
+}
+
+// One extended-protocol query with parameters (as `pg.extended`).
+pub fn extended[&h, &l, &s, &p](heap: &!h Heap, link: &!l Link, sql: &s [byte], ps: &p pg.Params) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    return exchange(heap, link, pg.execute(heap, sql, ps));
+}
+
+// Prepare `sql` as `name` on this connection (as `pg.prepare`).
+pub fn prepare[&h, &l, &n, &s](heap: &!h Heap, link: &!l Link, name: &n [byte], sql: &s [byte]) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    return exchange(heap, link, pg.parse_named(heap, name, sql));
+}
+
+// `prepare`, only if the step before it went well (as `pg.prepare_after`).
+pub fn prepare_after[&h, &l, &n, &s](heap: &!h Heap, link: &!l Link, reply: buffer.Buffer, status: int, name: &n [byte], sql: &s [byte]) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    var failed = status != 0;
+    borrow reply as &rr in {
+        if pg.failure(buffer.bytes(rr)) >= 0 {
+            failed = true;
+        }
+    }
+    if failed {
+        return (reply, status);
+    }
+    buffer.drop(heap, reply);
+    return prepare(heap, link, name, sql);
+}
+
+// Run the statement prepared as `name` with `ps` (as `pg.run_named`).
+pub fn run_named[&h, &l, &n, &p](heap: &!h Heap, link: &!l Link, name: &n [byte], ps: &p pg.Params) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    return exchange(heap, link, pg.bind_named(heap, name, ps));
+}
+
+// Prepare every statement of a script (`pool.statement`, or a `pgen` module's `prepare_script`): `count` Parse and Sync
+// pairs, sent at once, and their `count` replies read. Answers the reply of the first refusal (`pg.failure(reply) >= 0`)
+// or of the last statement, and a status: nothing should be run unless both are clean.
+pub fn prepare_script[&h, &l, &s](heap: &!h Heap, link: &!l Link, script: &s [byte], count: int) -> [heap, conn_read, conn_write] (buffer.Buffer, int) {
+    let sent = put(link, script);
+    if sent != 0 {
+        return (buffer.empty(heap, 8), sent);
+    }
+    var last = buffer.empty(heap, 8);
+    var status = 0;
+    var refused = false;
+    var k = 0;
+    while k < count && status == 0 {
+        let (reply, s) = receive(heap, link);
+        var bad = false;
+        borrow reply as &rr in {
+            bad = pg.failure(buffer.bytes(rr)) >= 0;
+        }
+        if refused {
+            buffer.drop(heap, reply);
+        } else {
+            buffer.drop(heap, last);
+            last = reply;
+            refused = bad;
+        }
+        status = s;
+        k = k + 1;
+    }
+    return (last, status);
+}

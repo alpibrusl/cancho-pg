@@ -1,0 +1,22 @@
+{
+  "store": "",
+  "lock": {
+    "origin": {
+      "git": "https://github.com/alpibrusl/cancho",
+      "rev": "a4572ea3b506e4bcec1c4be43deda1043c11ba9f",
+      "path": "packages/tls/.cancho-vcs/tls_record"
+    },
+    "entries": {
+      "peer_closed": {
+        "sig_id": "fd3443b16b96404a91adef51cba56fcb7ff33dc6a2f2c116fd97a39a68b56483",
+        "stage_id": "597ebeef25788f006f779df5f8f63d7e4fb9660ade1cf9576c38e038a7250921",
+        "source_hash": "3f1047f1e34a34a374bf6136b846446edfb41fe6508e9f10ee3c597511f17e89"
+      },
+      "too_many_messages": {
+        "sig_id": "9d584653cfe9c8ebef69c262922c60740797f158f33ec2b708f92d37561a66d2",
+        "stage_id": "4892272a321809229da8769acec849b2915a4bf707488c0e03cbd171bd948b82",
+        "source_hash": "3f1047f1e34a34a374bf6136b846446edfb41fe6508e9f10ee3c597511f17e89"
+      }
+    }
+  }
+}

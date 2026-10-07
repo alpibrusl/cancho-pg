@@ -1,0 +1,102 @@
+{
+  "store": "",
+  "lock": {
+    "origin": {
+      "git": "https://github.com/alpibrusl/cancho",
+      "rev": "a4572ea3b506e4bcec1c4be43deda1043c11ba9f",
+      "path": "packages/tls/.cancho-vcs/tls"
+    },
+    "entries": {
+      "close": {
+        "sig_id": "0d975e90c8296c4258a253487f19b330041a428b766173d0659a91c73dadf2ad",
+        "stage_id": "29d4a6e55ef9148aa26db7f1804c3431af815f21a6ead32cfba03e246df6bea2",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      },
+      "eof": {
+        "sig_id": "44e0b4f97ef5ebcec5d6b89f1057e30f915787be223af40b0e1b79579d6daf25",
+        "stage_id": "efb7e9d1b403053a236d5489fd6256dedca2e64a5753b8fbaa01310827645aab",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      },
+      "event": {
+        "sig_id": "c6884fe222d6291997991673fe31226bebe9f35044175a1a365fa3a1db48d839",
+        "stage_id": "af5270ec4fe4410e6029cbfeaaf61abc5b0cf6a21a3d430e6015cb6918a01156",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      },
+      "event_closed": {
+        "sig_id": "4e818dfadcf6a789c003b8031aa12c53a521f523020fc26daf9a0f0e167df89d",
+        "stage_id": "310195b34605a19fca708e9714694cc412d7b41e104b3ede960f792224c31d42",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      },
+      "event_established": {
+        "sig_id": "4c040b0107b976d1d4b406d84895be92cb11c327ebbe816f9d726cc5a064aa13",
+        "stage_id": "c3972718a3a60706af363993a1fb8bff25228d7d3629a46181c1fe44aca95914",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      },
+      "event_failed": {
+        "sig_id": "cbfbf714a9395d9a0f5e7eb268620c194f28ea3c05c556562d06328818c40c73",
+        "stage_id": "25112f74945e92d0c44262677622d5405db8da56e48ead68954dd9c670a7675e",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      },
+      "failure": {
+        "sig_id": "70cde32e09f4079bdb722e99d5eb065463b22a3d139fc5883ba6d63c583e0187",
+        "stage_id": "4454ad3d33d4f44e56aca7c1513efbd0f0311597f3a043436431765e96ed3895",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      },
+      "feed": {
+        "sig_id": "fef051ed4a017cb602447c0eaa030d5acfecaebfbe0d526c7a55163246d2e93f",
+        "stage_id": "d111c900f79b3a2b66933e8ea6c6569d8601115240544cee8932b0dd6f7802df",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      },
+      "finish": {
+        "sig_id": "db346ee92e270c7af31ff43a272463f7596f22e7ce22eb385bb537874eb01c9d",
+        "stage_id": "aa138295e099f68280d4fae7ee6202f0157e80c8b554b8314915f02d3b428bec",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      },
+      "open": {
+        "sig_id": "def0a21789ec8e62831a2fc716f3d4c09b9b02f73616252585a50932ddb601de",
+        "stage_id": "fef75c9b02274067da4bf9e0238e760f53c4e0d9ca91f02a01b9970734ad0df6",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      },
+      "recv": {
+        "sig_id": "9ce77363aa7f828b174155cf42179cfe7e36ac9ee5939219943585d82d31bbba",
+        "stage_id": "655d53f56ec9e92054798b38db845a0b65b27fb5c9160849f5c7b3dc38986305",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      },
+      "refusal_tag": {
+        "sig_id": "8c7a2c001187df8666d89c695601d6b37f75a4e86c777047c1f25f926a6865ef",
+        "stage_id": "65d1f9df55e515d67da2abb47d414fdbd6907ce817fcd107baa557cea53686fa",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      },
+      "seed": {
+        "sig_id": "060a9842761dea03ad56a71cf94d36c3bff4a2cd02b61af3d37d0c46954638d6",
+        "stage_id": "9339f68fade8b1af17395ffff7e5141620eb1c2440c68d951fbea4c79e7b8fe3",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      },
+      "send": {
+        "sig_id": "a3625d37a882652e00eb8f7aabd972d945c20645c65c7c27e12978e6f28ea865",
+        "stage_id": "e44cbec29a9f410685c2a8a2cbd25fc9abaddf55cb1f02ad425b8fdeeb8f4640",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      },
+      "start": {
+        "sig_id": "9213b5066c9272cf685b7d0d5fee49c8e2dea56f2414ba90a2e1f3cdc6481c28",
+        "stage_id": "be5458b9c40bc873f0d83c93caabe20a34b3130e6b3daa0dca8187ac0cb5102d",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      },
+      "take": {
+        "sig_id": "3e81038c0e22aac71b48b8999907b7499aceeefad44c4b2ab21eeb7ddd35d800",
+        "stage_id": "24b8164d202348036b7250b91e6679ca21fcaf832e9d922486686f3e897d9200",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      },
+      "trust": {
+        "sig_id": "54deb1eb8524096469c9bf73f3a1cb1d9dbca18dba3ade2dfd7d42a21d0cea15",
+        "stage_id": "6858c6c31b896d49ef070e3ec4e8498bbdf3eb9b920c00e6ab3adcbb2fe521cd",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      },
+      "would_block": {
+        "sig_id": "4db013a13cd88907c1aae42fe92de87bac8d132b0d3aed5dc2502dbc675ecba3",
+        "stage_id": "f66088e86b727f72ad0816a25f9237ff727984affacedb12ea52619fedd3006e",
+        "source_hash": "35975df7fcd6ffdd46fbc92bdbac449baeb0248ab95981a6453fa89fc15b2b1e"
+      }
+    }
+  }
+}

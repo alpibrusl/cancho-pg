@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Single-edit mutants of src/pool.cho and src/pg.cho: each one must make a test fail.
+"""Single-edit mutants of src/pool.cho, src/pg.cho and src/ssl.cho: each one must make a test fail.
 
-    CANCHO=... PGHOST=... python3 tests/mutants.py [name ...]      (default: all; the server env of tests/e2e.py)
+    CANCHO=... PGHOST=... python3 tests/mutants.py [--tls] [name ...]      (default: all; the server env of tests/e2e.py)
 
 For each mutant: save the file, make the edit, run the unit tests (no server) and then tests/reconnect_test.py until the first
 failure, restore the file from the saved copy and check with `cmp` that it is the same bytes. Prints one line per mutant
@@ -19,6 +19,7 @@ LEX = os.environ.get("CANCHO", "cancho")
 
 POOL = "src/pool.cho"
 PG = "src/pg.cho"
+SSL = "src/ssl.cho"
 
 # (name, file, old text, new text)
 MUTANTS = [
@@ -47,11 +48,42 @@ MUTANTS = [
     ("a refused login is called a protocol error", POOL, "                code = 4;\n                if st[p + 11] == ph_setup() {", "                code = 10;\n                if st[p + 11] == ph_setup() {"),
     ("a pool is made before the loop has started it", POOL, "if contents(core.ci)[0] != 1 || core.base < 0 {", "if contents(core.ci)[0] != 1 {"),
     ("a longest wait below the first is accepted", POOL, "max_ms < min_ms ||", "max_ms < min_ms - 1 ||"),
-    ("a connection lost for a request timeout is not a lost status", POOL, "|| status == 11 || status == 12;", "|| status == 11;"),
+    ("a connection lost for a request timeout is not a lost status", POOL, "|| status == 11 || status == 12 || status == 15;", "|| status == 11 || status == 15;"),
     ("a SCRAM challenge of any size is accepted", PG, "    if iterations < 1 || iterations > 1000000 {\n        return (0, 4);", "    if iterations < 1 || iterations > 100000000 {\n        return (0, 4);"),
     ("a SCRAM nonce that does not extend ours is accepted", PG, "    if len(full) <= len(nonce) || !bytes.starts_with(full, nonce) {\n        return (0, 2);", "    if len(full) <= len(nonce) {\n        return (0, 2);"),
     ("PBKDF2 in pieces xors with an or", PG, "state[32 + j] = byte_of(int_of(state[32 + j]) ^ int_of(nb[j]));", "state[32 + j] = byte_of(int_of(state[32 + j]) | int_of(nb[j]));"),
     ("PBKDF2 in pieces starts from nothing", PG, "            state[32 + j] = ub[j];\n", "            state[32 + j] = byte_of(0);\n"),
+]
+
+# TLS (docs/tls.md section 10): the negotiation, the pool's TLS lanes and the blocking link. Run against the unit suites and
+# tests/tls_test.py (the server of tests/postgres.sh, TLS on).
+TLS_MUTANTS = [
+    ("bytes after the S are accepted", PG, "    if len(m) == 1 && int_of(m[0]) == 83 {", "    if int_of(m[0]) == 83 {"),
+    ("an N is taken for an S", PG, "        return 13;\n    }\n    return 14;", "        return 0;\n    }\n    return 14;"),
+    ("the names of two statuses are swapped", PG, '        return "pg-ssl-not-offered";', '        return "pg-ssl-bad-answer";'),
+    ("a disabled link sends SSLRequest", SSL, "        if mode != pg.sslmode_disable() {", "        if true {"),
+    ("the link reads the answer a byte at a time", SSL, "let got = alloc_slice[r](16, byte_of(0));", "let got = alloc_slice[r](1, byte_of(0));"),
+    ("the link verifies a name of its own", SSL, "let started = tls.start(link.eng, 0, server_name, unix_ms);", 'let started = tls.start(link.eng, 0, "localhost", unix_ms);'),
+    ("the link keeps no engine code", SSL, "    contents(link.st)[1] = code;", "    contents(link.st)[1] = 0;"),
+    ("a secure link writes in the clear", SSL, "    if contents(link.st)[0] != 1 {\n        if write_all(link.conn, bytes) {", "    if true {\n        if write_all(link.conn, bytes) {"),
+    ("a secure link reads in the clear", SSL, "    if contents(link.st)[0] != 1 {\n        match conn_read(link.conn, into) {", "    if true {\n        match conn_read(link.conn, into) {"),
+    ("a live TLS failure is not lost", POOL, "|| status == 12 || status == 15;", "|| status == 12;"),
+    ("a secure pool accepts a bundle with no root", POOL, "            if roots > 0 {\n                n[27] = 1;", "            if roots >= 0 {\n                n[27] = 1;"),
+    ("the pool's wall clock has the wrong sign", POOL, "                n[28] = unix_ms - now_ms;", "                n[28] = now_ms - unix_ms;"),
+    ("the pool checks certificates at the monotonic time", POOL, "let started = tls.start(core.eng, k, name, now + ci[28]);", "let started = tls.start(core.eng, k, name, now);"),
+    ("the pool verifies a name of its own", POOL, "let started = tls.start(core.eng, k, name, now + ci[28]);", 'let started = tls.start(core.eng, k, "localhost", now + ci[28]);'),
+    ("the pool sends the wrong request code", POOL, "            q[ob + 7] = byte_of(code % 256);", "            q[ob + 7] = byte_of((code + 1) % 256);"),
+    ("the handshake begins before the answer is read", POOL, "            st[p + 11] = ph_ssl_answer();", "            st[p + 11] = ph_tls_start();"),
+    ("the answer is left in the input", POOL, "                        st[p] = 0;\n                        st[p + 1] = 0;\n                        st[p + 11] = ph_tls_start();", "                        st[p + 1] = 0;\n                        st[p + 11] = ph_tls_start();"),
+    ("the handshake's end does not switch the lane to the engine", POOL, "            st[p + 31] = 1;\n            st[p + 11] = ph_startup();", "            st[p + 11] = ph_startup();"),
+    ("a lane's slot is not dropped when its connection ends", POOL, "    if st[p + 25] == 1 {\n        tls.drop(core.eng, k);", "    if st[p + 25] == 1 {\n        tls.failure(core.eng, k);"),
+    ("what the engine holds is never drained", POOL, "            if st[p + 30] == 1 && st[p] < core.in_cap {\n                // TLS: what the engine held when the input was full, now", "            if false {\n                // TLS: what the engine held when the input was full, now"),
+    ("the loop is not woken for what the engine holds", POOL, "        if (st[p + 6] == 1 || st[p + 6] == 3) && st[p + 30] == 1 && st[p] < core.in_cap {", "        if false {"),
+    ("a record that does not authenticate is ignored", POOL, "            ci[29] = n;\n            return 15;\n        } else {\n            st[p + 30] = 0;", "            ci[29] = n;\n            return 0;\n        } else {\n            st[p + 30] = 0;"),
+    ("ciphertext the kernel did not take is not watched for", POOL, "if st[p + 4] == st[p + 3] && st[p + 26] == st[p + 27] {", "if st[p + 4] == st[p + 3] {"),
+    ("a secure pool accepts a connection from add", POOL, "        if contents(cr.ci)[27] == 1 {\n            k = cr.lanes;", "        if false {\n            k = cr.lanes;"),
+    ("answers that tick completed do not wake the loop", POOL, "    if ci[31] == 1 {\n        return 0;\n    }\n    var best", "    var best"),
+    ("a failed handshake is not a failed attempt", POOL, "        if shaken != 0 {\n            fail_attempt(tab, core, k, shaken);", "        if false {\n            fail_attempt(tab, core, k, shaken);"),
 ]
 
 
@@ -59,20 +91,32 @@ def run(cmd, **kw):
     return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, **kw)
 
 
-def suites():
+def deps():
+    d = os.path.join(ROOT, "build", "deps")
+    return sorted(os.path.join("build", "deps", f) for f in os.listdir(d) if f.endswith(".cho"))
+
+
+def suites(tls=False):
     """The suites, in the order a mutant is most likely to fail them. Yields (name, command)."""
     yield "pg_test", [LEX, "test", "tests/pg_test.cho", "src/pg.cho", "--std"]
-    yield "pool_test", [LEX, "test", "tests/pool_test.cho", "src/pool.cho", "src/pg.cho", "tests/generated/queries.cho", "--std"]
+    yield "pool_test", [LEX, "test", "tests/pool_test.cho", "src/pool.cho", "src/pg.cho", "tests/generated/queries.cho", *deps(), "--std"]
+    if tls:
+        yield "tls_test", [sys.executable, "tests/tls_test.py", "-f"]
+        return
     yield "scram_test", [LEX, "test", "tests/scram_test.cho", "pooler/scram.cho", "src/pg.cho", "--std"]
     yield "reconnect_test", [sys.executable, "tests/reconnect_test.py", "-f"]
 
 
 def main():
-    wanted = sys.argv[1:]
+    # `--tls`: only the TLS mutants (each runs tests/tls_test.py, which needs the TLS server of tests/postgres.sh)
+    only_tls = "--tls" in sys.argv[1:]
+    wanted = [a for a in sys.argv[1:] if a != "--tls"]
     killed, survived = 0, []
     scratch = tempfile.mkdtemp()
-    for name, rel, old, new in MUTANTS:
+    for name, rel, old, new, tls in [m + (False,) for m in MUTANTS] + [m + (True,) for m in TLS_MUTANTS]:
         if wanted and not any(w in name for w in wanted):
+            continue
+        if only_tls and not tls:
             continue
         path = os.path.join(ROOT, rel)
         saved = os.path.join(scratch, os.path.basename(rel))
@@ -85,7 +129,7 @@ def main():
             with open(path, "w") as f:
                 f.write(text.replace(old, new))
             verdict = "SURVIVED"
-            for suite, cmd in suites():
+            for suite, cmd in suites(tls):
                 p = run(cmd, timeout=900)
                 if p.returncode != 0:
                     out = p.stdout + p.stderr

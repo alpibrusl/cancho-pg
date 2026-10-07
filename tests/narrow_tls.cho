@@ -1,0 +1,99 @@
+edition 5;
+
+import std.buffer;
+import pg;
+import pg.pool;
+
+// `narrow_use.cho` with a secure pool (docs/tls.md section 9): the network narrowed to one host and port, the files to
+// `/dev/urandom` (the engine's entropy), and the trust store read from standard input. (An `Fs` is narrowed once, so a program
+// that reads both `/dev/urandom` and a CA file elsewhere holds the prefix common to both, `fs_read("")`: docs/tls.md
+// section 11.) `tests/tls_test.py` asks `cancho authority` about it: nothing foreign, the network that one `host:port`, the
+// one file. It does nothing useful when run.
+
+fn dial_some[&h, &n, &p](heap: &!h Heap, pl: pool.Pool, net: &n Net("127.0.0.1:5432"), poller: &!p Poller, now: int) -> [heap, net_out("127.0.0.1:5432"), conn_write, poll] pool.Pool {
+    var pool_now = pl;
+    var want = 0;
+    borrow mut pool_now as &!w in {
+        want = pool.tick(heap, w, poller, now);
+    }
+    while want > 0 {
+        match tcp_connect_start(net, "127.0.0.1", 5432) {
+            Dialed::Ok(c) => {
+                let (grown, lane) = pool.adopt(heap, pool_now, poller, now, c);
+                pool_now = grown;
+            }
+            Dialed::Failed(e) => {
+                borrow mut pool_now as &!w in {
+                    pool.dial_failed(w, now, e);
+                }
+            }
+        }
+        want = want - 1;
+    }
+    return pool_now;
+}
+
+fn secured[&h, &r, &i, &k](heap: &!h Heap, rng: &r Fs("/dev/urandom"), io: &!i Io, clock: &k Clock) -> [heap, fs_read("/dev/urandom"), io_read, clock] pool.Pool {
+    var pl = pool.empty(heap, 1, 4, 4096, 4096);
+    var entropy = box_slice(heap, 32, byte_of(0));
+    borrow mut entropy as &!ew in {
+        let got = fs_read(rng, "/dev/urandom", contents(ew));
+    }
+    var pem = buffer.empty(heap, 4096);
+    var c = getchar(io);
+    while c >= 0 {
+        pem = buffer.push(heap, pem, byte_of(c));
+        c = getchar(io);
+    }
+    borrow entropy as &er in {
+        borrow pem as &pr in {
+            let (made, roots) = pool.secure(heap, pl, "db.internal", contents(er), buffer.bytes(pr), clock_unix_ms(clock), clock_ms(clock));
+            pl = made;
+        }
+    }
+    unbox_slice(heap, entropy);
+    buffer.drop(heap, pem);
+    return pl;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock } = split(world);
+    release(ffi);
+    let rng = narrow(fs, "/dev/urandom");
+    let db = narrow(net, "127.0.0.1:5432");
+    var status = 1;
+    match poller_new() {
+        Polling::Ok(po) => {
+            var poller = po;
+            borrow mut heap as &!h in {
+                var pl = pool.empty(h, 1, 4, 4096, 4096);
+                pool.close(h, pl);
+                borrow rng as &r in {
+                    borrow mut io as &!i in {
+                        borrow clock as &k in {
+                            pl = secured(h, r, i, k);
+                        }
+                    }
+                }
+                borrow db as &n in {
+                    borrow mut poller as &!pw in {
+                        pl = dial_some(h, pl, n, pw, 0);
+                    }
+                }
+                status = 0;
+                pool.close(h, pl);
+            }
+            poller_close(poller);
+        }
+        Polling::Failed(e) => {
+            status = 2;
+        }
+    }
+    release(rng);
+    release(db);
+    release(clock);
+    release(args);
+    release(io);
+    release(heap);
+    return status;
+}
