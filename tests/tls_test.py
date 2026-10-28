@@ -790,7 +790,9 @@ class Authority(unittest.TestCase):
 
     def test_the_blocking_client_holds_nothing_foreign(self):
         d = self.report(os.path.join(ROOT, "examples", "psql_tls.cho"), os.path.join(ROOT, "src", "ssl.cho"), os.path.join(ROOT, "src", "pg.cho"))
-        self.assertTrue(d["bounded"])
+        # The client dials the host and port it is given on its command line, so the network it holds is not narrowed to a literal and
+        # the report (docs/net-bounds.md) says so: `net_out("")` is the one thing unbounded, and nothing is foreign.
+        self.assertEqual(d["unbounded_by"], ['net_out("")'])
         self.assertEqual(d["foreign_symbols"], [])
         self.assertFalse(any(x["name"].startswith("ffi") for x in d["labels"]))
 
