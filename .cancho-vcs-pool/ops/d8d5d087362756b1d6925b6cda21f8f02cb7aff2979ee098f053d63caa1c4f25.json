@@ -1,0 +1,14 @@
+{
+  "op_id": "d8d5d087362756b1d6925b6cda21f8f02cb7aff2979ee098f053d63caa1c4f25",
+  "operation": {
+    "kind": "AddFunction",
+    "sig_id": "4c858d827b8066559860dd401c155afffa7352802e8c33c54d5ea109799b394f",
+    "stage_id": "da03e6f76238e4bf3e00c6235a3e6330620701952b495a50d003c73d7efe9375",
+    "effects": [
+      "conn_read",
+      "conn_write",
+      "poll"
+    ],
+    "edition": 1
+  }
+}
