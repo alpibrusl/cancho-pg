@@ -9,7 +9,7 @@ env:
   # The compiler these sources are built and tested with. A package store records no hash
   # of the `std` it was published against, so the revision is part of the contract. It is
   # also `[package] cancho` in cancho.toml (checked below), and it has packages/tls (docs/tls.md).
-  CANCHO_REV: f4ead824f33b291a0ad7620a34a0c1346a7abe4f
+  CANCHO_REV: 471b8e9334e021123286db4b1cb9feaeba2677c5
 
 jobs:
   test:
@@ -35,7 +35,7 @@ jobs:
       - name: Build cancho
         if: steps.compiler.outputs.cache-hit != 'true'
         working-directory: cancho
-        run: cargo build --release -p cancho
+        run: scripts/install.sh "$(git rev-parse HEAD)" "$RUNNER_TEMP/cancho-release" && mkdir -p target/release && cp "$RUNNER_TEMP/cancho-release/bin/cancho" target/release/cancho
 
       - name: The reference client
         run: which psql || (sudo apt-get update -q && sudo apt-get install -y -q postgresql-client)

@@ -5,10 +5,10 @@
 
 [package]
 name = "pg"
-cancho = "f4ead824f33b291a0ad7620a34a0c1346a7abe4f"
+cancho = "471b8e9334e021123286db4b1cb9feaeba2677c5"
 
 # cancho's own TLS client (packages/tls, cancho epic #197) and the certificate verifier it requires (docs/tls.md).
 [dependencies.tls]
 git = "https://github.com/alpibrusl/cancho"
-rev = "f4ead824f33b291a0ad7620a34a0c1346a7abe4f"
+rev = "471b8e9334e021123286db4b1cb9feaeba2677c5"
 path = "packages/tls/.cancho-vcs/tls"
