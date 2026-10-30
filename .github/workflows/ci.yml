@@ -9,7 +9,7 @@ env:
   # The compiler these sources are built and tested with. A package store records no hash
   # of the `std` it was published against, so the revision is part of the contract. It is
   # also `[package] cancho` in cancho.toml (checked below), and it has packages/tls (docs/tls.md).
-  CANCHO_REV: 471b8e9334e021123286db4b1cb9feaeba2677c5
+  CANCHO_REV: dcf6751951590aa7f3427001eca3bef0d6677f3b
 
 jobs:
   test:
