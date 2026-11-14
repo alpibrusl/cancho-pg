@@ -376,7 +376,7 @@ allow-list, the hosts as `narrow` literals so the row shows one `net_out("host:4
 
 | | BigQuery | Athena |
 |---|---|---|
-| API (**read from my memory of the services, not from their documentation; to be checked before the design is final**) | `jobs.query` / `jobs.getQueryResults`, JSON, paged by token | `StartQueryExecution`, poll `GetQueryExecution`, `GetQueryResults` (JSON, paged) or the CSV Athena wrote to S3 |
+| API (**recalled, not read from the services' documentation: to be checked before this design is final**) | `jobs.query` / `jobs.getQueryResults`, JSON, paged by token | `StartQueryExecution`, poll `GetQueryExecution`, `GetQueryResults` (JSON, paged) or the CSV Athena wrote to S3 |
 | auth | a bearer token; a service account's own JWT needs **RSA signing** | AWS SigV4 on every request: **HMAC-SHA256**, which this repository already has (`pg.hmac_sha256`) |
 | what cancho has (**read**: `cancho/packages`) | `tls`, `x509`, `http-client`; **no RSA signing found** (`x509` verifies) | the same, plus the HMAC |
 | consequence | **choice**: take a short-lived access token from a file the operator refreshes (e.g. `gcloud auth print-access-token` in a sidecar), as `cancho-fetch`'s credential is a file; do not sign JWTs until cancho has RSA signing | SigV4 in cancho is writable; **open**: whether the signing key is a file (one per binary) and how a session token is refreshed |
