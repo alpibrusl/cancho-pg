@@ -285,3 +285,110 @@ per connection and lives as long as it, so the call goes once after login.
   under it, and fails with `0A000` ("cached plan must not change result type") if a column's *type* changed; a
   fresh connection, running `prepare_all` again, picks up the new types, and the generated accessors are regenerated
   from the changed schema like any other.
+
+## 10. `pg-export`: rows out as JSON lines, for `table` and for a recorded step (design; nothing built)
+
+> **Status: design.** Every claim below is marked as a **read** (with the file it was read from), a **choice**, or **open**. Nothing here is measured: no code
+> exists, and the first measurement is a gate (G-E1 below).
+
+**The question.** Can `cancho-table` take a PostgreSQL query as its data? **Choice: not inside `table`.** `table`'s authority row has no `net_out`, `conn_read` or
+`conn_write`, `tools.toml` there forbids `net_out` for every tool, and CI fails if the binary differs from `manifests/table.authority.json`
+(**read**: `cancho-table/docs/architecture.md`, "Not in the row"; `README.md`, "No implicit network access"). A live database also breaks `table`'s other promise,
+the same bytes for the same input. So the database is a *separate program* that writes a file or a pipe, and `table` reads that (`table ... -` or a file).
+
+### 10.1 Where it lives, and why
+
+| place | verdict | reason |
+|---|---|---|
+| inside `cancho-table` | **no** | above |
+| inside `cancho-flow` | **no** | `flow` "knows nothing of the programs it starts" and its row has no network (**read**: `cancho-flow/README.md`, `CLAUDE.md`, `docs/design.md` §0 and the row of `flow`) |
+| **`cancho-pg/tools/pg-export.cho`**, beside `tools/pgen.cho` | **yes** | the only place whose row is *meant* to hold `net_out` (narrowable to one `host:port`), `conn_read`, `conn_write`, `heap`; `pgen` is the precedent for a tool that is a program on this driver |
+| a new repository for all sources | **open** (§10.5) | only if a second source with a different transport arrives |
+
+### 10.2 The command
+
+```
+pg-export <host> <port> <user> <database> <password|-> [--sql FILE | --query "select ..."] [--out FILE] [--max-rows N] [--max-bytes N]
+```
+
+* **One statement, read only.** It runs inside `BEGIN READ ONLY` (**choice**: the server refuses a write whatever the SQL says, `25006`), with `statement_timeout` set
+  from a flag. It sends exactly one statement; the extended protocol is used so that a `;`-separated second statement is refused by the server rather than run
+  (**read**: §2 layer 1, `execute`; **open**: the exact behaviour is a test, G-E2).
+* **Output is JSON lines**, in the shape `table --input-format jsonl` reads (**read**: `cancho-table/docs/readers.md` §5): one object per row, the keys the column
+  names in the order the server sent them, so `--fields` is the column list and `--discover` works on it.
+  * integer, `numeric` and the float types are JSON **number tokens carrying the server's own text**, never through a double (the server's text for a `numeric`
+    is exact; **read**: §8 "Only `bool` and the integers are mapped"; `table` keeps a number's token text, `readers.md` §5.3);
+  * `bool` is `true`/`false`; every other type, the timestamps and dates included, is a **string with the server's text form**; the types a caller declares in
+    `table` (`:dec(S)`, `:timestamp`, `:date`) are the caller's, as for any CSV;
+  * a SQL `NULL` is JSON `null`, which `table` treats as absent and **refuses by default** (`parse.jsonl-missing-field`, `--absent empty` to accept)
+    (**read**: `readers.md` §5.3). That default is the right one and is the reason to prefer JSON lines to CSV, where `NULL`, `""` and a missing cell collapse;
+  * a value that is not valid UTF-8 (a `bytea` in text form is ASCII, but a database in another encoding is not) is refused, not repaired: `pg-export.not-utf8`.
+* **Bounded.** `--max-rows` and `--max-bytes` have defaults and ceilings; past one the export stops, **writes nothing** (like `pgen`: output is accumulated or
+  written whole to a file named by `--out` through a rename, never half) and says which bound, with a rule tag. Every refusal has a `pg-export.<name>` tag and no
+  input reaches a panic (**the rule of every repository here**).
+* **No payload is ever logged.** An error carries the SQLSTATE and the server's message *class*, not a row, a parameter or the SQL text beyond its first token.
+* **The password is a file or `-`**, as in `pgen`; it is not a flag value that a process list shows (**choice**).
+
+### 10.3 Composing it
+
+```sh
+pg-export db.internal 5432 reader orders - --query "select id, amount, status from orders where day = '2026-11-13' order by id" --out orders.jsonl
+table --input-format jsonl --fields id,amount,status --where "status = 'paid'" --agg "sum(amount:dec(2))" orders.jsonl
+```
+
+`order by` is the caller's; without it the order is the server's, and `pg-export` does not add one (**choice**: adding a sort would change the query).
+
+**Recorded, with `cancho-flow`.** `flow step` records what a program was given, which program ran, and the hashes of what it wrote
+(**read**: `cancho-flow/README.md`). A deployment bakes `pg-export` into the programs directory of its `flow`, and the export becomes a step:
+
+```sh
+flow step --root . --record records --out orders.jsonl -- pg-export db.internal 5432 reader orders /run/secrets/pg --query "..." --out orders.jsonl
+table ... orders.jsonl      # replayable offline: the file's hash is in the record
+```
+
+What this does and does not give (**choices, stated so they are not read as more**):
+
+* The record says *this file is what the database returned, at that time*; it does **not** say the database would return it again. The step is **not** `--deterministic`
+  and must not be declared so (a record is "a pure function of its inputs", and a live table is not an input `flow` can see; **read**: `cancho-flow/CLAUDE.md`, and §9 of its design on undeclared inputs).
+* What *is* replayable is everything after: `table` over `orders.jsonl` from the recorded hash, with no database.
+* The child has its user's whole authority; `flow`'s row says what `flow` may start, not what the child does (**read**: `cancho-flow/docs/design.md`, row of `flow`). `pg-export`'s own row, derived by
+  `cancho authority`, is what a reviewer reads for the child, and **open**: whether `flow`'s build step should check that a baked program's row is inside a ceiling a deployment names. That is a
+  `cancho-flow` change and is not made here.
+
+### 10.4 Gates, written before the code, each able to fail
+
+| gate | what it checks | a version it must refuse |
+|---|---|---|
+| G-E1 authority | `cancho authority` on the binary lists `net_out` for one `host:port`, `conn_read`, `conn_write`, `heap`, `fs_read`/`file_write` for the named paths, and nothing else (no `ffi`, no `net_in`, no `clock`); the row is committed and CI re-derives it | a build that adds any other label |
+| G-E2 read only | a statement `insert`, `create table`, `drop`, and a second statement after a `;` are each refused and the table is unchanged | a version that sends `Query` with the caller's text outside `BEGIN READ ONLY` |
+| G-E3 exactness | a `numeric(40,10)`, `int8` at both limits, a `float8` `NaN` and `-0`, and a hostile string (`"`, `\`, U+2028, U+0000, 4-byte UTF-8) round-trip through `table --input-format jsonl` to the same text; `NaN` is a refusal, not a number token (JSON has none) | a version that goes through a double, or writes `NaN` as a bare token |
+| G-E4 NULL | a `NULL`, `''` and a string `'null'` are three different things to `table` | a version that writes `NULL` as `""` |
+| G-E5 bounds | each of `--max-rows` and `--max-bytes` stops the export with its tag and leaves no file | a version that leaves a half file |
+| G-E6 no leak | no row, parameter or SQL text in any error or log line, over the hostile corpus | a version that echoes the SQL in `error.message` |
+| G-E7 flow | the `flow step` line above records the file's hash; changing the file makes `flow-records check` fail | not applicable until `flow` is built with `pg-export` in its directory |
+| mutants | a runner like `tests/mutants.py`: all killed, or each survivor explained | |
+
+### 10.5 BigQuery and Athena
+
+Same output, different transport. **Where: not here.** `cancho-pg` is a PostgreSQL wire client; both are HTTPS APIs. The model to follow is `cancho-fetch`: one binary per
+allow-list, the hosts as `narrow` literals so the row shows one `net_out("host:443")` each, and credentials from a file named at build time, never a flag
+(**read**: `cancho-fetch/README.md`, `docs/design.md` §8.6).
+
+| | BigQuery | Athena |
+|---|---|---|
+| API (**recalled, not read from the services' documentation: to be checked before this design is final**) | `jobs.query` / `jobs.getQueryResults`, JSON, paged by token | `StartQueryExecution`, poll `GetQueryExecution`, `GetQueryResults` (JSON, paged) or the CSV Athena wrote to S3 |
+| auth | a bearer token; a service account's own JWT needs **RSA signing** | AWS SigV4 on every request: **HMAC-SHA256**, which this repository already has (`pg.hmac_sha256`) |
+| what cancho has (**read**: `cancho/packages`) | `tls`, `x509`, `http-client`; **no RSA signing found** (`x509` verifies) | the same, plus the HMAC |
+| consequence | **choice**: take a short-lived access token from a file the operator refreshes (e.g. `gcloud auth print-access-token` in a sidecar), as `cancho-fetch`'s credential is a file; do not sign JWTs until cancho has RSA signing | SigV4 in cancho is writable; **open**: whether the signing key is a file (one per binary) and how a session token is refreshed |
+| shape | an asynchronous job: start, poll with a bound and a deadline, page, write whole or nothing | the same, and the results may sit in S3, which is a second host and a second row entry |
+
+**Recommendation (choice):** one new repository, `cancho-export`, holding `bq-export` and `athena-export` (each a binary with its own row), and the **output contract**
+of §10.2 written once there; `pg-export` stays here and follows the same contract. **Open:** whether the contract belongs in `cancho-table`'s `docs/readers.md` instead, since `table` is
+the consumer and the contract is its input format. Neither warehouse tool is started until `pg-export` has passed G-E1 to G-E6, so the contract is one that was exercised.
+
+### 10.6 Open questions
+
+1. How a `numeric` `NaN`, `Infinity` and a `float8` `NaN` are written (JSON has no token for them): refuse (the first choice, G-E3) or a string.
+2. Whether `--sql FILE` takes more than one statement with a name, as `pgen`'s `-- name:` file does, to export several in one run (several files; each one whole).
+3. `COPY ... TO STDOUT` as the transport, which is what `psql \copy` uses: faster, and not built here (§4, "Not yet: `COPY`"); the extended-protocol path in §10.2 is what exists.
+4. Whether `table` should learn to read a `flow` record's output file by record id. That is a `table` and `flow` question and is not decided here.
