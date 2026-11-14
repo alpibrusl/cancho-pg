@@ -83,6 +83,16 @@ jobs:
           eval "$(cat /tmp/pg.env.sh)"
           python3 tests/e2e.py
 
+      # pg-export (docs/design.md section 10): the gates G-E1 to G-E6 on the real server, and its mutants, each of which must make a gate fail.
+      - name: pg-export gates and mutants
+        working-directory: pg
+        env:
+          CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
+        run: |
+          eval "$(cat /tmp/pg.env.sh)"
+          python3 tests/export_test.py
+          python3 tests/export_mutants.py
+
       # The pool that makes its own connections (docs/reconnect.md): backends killed idle and mid-request, a server that goes
       # away and comes back, a database that is black-holed, silent, or refuses the password; against PostgreSQL behind
       # tests/tcpproxy.py, and against mock servers that answer the login badly. Each run reports the longest the loop

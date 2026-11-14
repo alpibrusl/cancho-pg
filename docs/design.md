@@ -286,10 +286,11 @@ per connection and lives as long as it, so the call goes once after login.
   fresh connection, running `prepare_all` again, picks up the new types, and the generated accessors are regenerated
   from the changed schema like any other.
 
-## 10. `pg-export`: rows out as JSON lines, for `table` and for a recorded step (design; nothing built)
+## 10. `pg-export`: rows out as JSON lines, for `table` and for a recorded step
 
-> **Status: design.** Every claim below is marked as a **read** (with the file it was read from), a **choice**, or **open**. Nothing here is measured: no code
-> exists, and the first measurement is a gate (G-E1 below).
+> **Status: built** (`tools/pgexport.cho`, `tests/export_test.py`, `tests/export_mutants.py`, `scripts/bench_export.py`); §10.7 says what the build changed from the design below and what
+> was measured. Every claim is marked as a **read** (with the file it was read from), a **choice**, **open**, or **measured** (in §10.7, with the command). Where the build differs
+> from §10.2 to §10.4, the text there is corrected in place and §10.7 lists each change.
 
 **The question.** Can `cancho-table` take a PostgreSQL query as its data? **Choice: not inside `table`.** `table`'s authority row has no `net_out`, `conn_read` or
 `conn_write`, `tools.toml` there forbids `net_out` for every tool, and CI fails if the binary differs from `manifests/table.authority.json`
@@ -302,17 +303,17 @@ the same bytes for the same input. So the database is a *separate program* that 
 |---|---|---|
 | inside `cancho-table` | **no** | above |
 | inside `cancho-flow` | **no** | `flow` "knows nothing of the programs it starts" and its row has no network (**read**: `cancho-flow/README.md`, `CLAUDE.md`, `docs/design.md` §0 and the row of `flow`) |
-| **`cancho-pg/tools/pg-export.cho`**, beside `tools/pgen.cho` | **yes** | the only place whose row is *meant* to hold `net_out` (narrowable to one `host:port`), `conn_read`, `conn_write`, `heap`; `pgen` is the precedent for a tool that is a program on this driver |
+| **`cancho-pg/tools/pgexport.cho`**, beside `tools/pgen.cho` | **yes** | the only place whose row is *meant* to hold `net_out` (narrowable to one `host:port`), `conn_read`, `conn_write`, `heap`; `pgen` is the precedent for a tool that is a program on this driver |
 | a new repository for all sources | **open** (§10.5) | only if a second source with a different transport arrives |
 
 ### 10.2 The command
 
 ```
-pg-export <host> <port> <user> <database> <password|-> [--sql FILE | --query "select ..."] [--out FILE] [--max-rows N] [--max-bytes N]
+pg-export <host> <port> <user> <database> <password|-> <sql> [max_rows [max_bytes]]
 ```
 
 * **One statement, read only.** It runs inside `BEGIN READ ONLY` (**choice**: the server refuses a write whatever the SQL says, `25006`), with `statement_timeout` set
-  from a flag. It sends exactly one statement; the extended protocol is used so that a `;`-separated second statement is refused by the server rather than run
+  (as built: `SET LOCAL statement_timeout = 60000`, fixed; no flag). It sends exactly one statement; the extended protocol is used so that a `;`-separated second statement is refused by the server rather than run
   (**read**: §2 layer 1, `execute`; **open**: the exact behaviour is a test, G-E2).
 * **Output is JSON lines**, in the shape `table --input-format jsonl` reads (**read**: `cancho-table/docs/readers.md` §5): one object per row, the keys the column
   names in the order the server sent them, so `--fields` is the column list and `--discover` works on it.
@@ -323,17 +324,19 @@ pg-export <host> <port> <user> <database> <password|-> [--sql FILE | --query "se
   * a SQL `NULL` is JSON `null`, which `table` treats as absent and **refuses by default** (`parse.jsonl-missing-field`, `--absent empty` to accept)
     (**read**: `readers.md` §5.3). That default is the right one and is the reason to prefer JSON lines to CSV, where `NULL`, `""` and a missing cell collapse;
   * a value that is not valid UTF-8 (a `bytea` in text form is ASCII, but a database in another encoding is not) is refused, not repaired: `pg-export.not-utf8`.
-* **Bounded.** `--max-rows` and `--max-bytes` have defaults and ceilings; past one the export stops, **writes nothing** (like `pgen`: output is accumulated or
-  written whole to a file named by `--out` through a rename, never half) and says which bound, with a rule tag. Every refusal has a `pg-export.<name>` tag and no
+* **Bounded.** `max_rows` (default 1,000,000, ceiling 100,000,000) and `max_bytes` (default 256 MiB, ceiling 1 GiB) are the last two arguments; past one the export stops, **writes nothing** (like `pgen`: output is
+  accumulated and written once to standard output only if every row passed; **corrected:** there is no `--out` file and rename in the first build) and says which bound, with a rule tag. Every refusal has a `pg-export.<name>` tag and no
   input reaches a panic (**the rule of every repository here**).
-* **No payload is ever logged.** An error carries the SQLSTATE and the server's message *class*, not a row, a parameter or the SQL text beyond its first token.
-* **The password is a file or `-`**, as in `pgen`; it is not a flag value that a process list shows (**choice**).
+* **No payload is ever logged.** **Corrected:** an error from the server carries its SQLSTATE and nothing else (the server's own message can quote a value); the other refusals are fixed sentences.
+* **The password is an argument**, as in `pgen`, and `-` is the empty one. **Corrected:** this design first said "a file or `-`, not a flag value that a process list shows"; the first build does
+  not read a file (a file read of a caller's path widens the authority row from `fs_read("/dev/urandom")` to `fs_read("")`), so a password is visible in the process list. **Open**: a file read through a
+  narrowed capability, as `cancho-fetch`'s credentials are (`cancho-fetch/docs/design.md` §8.6).
 
 ### 10.3 Composing it
 
 ```sh
-pg-export db.internal 5432 reader orders - --query "select id, amount, status from orders where day = '2026-11-13' order by id" --out orders.jsonl
-table --input-format jsonl --fields id,amount,status --where "status = 'paid'" --agg "sum(amount:dec(2))" orders.jsonl
+pg-export db.internal 5432 reader orders - "select id, amount, status from orders where day = '2026-11-13' order by id" > orders.jsonl
+table --input-format jsonl --fields id,amount,status --where "status = 'paid'" --agg "sum:amount:dec(2)" orders.jsonl
 ```
 
 `order by` is the caller's; without it the order is the server's, and `pg-export` does not add one (**choice**: adding a sort would change the query).
@@ -342,8 +345,9 @@ table --input-format jsonl --fields id,amount,status --where "status = 'paid'" -
 (**read**: `cancho-flow/README.md`). A deployment bakes `pg-export` into the programs directory of its `flow`, and the export becomes a step:
 
 ```sh
-flow step --root . --record records --out orders.jsonl -- pg-export db.internal 5432 reader orders /run/secrets/pg --query "..." --out orders.jsonl
+flow step --root . --record records --out orders.jsonl -- sh -c 'pg-export db.internal 5432 reader orders - "..." > orders.jsonl'
 table ... orders.jsonl      # replayable offline: the file's hash is in the record
+# NOT RUN: G-E7. This line was written, not executed; it needs `sh` and `pg-export` in the baked directory of a `flow` build.
 ```
 
 What this does and does not give (**choices, stated so they are not read as more**):
@@ -359,7 +363,7 @@ What this does and does not give (**choices, stated so they are not read as more
 
 | gate | what it checks | a version it must refuse |
 |---|---|---|
-| G-E1 authority | `cancho authority` on the binary lists `net_out` for one `host:port`, `conn_read`, `conn_write`, `heap`, `fs_read`/`file_write` for the named paths, and nothing else (no `ffi`, no `net_in`, no `clock`); the row is committed and CI re-derives it | a build that adds any other label |
+| G-E1 authority | `cancho authority` on the binary lists the network, `conn_read`, `conn_write`, `heap`, the console and one file, `fs_read("/dev/urandom")`, and nothing else (no `ffi`, no `net_in`, no `clock`, no file written). **Not met as first written:** the design said `net_out` for one `host:port`; the generic build is `net_out("")`, `bounded: false`, and a one-host build is **open** (§10.7) | a build that adds any other label |
 | G-E2 read only | a statement `insert`, `create table`, `drop`, and a second statement after a `;` are each refused and the table is unchanged | a version that sends `Query` with the caller's text outside `BEGIN READ ONLY` |
 | G-E3 exactness | a `numeric(40,10)`, `int8` at both limits, a `float8` `NaN` and `-0`, and a hostile string (`"`, `\`, U+2028, U+0000, 4-byte UTF-8) round-trip through `table --input-format jsonl` to the same text; `NaN` is a refusal, not a number token (JSON has none) | a version that goes through a double, or writes `NaN` as a bare token |
 | G-E4 NULL | a `NULL`, `''` and a string `'null'` are three different things to `table` | a version that writes `NULL` as `""` |
@@ -390,5 +394,63 @@ the consumer and the contract is its input format. Neither warehouse tool is sta
 
 1. How a `numeric` `NaN`, `Infinity` and a `float8` `NaN` are written (JSON has no token for them): refuse (the first choice, G-E3) or a string.
 2. Whether `--sql FILE` takes more than one statement with a name, as `pgen`'s `-- name:` file does, to export several in one run (several files; each one whole).
-3. `COPY ... TO STDOUT` as the transport, which is what `psql \copy` uses: faster, and not built here (§4, "Not yet: `COPY`"); the extended-protocol path in §10.2 is what exists.
+3. `COPY ... TO STDOUT` as the transport, which is what `psql \copy` uses (whether it would be faster here is **not measured**), and not built here (§4, "Not yet: `COPY`"); the extended-protocol path in §10.2 is what exists.
 4. Whether `table` should learn to read a `flow` record's output file by record id. That is a `table` and `flow` question and is not decided here.
+
+### 10.7 As built, and what was measured
+
+`tools/pgexport.cho` (496 lines), built with `cancho build --std tools/pgexport.cho src/pg.cho -o build/pg-export`, compiler `f4ead824` (`cancho.toml`). Everything below was run in one
+session on one machine: Linux 6.18 (a 4-CPU virtual machine), PostgreSQL 16.15 from the Ubuntu package on the same machine, trust authentication, loopback TCP.
+
+**What differs from §10.2 to §10.4** (each corrected in place above):
+
+| design said | as built |
+|---|---|
+| flags `--sql FILE`, `--query`, `--out FILE`, `--max-rows`, `--max-bytes` | positional: `<sql> [max_rows [max_bytes]]`; output on standard output; no `--out` and no rename |
+| `statement_timeout` from a flag | fixed, 60 s |
+| password from a file | an argument (`-` is empty); a file is **open** |
+| the server's message class in an error | the SQLSTATE only |
+| G-E1: `net_out` for one `host:port` | `net_out("")`, `bounded: false`; narrowing is a deployment's build and is **not built** |
+| G-E7: the `flow step` composition | **not run**; the line in §10.3 is written, not executed |
+
+**Gates** (`python3 tests/export_test.py`; 20 tests, all passed; the last of them runs the export through `table`, with `TABLE` set to cancho-table's `build/table`, built with that repository's pinned compiler):
+
+| gate | test | result |
+|---|---|---|
+| G-E1 | `test_authority_row`: the label set is exactly `args, conn_read, conn_write, err_write, fs_read("/dev/urandom"), heap, io_write, net_out("")`, no foreign symbol | met for the generic build; **not** the one-host row of the design |
+| G-E2 | `insert`, `delete`, `update`, `create`, `drop`, `truncate` are each refused with SQLSTATE `25006` and change nothing; `select 1; drop table` is `42601` | met |
+| G-E3 | `numeric(40,10)`, `int8` at both limits, `1.50` keep the server's text; `NaN`, `Infinity`, `-Infinity` and numeric `NaN` are `pg-export.non-finite` and write nothing; a string with `"`, `\`, U+2028, U+2029, a tab, a newline, U+0001, U+001F, an accent and a 4-byte character round-trips | met |
+| G-E4 | `NULL`, `''` and the string `null` come out as `null`, `""` and `"null"` | met |
+| G-E5 | `max_rows`, `max_bytes` and the bad limits refuse with their tags and write nothing | met |
+| G-E6 | `select 'SECRETVALUE'::int`, an unknown column and an unknown table: the error line is `pg-export: pg-export.server-refused: SQLSTATE XXXXX` and holds none of the names | met |
+| mutants | `python3 tests/export_mutants.py`: 10 mutants (no `READ ONLY`, `NaN` as a token, no UTF-8 check, no `max_rows`, no `max_bytes`, an unescaped quote, `NULL` as `""`, the server message echoed, duplicate columns allowed, partial output on a refusal) | **10 of 10 killed** |
+
+Two things the tests found while they were being written: the first draft wrote a tab as `\u0009`, where the server's `row_to_json` writes `\t` (both are valid JSON; the short escapes are now used, so the bytes are the server's),
+and a test that split the output with Python's `str.splitlines` broke on a U+2028 inside a string (the test was wrong, not the tool).
+
+**Same bytes as the server's own JSON writer** (**measured**): `test_same_bytes_as_row_to_json` compares the output with `psql -At -c "select row_to_json(t) from (q) t"` over 500 rows with a `NULL`, a `numeric`, a boolean,
+a date, and a string with a quote, a backslash, a tab and a 4-byte character; and for the benchmark table below at 100,000 rows the two outputs have the same SHA-256 (`f1765898...`). That is one query shape,
+not every type. Arrays and `jsonb` are strings in this tool; `row_to_json` is expected to write them as JSON arrays and objects, so the two would differ for those (**not tested**).
+
+**Time and memory against the stock `psql`** (**measured**: `PGHOST=127.0.0.1 PGPORT=54329 PGUSER=postgres PGDATABASE=shop RUNS=7 python3 scripts/bench_export.py 100000 1000000`; the table, the three commands, the warm-up run
+and how memory is read are in the script's header). One run of that command; the median of 7 timed runs after one warm-up; each writes to a file; peak memory is `ru_maxrss` of the client process.
+
+| rows | | median s | min s | peak MB | output MB |
+|---|---|---|---|---|---|
+| 100,000 | `psql --csv` | 0.119 | 0.100 | 32.2 | 9.0 |
+| | `psql` + `row_to_json` | 0.196 | 0.167 | 26.7 | 14.6 |
+| | `pg-export` | 0.190 | 0.166 | 36.3 | 14.6 |
+| 1,000,000 | `psql --csv` | 0.920 | 0.823 | 247.4 | 92.2 |
+| | `psql` + `row_to_json` | 1.677 | 1.601 | 188.1 | 148.4 |
+| | `pg-export` | 1.943 | 1.761 | 365.9 | 148.4 |
+
+What this says and does not say:
+
+* **`pg-export` is not faster than `psql`.** For the same JSON lines it is level at 100,000 rows and about 16 percent slower at 1,000,000 (1.94 s against 1.68 s, medians), and it holds about twice the memory (366 MB against 188 MB).
+  Against `psql --csv`, which does less work (no JSON, about 38 percent fewer bytes), it takes about twice as long at 1,000,000 rows.
+* **What the time contains** is not separated: it is the server running the query, the transfer, and the client; the server's share is the same for the three commands except that `row_to_json` makes the server write the JSON.
+* **Why it is slower and larger** is **not measured**. The reply is held whole in one buffer (§2, layer 2) and the output is built whole beside it, which is the memory; the time is a loop that copies each value once into a
+  buffer that grows by doubling. No profile was taken and no optimisation was tried; streaming (write a row, drop it) is the obvious next step for the memory, but it gives up "writes nothing on a refusal" unless the output is spooled first.
+* **One machine, one table shape** (six columns of five types, short values), a loopback connection, a cold-ish page cache not controlled for. These numbers do not carry to a remote server, wide rows, or a loaded machine.
+* **Open:** the one-host build that would meet G-E1 as written; a password file; `--out` with a rename; the streaming build; the `flow` composition (G-E7).
+

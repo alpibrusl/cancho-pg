@@ -1,0 +1,496 @@
+edition 5;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import pg;
+
+// `pg-export` -- one read-only statement, its rows as JSON lines (docs/design.md section 10).
+//
+//     pg-export <host> <port> <user> <database> <password|-> <sql> [max_rows [max_bytes]]
+//
+// The statement runs inside `BEGIN READ ONLY` on the extended protocol (so a second statement after a `;` is
+// the server's error, and so is a write), and the transaction is rolled back. Each row is one JSON object, the
+// keys the column names in the order the server sent them:
+//
+//   * int2, int4, int8, oid, float4, float8 and numeric are a JSON number whose text is the server's own text
+//     (never through a double). `NaN` and `Infinity` have no JSON token and are refused.
+//   * bool is true or false; every other type is a string holding the server's text form.
+//   * NULL is `null`.
+//   * a value that is not valid UTF-8 is refused, a repeated column name is refused (`table` refuses a key twice).
+//
+// The output is built whole and written once, only if every row passed, so a refusal writes nothing to
+// standard output. A refusal is one line on standard error, `pg-export: <rule>: <what>`, exit status 1.
+// The server's message is never echoed (it can carry a value): only its SQLSTATE. No row is ever logged.
+//
+// `cancho authority` on it reports `args`, `heap`, `fs_read("/dev/urandom")` (the login's nonce), the console and
+// the network (any host: a deployment narrows it to one `host:port`). The password `-` is the empty one.
+
+// A decimal number, or -1 for empty text or a non-digit.
+fn number_of[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 || len(text) > 17 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        n = n * 10 + (c - 48);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn complain[&i, &r, &w](io: &!i Io, rule: &r [byte], what: &w [byte]) -> [err_write] int {
+    io.error_all(io, "pg-export: ");
+    io.error_all(io, rule);
+    io.error_all(io, ": ");
+    io.error_all(io, what);
+    io.error_all(io, "\n");
+    return 1;
+}
+
+// The server's refusal, as its SQLSTATE and nothing else.
+fn complain_server[&i, &m](io: &!i Io, reply: &m [byte], at: int) -> [err_write] int {
+    let (cf, ct) = pg.error_field(reply, at, 67);
+    io.error_all(io, "pg-export: pg-export.server-refused: SQLSTATE ");
+    io.error_all(io, reply[cf..ct]);
+    io.error_all(io, "\n");
+    return 1;
+}
+
+// 1 a JSON number, 2 a JSON boolean, 3 a string, by the column's type oid.
+fn json_kind(oid: int) -> [] int {
+    if oid == 20 || oid == 21 || oid == 23 || oid == 26 || oid == 700 || oid == 701 || oid == 1700 {
+        return 1;
+    }
+    if oid == 16 {
+        return 2;
+    }
+    return 3;
+}
+
+fn is_digit(c: int) -> [] bool {
+    return c >= 48 && c <= 57;
+}
+
+// Whether m[from..to] is a JSON number: -? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?
+fn is_json_number[&b](m: &b [byte], from: int, to: int) -> [] bool {
+    var i = from;
+    if i < to && int_of(m[i]) == 45 {
+        i = i + 1;
+    }
+    if i >= to || !is_digit(int_of(m[i])) {
+        return false;
+    }
+    if int_of(m[i]) == 48 {
+        i = i + 1;
+    } else {
+        while i < to && is_digit(int_of(m[i])) {
+            i = i + 1;
+        }
+    }
+    if i < to && int_of(m[i]) == 46 {
+        i = i + 1;
+        if i >= to || !is_digit(int_of(m[i])) {
+            return false;
+        }
+        while i < to && is_digit(int_of(m[i])) {
+            i = i + 1;
+        }
+    }
+    if i < to && (int_of(m[i]) == 101 || int_of(m[i]) == 69) {
+        i = i + 1;
+        if i < to && (int_of(m[i]) == 43 || int_of(m[i]) == 45) {
+            i = i + 1;
+        }
+        if i >= to || !is_digit(int_of(m[i])) {
+            return false;
+        }
+        while i < to && is_digit(int_of(m[i])) {
+            i = i + 1;
+        }
+    }
+    return i == to;
+}
+
+fn hex_digit(n: int) -> [] byte {
+    if n < 10 {
+        return byte_of(48 + n);
+    }
+    return byte_of(87 + n);
+}
+
+fn is_cont(c: int) -> [] bool {
+    return c >= 128 && c <= 191;
+}
+
+// The length of the well-formed UTF-8 sequence at m[i] (1 to 4), or 0 if there is none (overlong forms,
+// surrogates and anything past U+10FFFF are not well-formed).
+fn utf8_len[&b](m: &b [byte], i: int, to: int) -> [] int {
+    let c = int_of(m[i]);
+    if c < 128 {
+        return 1;
+    }
+    if c >= 194 && c <= 223 {
+        if i + 1 < to && is_cont(int_of(m[i + 1])) {
+            return 2;
+        }
+        return 0;
+    }
+    if c >= 224 && c <= 239 {
+        if i + 2 >= to || !is_cont(int_of(m[i + 1])) || !is_cont(int_of(m[i + 2])) {
+            return 0;
+        }
+        let d = int_of(m[i + 1]);
+        if c == 224 && d < 160 {
+            return 0;
+        }
+        if c == 237 && d > 159 {
+            return 0;
+        }
+        return 3;
+    }
+    if c >= 240 && c <= 244 {
+        if i + 3 >= to || !is_cont(int_of(m[i + 1])) || !is_cont(int_of(m[i + 2])) || !is_cont(int_of(m[i + 3])) {
+            return 0;
+        }
+        let d = int_of(m[i + 1]);
+        if c == 240 && d < 144 {
+            return 0;
+        }
+        if c == 244 && d > 143 {
+            return 0;
+        }
+        return 4;
+    }
+    return 0;
+}
+
+// `"` and the JSON-escaped text m[from..to], and `"` again. False (and a buffer that must be dropped) if the
+// text is not well-formed UTF-8.
+fn push_string[&h, &b](heap: &!h Heap, out: buffer.Buffer, m: &b [byte], from: int, to: int) -> [heap] (buffer.Buffer, bool) {
+    var o = buffer.push(heap, out, byte_of(34));
+    var i = from;
+    var run_from = from;
+    while i < to {
+        let c = int_of(m[i]);
+        if c == 34 || c == 92 || c < 32 {
+            o = buffer.append(heap, o, m[run_from..i]);
+            if c == 34 {
+                o = buffer.append(heap, o, "\\\"");
+            } else if c == 92 {
+                o = buffer.append(heap, o, "\\\\");
+            } else if c == 8 {
+                o = buffer.append(heap, o, "\\b");
+            } else if c == 9 {
+                o = buffer.append(heap, o, "\\t");
+            } else if c == 10 {
+                o = buffer.append(heap, o, "\\n");
+            } else if c == 12 {
+                o = buffer.append(heap, o, "\\f");
+            } else if c == 13 {
+                o = buffer.append(heap, o, "\\r");
+            } else {
+                o = buffer.append(heap, o, "\\u00");
+                o = buffer.push(heap, o, hex_digit(c / 16));
+                o = buffer.push(heap, o, hex_digit(c % 16));
+            }
+            i = i + 1;
+            run_from = i;
+        } else {
+            let n = utf8_len(m, i, to);
+            if n == 0 {
+                return (o, false);
+            }
+            i = i + n;
+        }
+    }
+    o = buffer.append(heap, o, m[run_from..to]);
+    o = buffer.push(heap, o, byte_of(34));
+    return (o, true);
+}
+
+// The position of the RowDescription in a reply, or -1.
+fn description[&b](m: &b [byte]) -> [] int {
+    var p = 0;
+    while pg.size(m, p) > 0 {
+        if pg.kind(m, p) == 84 {
+            return p;
+        }
+        p = p + pg.size(m, p);
+    }
+    return 0 - 1;
+}
+
+// Whether the name of column j of the description at `t` is already the name of an earlier column.
+fn repeated[&b](m: &b [byte], t: int, j: int) -> [] bool {
+    let (jf, jt) = pg.column_name(m, t, j);
+    var k = 0;
+    while k < j {
+        let (kf, kt) = pg.column_name(m, t, k);
+        if bytes.equal(m[jf..jt], m[kf..kt]) {
+            return true;
+        }
+        k = k + 1;
+    }
+    return false;
+}
+
+// Every row of the reply as JSON lines. The status is 0 (ok), or a refusal already complained of.
+fn rows_to_lines[&h, &i, &m](heap: &!h Heap, io: &!i Io, reply: &m [byte], max_rows: int, max_bytes: int) -> [heap, err_write] (buffer.Buffer, int) {
+    var out = buffer.empty(heap, 4096);
+    let t = description(reply);
+    if t < 0 {
+        complain(io, "pg-export.no-columns", "the statement returns no rows (a command, not a query)");
+        return (out, 1);
+    }
+    let columns = pg.fields(reply, t);
+    var j = 0;
+    while j < columns {
+        if repeated(reply, t, j) {
+            complain(io, "pg-export.duplicate-column", "two columns have the same name: rename one with `as`");
+            return (out, 1);
+        }
+        j = j + 1;
+    }
+    var count = 0;
+    var at = pg.first_row(reply);
+    while at >= 0 {
+        if count >= max_rows {
+            complain(io, "pg-export.too-many-rows", "the result has more rows than max_rows");
+            return (out, 1);
+        }
+        out = buffer.push(heap, out, byte_of(123));
+        var c = 0;
+        while c < columns {
+            if c > 0 {
+                out = buffer.push(heap, out, byte_of(44));
+            }
+            let (nf, nt) = pg.column_name(reply, t, c);
+            let (kb, kok) = push_string(heap, out, reply, nf, nt);
+            out = kb;
+            if !kok {
+                complain(io, "pg-export.not-utf8", "a column name is not valid UTF-8");
+                return (out, 1);
+            }
+            out = buffer.push(heap, out, byte_of(58));
+            let (vf, vt) = pg.value(reply, at, c);
+            if vf < 0 {
+                out = buffer.append(heap, out, "null");
+            } else {
+                let kind = json_kind(pg.column_oid(reply, t, c));
+                if kind == 1 {
+                    if !is_json_number(reply, vf, vt) {
+                        complain(io, "pg-export.non-finite", "a number has no JSON form (NaN or Infinity): cast it to text");
+                        return (out, 1);
+                    }
+                    out = buffer.append(heap, out, reply[vf..vt]);
+                } else if kind == 2 {
+                    if pg.bool_text(reply, vf, vt) {
+                        out = buffer.append(heap, out, "true");
+                    } else {
+                        out = buffer.append(heap, out, "false");
+                    }
+                } else {
+                    let (sb, sok) = push_string(heap, out, reply, vf, vt);
+                    out = sb;
+                    if !sok {
+                        complain(io, "pg-export.not-utf8", "a value is not valid UTF-8");
+                        return (out, 1);
+                    }
+                }
+            }
+            c = c + 1;
+        }
+        out = buffer.append(heap, out, "}\n");
+        count = count + 1;
+        var size = 0;
+        borrow out as &ob in {
+            size = buffer.size(ob);
+        }
+        if size > max_bytes {
+            complain(io, "pg-export.too-large", "the output is larger than max_bytes");
+            return (out, 1);
+        }
+        at = pg.next_row(reply, at);
+    }
+    return (out, 0);
+}
+
+// An unpredictable client nonce for SCRAM: 18 bytes from the kernel, as base64. Empty if the read came up short,
+// and `pg.login` then refuses a SCRAM server (status 7).
+fn fresh_nonce[&h, &f](heap: &!h Heap, fs: &f Fs("/dev/urandom")) -> [heap, fs_read("/dev/urandom")] buffer.Buffer {
+    var nonce = buffer.empty(heap, 1);
+    region a {
+        let raw = alloc_slice[a](18, byte_of(0));
+        let got = fs_read(fs, "/dev/urandom", raw);
+        if got == 18 {
+            buffer.drop(heap, nonce);
+            nonce = pg.base64_encode(heap, raw);
+        }
+    }
+    return nonce;
+}
+
+// Run one simple statement and drop its reply; 0 if the server accepted it.
+fn command[&h, &c, &i, &s](heap: &!h Heap, conn: &!c Conn, io: &!i Io, sql: &s [byte]) -> [heap, conn_read, conn_write, err_write] int {
+    let (reply, st) = pg.simple(heap, conn, sql);
+    var status = st;
+    if st != 0 {
+        complain(io, "pg-export.connection", "the connection failed");
+    } else {
+        borrow reply as &rb in {
+            let bad = pg.failure(buffer.bytes(rb));
+            if bad >= 0 {
+                status = complain_server(io, buffer.bytes(rb), bad);
+            }
+        }
+    }
+    buffer.drop(heap, reply);
+    return status;
+}
+
+fn export[&h, &c, &i, &s](heap: &!h Heap, conn: &!c Conn, io: &!i Io, sql: &s [byte], max_rows: int, max_bytes: int) -> [heap, conn_read, conn_write, io_write, err_write] int {
+    var status = command(heap, conn, io, "BEGIN READ ONLY");
+    if status != 0 {
+        return status;
+    }
+    status = command(heap, conn, io, "SET LOCAL statement_timeout = 60000");
+    if status != 0 {
+        return status;
+    }
+    var ps = pg.params(heap);
+    var out = buffer.empty(heap, 1);
+    borrow ps as &pr in {
+        let (reply, st) = pg.extended(heap, conn, sql, pr);
+        if st != 0 {
+            status = complain(io, "pg-export.connection", "the connection failed");
+        } else {
+            borrow reply as &rb in {
+                let bad = pg.failure(buffer.bytes(rb));
+                if bad >= 0 {
+                    status = complain_server(io, buffer.bytes(rb), bad);
+                } else {
+                    let (lines, code) = rows_to_lines(heap, io, buffer.bytes(rb), max_rows, max_bytes);
+                    buffer.drop(heap, out);
+                    out = lines;
+                    status = code;
+                }
+            }
+        }
+        buffer.drop(heap, reply);
+    }
+    pg.drop_params(heap, ps);
+    // The transaction is read only and is rolled back whatever happened; a failure here changes nothing the caller has.
+    let (rb, rst) = pg.simple(heap, conn, "ROLLBACK");
+    buffer.drop(heap, rb);
+    if status == 0 {
+        borrow out as &or in {
+            buffer.write(io, or);
+        }
+    }
+    buffer.drop(heap, out);
+    return status;
+}
+
+fn run[&h, &g, &i, &c, &z](heap: &!h Heap, args: &g Args, io: &!i Io, conn: &!c Conn, rng: &z Fs("/dev/urandom")) -> [heap, args, io_write, err_write, conn_read, conn_write, fs_read("/dev/urandom")] int {
+    var max_rows = 1000000;
+    var max_bytes = 268435456;
+    if arg_count(args) > 7 {
+        max_rows = number_of(arg(args, 7));
+    }
+    if arg_count(args) > 8 {
+        max_bytes = number_of(arg(args, 8));
+    }
+    if max_rows < 1 || max_rows > 100000000 {
+        return complain(io, "pg-export.bad-limit", "max_rows is a number from 1 to 100000000");
+    }
+    if max_bytes < 1 || max_bytes > 1073741824 {
+        return complain(io, "pg-export.bad-limit", "max_bytes is a number from 1 to 1073741824");
+    }
+    var secret = arg(args, 5);
+    if len(secret) == 1 && int_of(secret[0]) == 45 {
+        secret = "";
+    }
+    let nonce = fresh_nonce(heap, rng);
+    var hello = buffer.empty(heap, 1);
+    var s0 = 0;
+    borrow nonce as &nr in {
+        let (reply, st) = pg.login(heap, conn, arg(args, 3), secret, arg(args, 4), buffer.bytes(nr));
+        buffer.drop(heap, hello);
+        hello = reply;
+        s0 = st;
+    }
+    buffer.drop(heap, nonce);
+    var status = 0;
+    if s0 != 0 {
+        status = complain(io, "pg-export.login", "the server refused the login");
+        borrow hello as &hr in {
+            let bad = pg.failure(buffer.bytes(hr));
+            if bad >= 0 {
+                complain_server(io, buffer.bytes(hr), bad);
+            }
+        }
+    } else {
+        status = export(heap, conn, io, arg(args, 6), max_rows, max_bytes);
+    }
+    buffer.drop(heap, hello);
+    return status;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock } = split(world);
+    release(ffi);
+    release(clock);
+    let rng = narrow(fs, "/dev/urandom");
+    var status = 2;
+    borrow args as &g in {
+        if arg_count(g) >= 7 && arg_count(g) <= 9 {
+            status = 2;
+            let port = number_of(arg(g, 2));
+            if port > 0 && port < 65536 {
+                borrow rng as &z in {
+                    borrow net as &nn in {
+                        match tcp_connect(nn, arg(g, 1), port) {
+                            Dialed::Ok(c) => {
+                                var conn = c;
+                                borrow mut conn as &!ch in {
+                                    borrow mut heap as &!h in {
+                                        borrow mut io as &!i in {
+                                            status = run(h, g, i, ch, z);
+                                        }
+                                    }
+                                }
+                                conn_close(conn);
+                            }
+                            Dialed::Failed(e) => {
+                                borrow mut io as &!i in {
+                                    complain(i, "pg-export.connect", "cannot connect to the host and port");
+                                }
+                                status = 1;
+                            }
+                        }
+                    }
+                }
+            } else {
+                borrow mut io as &!i in {
+                    complain(i, "pg-export.bad-port", "the port is a number from 1 to 65535");
+                }
+            }
+        } else {
+            borrow mut io as &!i in {
+                complain(i, "pg-export.usage", "pg-export <host> <port> <user> <database> <password|-> <sql> [max_rows [max_bytes]]");
+            }
+        }
+    }
+    release(rng);
+    release(net);
+    release(args);
+    release(io);
+    release(heap);
+    return status;
+}
