@@ -1,0 +1,78 @@
+edition 5;
+
+import std.io;
+import pg;
+import pgexport;
+
+// `pg-export` -- one read-only statement, its rows as JSON lines (docs/design.md section 10): the program that takes the
+// host, the port and the password as arguments.
+//
+//     pg-export <host> <port> <user> <database> <password|-> <sql> [max_rows [max_bytes]]
+//
+// The network is therefore not narrowed: `cancho authority` reports `net_out("")` and `bounded: false`, and the password is
+// in the process list. `scripts/export_build.py` builds the variant that has one `host:port` and a password file baked in
+// (section 11). The password `-` is the empty one.
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock } = split(world);
+    release(ffi);
+    release(clock);
+    let rng = narrow(fs, "/dev/urandom");
+    var status = 2;
+    borrow args as &g in {
+        if arg_count(g) >= 7 && arg_count(g) <= 9 {
+            let port = pgexport.number_of(arg(g, 2));
+            if port > 0 && port < 65536 {
+                var secret = arg(g, 5);
+                if len(secret) == 1 && int_of(secret[0]) == 45 {
+                    secret = "";
+                }
+                var rows_text = "";
+                var bytes_text = "";
+                if arg_count(g) > 7 {
+                    rows_text = arg(g, 7);
+                }
+                if arg_count(g) > 8 {
+                    bytes_text = arg(g, 8);
+                }
+                borrow rng as &z in {
+                    borrow net as &nn in {
+                        match tcp_connect(nn, arg(g, 1), port) {
+                            Dialed::Ok(c) => {
+                                var conn = c;
+                                borrow mut conn as &!ch in {
+                                    borrow mut heap as &!h in {
+                                        borrow mut io as &!i in {
+                                            status = pgexport.run_export(h, i, ch, z, arg(g, 3), arg(g, 4), secret, arg(g, 6), rows_text, bytes_text);
+                                        }
+                                    }
+                                }
+                                conn_close(conn);
+                            }
+                            Dialed::Failed(e) => {
+                                borrow mut io as &!i in {
+                                    pgexport.complain(i, "pg-export.connect", "cannot connect to the host and port");
+                                }
+                                status = 1;
+                            }
+                        }
+                    }
+                }
+            } else {
+                borrow mut io as &!i in {
+                    pgexport.complain(i, "pg-export.bad-port", "the port is a number from 1 to 65535");
+                }
+            }
+        } else {
+            borrow mut io as &!i in {
+                pgexport.complain(i, "pg-export.usage", "pg-export <host> <port> <user> <database> <password|-> <sql> [max_rows [max_bytes]]");
+            }
+        }
+    }
+    release(rng);
+    release(net);
+    release(args);
+    release(io);
+    release(heap);
+    return status;
+}

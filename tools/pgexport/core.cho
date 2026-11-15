@@ -1,5 +1,7 @@
 edition 5;
 
+module pgexport;
+
 import std.buffer;
 import std.bytes;
 import std.io;
@@ -23,11 +25,12 @@ import pg;
 // standard output. A refusal is one line on standard error, `pg-export: <rule>: <what>`, exit status 1.
 // The server's message is never echoed (it can carry a value): only its SQLSTATE. No row is ever logged.
 //
-// `cancho authority` on it reports `args`, `heap`, `fs_read("/dev/urandom")` (the login's nonce), the console and
-// the network (any host: a deployment narrows it to one `host:port`). The password `-` is the empty one.
+// This file is the module `pgexport`: the statement, the JSON writer and the refusals, with no host and no password in it.
+// `tools/pgexport/generic.cho` is the program that takes both as arguments (`net_out("")`); `scripts/export_build.py`
+// writes the program that has them baked in (one `host:port`, the password from one file; docs/design.md section 11).
 
 // A decimal number, or -1 for empty text or a non-digit.
-fn number_of[&t](text: &t [byte]) -> [] int {
+pub fn number_of[&t](text: &t [byte]) -> [] int {
     if len(text) == 0 || len(text) > 17 {
         return 0 - 1;
     }
@@ -44,7 +47,7 @@ fn number_of[&t](text: &t [byte]) -> [] int {
     return n;
 }
 
-fn complain[&i, &r, &w](io: &!i Io, rule: &r [byte], what: &w [byte]) -> [err_write] int {
+pub fn complain[&i, &r, &w](io: &!i Io, rule: &r [byte], what: &w [byte]) -> [err_write] int {
     io.error_all(io, "pg-export: ");
     io.error_all(io, rule);
     io.error_all(io, ": ");
@@ -323,7 +326,7 @@ fn rows_to_lines[&h, &i, &m](heap: &!h Heap, io: &!i Io, reply: &m [byte], max_r
 
 // An unpredictable client nonce for SCRAM: 18 bytes from the kernel, as base64. Empty if the read came up short,
 // and `pg.login` then refuses a SCRAM server (status 7).
-fn fresh_nonce[&h, &f](heap: &!h Heap, fs: &f Fs("/dev/urandom")) -> [heap, fs_read("/dev/urandom")] buffer.Buffer {
+pub fn fresh_nonce[&h, &f](heap: &!h Heap, fs: &f Fs("/dev/urandom")) -> [heap, fs_read("/dev/urandom")] buffer.Buffer {
     var nonce = buffer.empty(heap, 1);
     region a {
         let raw = alloc_slice[a](18, byte_of(0));
@@ -397,30 +400,46 @@ fn export[&h, &c, &i, &s](heap: &!h Heap, conn: &!c Conn, io: &!i Io, sql: &s [b
     return status;
 }
 
-fn run[&h, &g, &i, &c, &z](heap: &!h Heap, args: &g Args, io: &!i Io, conn: &!c Conn, rng: &z Fs("/dev/urandom")) -> [heap, args, io_write, err_write, conn_read, conn_write, fs_read("/dev/urandom")] int {
-    var max_rows = 1000000;
-    var max_bytes = 268435456;
-    if arg_count(args) > 7 {
-        max_rows = number_of(arg(args, 7));
+// The row limit named by `text` (empty: the default 1,000,000), or -1 if it is not a number from 1 to 100,000,000.
+fn rows_limit[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 {
+        return 1000000;
     }
-    if arg_count(args) > 8 {
-        max_bytes = number_of(arg(args, 8));
+    let n = number_of(text);
+    if n < 1 || n > 100000000 {
+        return 0 - 1;
     }
-    if max_rows < 1 || max_rows > 100000000 {
+    return n;
+}
+
+// The byte limit named by `text` (empty: the default 256 MiB), or -1 if it is not a number from 1 to 1 GiB.
+fn bytes_limit[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 {
+        return 268435456;
+    }
+    let n = number_of(text);
+    if n < 1 || n > 1073741824 {
+        return 0 - 1;
+    }
+    return n;
+}
+
+// The whole job once a connection is open: the limits, the login, the statement, the lines. 0 ok, else a refusal already
+// complained of. `rows_text` and `bytes_text` are empty for "the default".
+pub fn run_export[&h, &i, &c, &z, &u, &d, &s, &q, &r, &b](heap: &!h Heap, io: &!i Io, conn: &!c Conn, rng: &z Fs("/dev/urandom"), user: &u [byte], database: &d [byte], secret: &s [byte], sql: &q [byte], rows_text: &r [byte], bytes_text: &b [byte]) -> [heap, io_write, err_write, conn_read, conn_write, fs_read("/dev/urandom")] int {
+    let max_rows = rows_limit(rows_text);
+    let max_bytes = bytes_limit(bytes_text);
+    if max_rows < 1 {
         return complain(io, "pg-export.bad-limit", "max_rows is a number from 1 to 100000000");
     }
-    if max_bytes < 1 || max_bytes > 1073741824 {
+    if max_bytes < 1 {
         return complain(io, "pg-export.bad-limit", "max_bytes is a number from 1 to 1073741824");
-    }
-    var secret = arg(args, 5);
-    if len(secret) == 1 && int_of(secret[0]) == 45 {
-        secret = "";
     }
     let nonce = fresh_nonce(heap, rng);
     var hello = buffer.empty(heap, 1);
     var s0 = 0;
     borrow nonce as &nr in {
-        let (reply, st) = pg.login(heap, conn, arg(args, 3), secret, arg(args, 4), buffer.bytes(nr));
+        let (reply, st) = pg.login(heap, conn, user, secret, database, buffer.bytes(nr));
         buffer.drop(heap, hello);
         hello = reply;
         s0 = st;
@@ -436,61 +455,8 @@ fn run[&h, &g, &i, &c, &z](heap: &!h Heap, args: &g Args, io: &!i Io, conn: &!c 
             }
         }
     } else {
-        status = export(heap, conn, io, arg(args, 6), max_rows, max_bytes);
+        status = export(heap, conn, io, sql, max_rows, max_bytes);
     }
     buffer.drop(heap, hello);
-    return status;
-}
-
-fn main(world: World) -> [] int {
-    let Split { io, ffi, fs, heap, args, net, clock } = split(world);
-    release(ffi);
-    release(clock);
-    let rng = narrow(fs, "/dev/urandom");
-    var status = 2;
-    borrow args as &g in {
-        if arg_count(g) >= 7 && arg_count(g) <= 9 {
-            status = 2;
-            let port = number_of(arg(g, 2));
-            if port > 0 && port < 65536 {
-                borrow rng as &z in {
-                    borrow net as &nn in {
-                        match tcp_connect(nn, arg(g, 1), port) {
-                            Dialed::Ok(c) => {
-                                var conn = c;
-                                borrow mut conn as &!ch in {
-                                    borrow mut heap as &!h in {
-                                        borrow mut io as &!i in {
-                                            status = run(h, g, i, ch, z);
-                                        }
-                                    }
-                                }
-                                conn_close(conn);
-                            }
-                            Dialed::Failed(e) => {
-                                borrow mut io as &!i in {
-                                    complain(i, "pg-export.connect", "cannot connect to the host and port");
-                                }
-                                status = 1;
-                            }
-                        }
-                    }
-                }
-            } else {
-                borrow mut io as &!i in {
-                    complain(i, "pg-export.bad-port", "the port is a number from 1 to 65535");
-                }
-            }
-        } else {
-            borrow mut io as &!i in {
-                complain(i, "pg-export.usage", "pg-export <host> <port> <user> <database> <password|-> <sql> [max_rows [max_bytes]]");
-            }
-        }
-    }
-    release(rng);
-    release(net);
-    release(args);
-    release(io);
-    release(heap);
     return status;
 }

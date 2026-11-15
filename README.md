@@ -28,16 +28,27 @@ poller's events; [below](#a-pool-that-comes-back) and [`docs/reconnect.md`](docs
 
 ## `pg-export`: rows out as JSON lines
 
-`tools/pgexport.cho` runs one read-only statement and writes each row as a JSON object, the format `cancho-table` reads with `--input-format jsonl` ([`docs/design.md`](docs/design.md) §10):
+`tools/pgexport/` runs one read-only statement and writes each row as a JSON object, the format `cancho-table` reads with `--input-format jsonl` ([`docs/design.md`](docs/design.md) §10, §11):
 
 ```console
-$ cancho build --std tools/pgexport.cho src/pg.cho -o pg-export
+$ cancho build --std tools/pgexport/generic.cho tools/pgexport/core.cho src/pg.cho -o pg-export
 $ pg-export 127.0.0.1 5432 postgres shop - "select id, customer, amount from orders order by id" | head -n 2
 {"id":1,"customer":"Doe, Jane","amount":19.90}
 {"id":2,"customer":"Acme","amount":null}
 ```
 
-The statement runs in `BEGIN READ ONLY` (a write is the server's `25006`), numbers keep the server's text, `NULL` is `null`, and a refusal (`NaN`, a value that is not UTF-8, a bound passed) writes nothing to standard output. For the same rows the bytes are the ones the server's `row_to_json` writes. It is **not faster than `psql`**: about 16 percent slower than `psql` with `row_to_json` at 1,000,000 rows and about twice the memory ([§10.7](docs/design.md#107-as-built-and-what-was-measured) has the numbers and the conditions). `cancho authority` on it names the network (any host: not narrowed to one), the connection, the console, the heap and `/dev/urandom` for the login.
+The statement runs in `BEGIN READ ONLY` (a write is the server's `25006`), numbers keep the server's text, `NULL` is `null`, and a refusal (`NaN`, a value that is not UTF-8, a bound passed) writes nothing to standard output. For the same rows the bytes are the ones the server's `row_to_json` writes. It is **not faster than `psql`**: about 16 percent slower than `psql` with `row_to_json` at 1,000,000 rows and about twice the memory ([§10.7](docs/design.md#107-as-built-and-what-was-measured) has the numbers and the conditions).
+
+That program takes the host, the port and the password as arguments, so `cancho authority` says `net_out("")` (any host) and `ps` shows the password. **For a deployment, build the one-host variant**: the host, the port and a password file are literals in the program, so its authority row names exactly that one `host:port` and that one file, and there is no argument that can hold a password.
+
+```console
+$ python3 scripts/export_build.py --host db.internal --port 5432 --password-file /run/secrets/pg --out pg-export-db
+built pg-export-db: network db.internal:5432 only, password from /run/secrets/pg
+note: 'db.internal' is a name; the row names it, and what it resolves to is the resolver's answer at run time (use an IP literal for the tighter claim)
+$ pg-export-db reader orders "select id, customer from orders order by id"
+```
+
+The script derives the row with `cancho authority` and refuses to build if it is not that bound row; `manifests/pg-export.authority.json` is the committed row of a reference variant, and CI re-derives it ([§11](docs/design.md#11-a-one-host-pg-export-and-a-password-that-is-not-in-the-process-list)).
 
 ## Requirements
 

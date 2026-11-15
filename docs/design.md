@@ -288,7 +288,7 @@ per connection and lives as long as it, so the call goes once after login.
 
 ## 10. `pg-export`: rows out as JSON lines, for `table` and for a recorded step
 
-> **Status: built** (`tools/pgexport.cho`, `tests/export_test.py`, `tests/export_mutants.py`, `scripts/bench_export.py`); §10.7 says what the build changed from the design below and what
+> **Status: built** (`tools/pgexport/`, `tests/export_test.py`, `tests/export_mutants.py`, `scripts/bench_export.py`); §10.7 says what the build changed from the design below and what
 > was measured. Every claim is marked as a **read** (with the file it was read from), a **choice**, **open**, or **measured** (in §10.7, with the command). Where the build differs
 > from §10.2 to §10.4, the text there is corrected in place and §10.7 lists each change.
 
@@ -303,7 +303,7 @@ the same bytes for the same input. So the database is a *separate program* that 
 |---|---|---|
 | inside `cancho-table` | **no** | above |
 | inside `cancho-flow` | **no** | `flow` "knows nothing of the programs it starts" and its row has no network (**read**: `cancho-flow/README.md`, `CLAUDE.md`, `docs/design.md` §0 and the row of `flow`) |
-| **`cancho-pg/tools/pgexport.cho`**, beside `tools/pgen.cho` | **yes** | the only place whose row is *meant* to hold `net_out` (narrowable to one `host:port`), `conn_read`, `conn_write`, `heap`; `pgen` is the precedent for a tool that is a program on this driver |
+| **`cancho-pg/tools/pgexport/`**, beside `tools/pgen.cho` | **yes** | the only place whose row is *meant* to hold `net_out` (narrowable to one `host:port`), `conn_read`, `conn_write`, `heap`; `pgen` is the precedent for a tool that is a program on this driver |
 | a new repository for all sources | **open** (§10.5) | only if a second source with a different transport arrives |
 
 ### 10.2 The command
@@ -328,9 +328,8 @@ pg-export <host> <port> <user> <database> <password|-> <sql> [max_rows [max_byte
   accumulated and written once to standard output only if every row passed; **corrected:** there is no `--out` file and rename in the first build) and says which bound, with a rule tag. Every refusal has a `pg-export.<name>` tag and no
   input reaches a panic (**the rule of every repository here**).
 * **No payload is ever logged.** **Corrected:** an error from the server carries its SQLSTATE and nothing else (the server's own message can quote a value); the other refusals are fixed sentences.
-* **The password is an argument**, as in `pgen`, and `-` is the empty one. **Corrected:** this design first said "a file or `-`, not a flag value that a process list shows"; the first build does
-  not read a file (a file read of a caller's path widens the authority row from `fs_read("/dev/urandom")` to `fs_read("")`), so a password is visible in the process list. **Open**: a file read through a
-  narrowed capability, as `cancho-fetch`'s credentials are (`cancho-fetch/docs/design.md` §8.6).
+* **The password is an argument** in the generic program, as in `pgen`, and `-` is the empty one. **Corrected:** this design first said "a file or `-`, not a flag value that a process list shows"; the first build did
+  not read a file (a file read of a caller's path widens the authority row from `fs_read("/dev/urandom")` to `fs_read("")`), so a password was visible in the process list. **Done in §11:** the one-host build reads it from a file narrowed to that one path, as `cancho-fetch`'s credentials are (`cancho-fetch/docs/design.md` §8.6).
 
 ### 10.3 Composing it
 
@@ -399,7 +398,7 @@ the consumer and the contract is its input format. Neither warehouse tool is sta
 
 ### 10.7 As built, and what was measured
 
-`tools/pgexport.cho` (496 lines), built with `cancho build --std tools/pgexport.cho src/pg.cho -o build/pg-export`, compiler `f4ead824` (`cancho.toml`). Everything below was run in one
+`tools/pgexport.cho` (496 lines; since §11 it is `tools/pgexport/core.cho` and `generic.cho`), built with `cancho build --std tools/pgexport/generic.cho tools/pgexport/core.cho src/pg.cho -o build/pg-export`, compiler `f4ead824` (`cancho.toml`). Everything below was run in one
 session on one machine: Linux 6.18 (a 4-CPU virtual machine), PostgreSQL 16.15 from the Ubuntu package on the same machine, trust authentication, loopback TCP.
 
 **What differs from §10.2 to §10.4** (each corrected in place above):
@@ -452,5 +451,66 @@ What this says and does not say:
 * **Why it is slower and larger** is **not measured**. The reply is held whole in one buffer (§2, layer 2) and the output is built whole beside it, which is the memory; the time is a loop that copies each value once into a
   buffer that grows by doubling. No profile was taken and no optimisation was tried; streaming (write a row, drop it) is the obvious next step for the memory, but it gives up "writes nothing on a refusal" unless the output is spooled first.
 * **One machine, one table shape** (six columns of five types, short values), a loopback connection, a cold-ish page cache not controlled for. These numbers do not carry to a remote server, wide rows, or a loaded machine.
-* **Open:** the one-host build that would meet G-E1 as written; a password file; `--out` with a rename; the streaming build; the `flow` composition (G-E7).
+* **Open:** `--out` with a rename; the streaming build; the `flow` composition (G-E7). **Done since, in §11:** the one-host build that meets G-E1 as written, and the password file.
+
+
+## 11. A one-host `pg-export`, and a password that is not in the process list
+
+> **Status: built** (§11.3 says what was measured). §11.1 and §11.2 were written before the code; where the build differs, §11.3 says so and the text above it is corrected in place. Marked as in §10: **read**, **choice**, **open**, **measured**.
+
+**The problem** (§10.7, **measured**): the generic `pg-export` reports `net_out("")` and `bounded: false`, and takes its password as an argument. The authority row therefore says "any host", and `ps` shows the password.
+
+**Why not a flag** (**read**: `cancho/docs/capability-budget.md`, "Where a bound comes from"; `cancho/docs/agent-toolbox.md` D14): a capability's bound is a *literal*, "checked where it is written". `narrow(net, arg(g, 1))` is refused (`capability-not-narrowable`), so the host cannot come from the command line and still be in the row. The way cancho's own tools do it, and `cancho-fetch` (**read**: `cancho-fetch/scripts/fetch_build.py`), is a **build-time variant**: a script writes a small source with the literals, and the ordinary build derives the row from it.
+
+### 11.1 The build
+
+```
+python3 scripts/export_build.py --host db.internal --port 5432 [--password-file /run/secrets/pg] [--out build/pg-export-db] [--manifest FILE [--check]]
+pg-export-db <user> <database> <sql> [max_rows [max_bytes]]
+```
+
+* **Split of the source** (**choice**): everything that is not the choice of host and secret moves to a module, `tools/pgexport/core.cho` (`module pgexport;`), so there is one copy of the JSON writer and the refusals. `tools/pgexport/generic.cho` is the existing program (host, port and password as arguments, `net_out("")`), unchanged in behaviour. The script writes the third file, the variant's `main`, into `build/gen/`, and builds the three with `src/pg.cho`.
+* **What is baked**: `narrow(net, "HOST:PORT")` (the network is that one name and port), and `narrow(fs, "/dev/urandom", "PASSWORD_FILE")` (**read**: `cancho/docs/narrowing-into-several.md`: the unrelated paths of one `Fs`, two labels, no `fs_read("")`). Without `--password-file` the file is not narrowed to, and the password is the empty one (trust authentication).
+* **What the variant refuses to take**: no host, port or password argument exists. The password cannot be passed on the command line at all, so it cannot be in the process list (**choice**; the generic build still takes it that way and its `--help`-equivalent usage line says so).
+* **The password file** is read once, at most 1,024 bytes, one trailing `\n` or `\r\n` removed. A file that is missing, unreadable, over the limit or empty is `pg-export.password-file` (fixed sentence; the content and the path are never printed). The file's permissions are **not** checked: the language has no `stat` in this row, and the deployment owns them (**open**).
+* **What the script validates before it writes a literal** (so that a bad input is an error of the script, not a source that fails to compile or, worse, a wider row): the host is letters, digits, dots and hyphens (no wildcard, no IPv6 bracket form: **open**), the port is 1 to 65535, the password file is an absolute path of plain characters with no `..` and is not `/dev/urandom` and not under it.
+* **A host name is a name** (**read**: `cancho/docs/net-bounds.md`, `capability-budget.md`): the row says `net_out("db.internal:5432")`; what the name resolves to is the resolver's answer at run time and is not in the row. An IP literal gives the tighter claim. Say so in the build's output.
+
+### 11.2 Gates, written first
+
+| gate | what it checks | a version it must refuse |
+|---|---|---|
+| G-E1b | the variant's row is `bounded: true` and is exactly `args, conn_read, conn_write, err_write, fs_read("/dev/urandom"), fs_read(<password file>), heap, io_write, net_out("<host>:<port>")` (the file label only with `--password-file`), no foreign symbol; the script itself fails the build if the derived row differs | a build that narrows to the host only (no port), to a wider path, or leaves `Net("")` |
+| G-E1c | the committed reference row (`manifests/pg-export.authority.json`) equals the row derived for the reference variant (`--check`), in CI | a change that adds a label and does not update the file, and the other way round |
+| G-P1 | the variant logs in with a password that is read from a file, against a role that is `scram-sha-256` and one that is cleartext (CI has them: `tests/postgres.sh`), and the same role with a wrong password is `pg-export.login` | a variant that sends the file's trailing newline |
+| G-P2 | a missing file, an empty file, a 1,025-byte file are each `pg-export.password-file` and the output holds neither the path nor the content | a variant that echoes either |
+| G-P3 | the password is in no argument of the variant's process (`/proc/<pid>/cmdline` while a slow query runs) | the generic build, which fails this by design (shown, as the contrast) |
+| G-S | the variant refuses an input the script must refuse (a wildcard, a port 0, a relative or `..` path, `/dev/urandom/x`) before it writes any file | a script that writes the source first and validates after |
+| mutants | extend `tests/export_mutants.py` to the new source: the narrow literal widened, the password's newline kept, an empty password file accepted, the path echoed | |
+
+**Not in this slice:** `--out` with a rename, the `cancho-flow` step, streaming (§10.7 "Open").
+
+### 11.3 As built, and what was measured
+
+`scripts/export_build.py` (about 250 lines) writes the variant's `main` from literals and builds it with `tools/pgexport/core.cho` and `src/pg.cho`; `tools/pgexport/generic.cho` is the old program, unchanged in what it does. Same session, machine and compiler (`f4ead824`) as §10.7, PostgreSQL 16.15 on the same machine; the SCRAM and cleartext roles are made locally with the same names as `tests/postgres.sh` (`scramuser`, `pwuser`), not by that script (it needs docker, which was not available), so **CI's run of these tests on the real `postgres.sh` server is the first run there**.
+
+| gate | result |
+|---|---|
+| G-E1b | **met.** The variant's row is `bounded: true` with exactly `args, conn_read, conn_write, err_write, fs_read("/dev/urandom"), fs_read(<password file>), heap, io_write, net_out("<host>:<port>")`, no foreign symbol. The script fails the build, and writes no binary, when the derived row differs; the generic build is `bounded: false` (a test says so) |
+| G-E1c | **met.** `manifests/pg-export.authority.json` is the row of the reference variant (`127.0.0.1:5432`, `/run/secrets/pg`); `--check` re-derives it and refuses a different file |
+| G-P1 | **met** against a `scram-sha-256` role and a cleartext one: the password comes from the file, a trailing `\n` or `\r\n` or none is accepted, and a wrong password is `pg-export.login` with neither the password nor the file in the output |
+| G-P2 | **met.** A missing, empty, newline-only and 1,025-byte file are each `pg-export.password-file` and print neither the path nor the content; a 1,024-byte file is taken |
+| G-P3 | **met.** `/proc/<pid>/cmdline` of the running variant does not hold the password; the same check on the generic build **does** (a test asserts the contrast, so the claim cannot go stale) |
+| G-S | **met.** Eight bad hosts (wildcard, space, `;`, brackets, empty, leading hyphen, `..`, a quote), three bad ports, nine bad password paths (relative, `..`, trailing or doubled slash, `/dev/urandom` and under it, a quote, a space, `/`) are each refused by the script before it writes any file |
+| mutants | **18 of 18 killed**: the earlier 10 and, for the variant, the network narrowed to the host only, the newline kept, the carriage return kept, an empty password accepted, a 1,025-byte file accepted, the path echoed, a wildcard host accepted, and a manifest that differs accepted |
+
+Tests: `tests/export_test.py` (20, on the generic build) and `tests/export_variant_test.py` (17), all passing locally.
+
+**What differs from §11.1:**
+
+* **The variant's `main` takes `<user> <database> <sql> [max_rows [max_bytes]]`**, as written. The generic program's file moved from `tools/pgexport.cho` to `tools/pgexport/generic.cho`, so the build line of §10.7 and the README changed with it.
+* **A host name** is accepted and the row names it: a build for `db.internal:5432` is `bounded: true` with `net_out("db.internal:5432")` (**measured**, one build), and prints a note that what the name resolves to is not in the row; an IP literal is the tighter claim. **Not tested:** a connection to a real host name (the tests use `127.0.0.1`), so how the resolver behaves under the bound is a **read** of `net-bounds.md`, not a measurement.
+* **The file's permissions** are not checked (no `stat` in the row): **open**, the deployment's.
+* **IPv6** hosts are refused by the script: **open**.
+* **A timing of the variant** against the generic build was not taken; it runs the same core, and nothing is claimed about its speed beyond §10.7's numbers for the generic one.
 

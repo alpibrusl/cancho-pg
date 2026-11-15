@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gates G-E2 to G-E6 of docs/design.md section 10, on a real PostgreSQL, for `pg-export` (tools/pgexport.cho).
+"""Gates G-E2 to G-E6 of docs/design.md section 10, on a real PostgreSQL, for `pg-export` (tools/pgexport/).
 
     PGHOST=127.0.0.1 PGPORT=5432 PGUSER=postgres PGDATABASE=postgres python3 tests/export_test.py
     CANCHO=/path/to/cancho   (default: cancho on PATH)    BIN=build/pg-export  (skip the build)
@@ -23,6 +23,9 @@ BIN = os.environ.get("BIN")
 TABLE = os.environ.get("TABLE")
 
 
+GENERIC = [os.path.join(ROOT, "tools", "pgexport", "generic.cho"), os.path.join(ROOT, "tools", "pgexport", "core.cho"), os.path.join(ROOT, "src", "pg.cho")]
+
+
 def psql(sql, db=DB):
     p = subprocess.run(["psql", "-h", HOST, "-p", PORT, "-U", USER, "-d", db, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-c", sql],
                        capture_output=True, text=True)
@@ -44,8 +47,7 @@ def build():
     out = os.path.join(ROOT, "build", "pg-export")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     cancho = os.environ.get("CANCHO", "cancho")
-    subprocess.run([cancho, "build", "--std", os.path.join(ROOT, "tools", "pgexport.cho"), os.path.join(ROOT, "src", "pg.cho"), "-o", out],
-                   check=True, cwd=ROOT)
+    subprocess.run([cancho, "build", "--std", *GENERIC, "-o", out], check=True, cwd=ROOT)
     BIN = out
 
 
@@ -188,7 +190,7 @@ class Gates(unittest.TestCase):
     # G-E1: the authority row is a fact, and it is checked
     def test_authority_row(self):
         cancho = os.environ.get("CANCHO", "cancho")
-        p = subprocess.run([cancho, "authority", os.path.join(ROOT, "tools", "pgexport.cho"), os.path.join(ROOT, "src", "pg.cho"), "--std", "--output", "json"],
+        p = subprocess.run([cancho, "authority", *GENERIC, "--std", "--output", "json"],
                            capture_output=True, text=True, cwd=ROOT)
         self.assertEqual(p.returncode, 0, p.stderr)
         row = json.loads(p.stdout)
