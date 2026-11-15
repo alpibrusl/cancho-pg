@@ -83,7 +83,8 @@ jobs:
           eval "$(cat /tmp/pg.env.sh)"
           python3 tests/e2e.py
 
-      # pg-export (docs/design.md section 10): the gates G-E1 to G-E6 on the real server, and its mutants, each of which must make a gate fail.
+      # pg-export (docs/design.md sections 10 and 11): the gates G-E1 to G-E6 on the real server, the one-host build and its password file (G-E1b, G-E1c,
+      # G-P1 to G-P3, G-S: the SCRAM and cleartext roles of tests/postgres.sh), and the mutants, each of which must make a gate fail.
       - name: pg-export gates and mutants
         working-directory: pg
         env:
@@ -91,6 +92,7 @@ jobs:
         run: |
           eval "$(cat /tmp/pg.env.sh)"
           python3 tests/export_test.py
+          python3 tests/export_variant_test.py
           python3 tests/export_mutants.py
 
       # The pool that makes its own connections (docs/reconnect.md): backends killed idle and mid-request, a server that goes

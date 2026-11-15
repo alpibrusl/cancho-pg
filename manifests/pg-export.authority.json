@@ -1,0 +1,42 @@
+{
+  "bounded": true,
+  "foreign_symbols": [],
+  "labels": [
+    [
+      "args",
+      null
+    ],
+    [
+      "conn_read",
+      null
+    ],
+    [
+      "conn_write",
+      null
+    ],
+    [
+      "err_write",
+      null
+    ],
+    [
+      "fs_read",
+      "/dev/urandom"
+    ],
+    [
+      "fs_read",
+      "/run/secrets/pg"
+    ],
+    [
+      "heap",
+      null
+    ],
+    [
+      "io_write",
+      null
+    ],
+    [
+      "net_out",
+      "127.0.0.1:5432"
+    ]
+  ]
+}
