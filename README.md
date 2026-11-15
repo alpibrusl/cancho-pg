@@ -26,6 +26,19 @@ server; **`pg.pool`** ([below](#a-pool-that-does-not-wait)) is the connection th
 poller's events; [below](#a-pool-that-comes-back) and [`docs/reconnect.md`](docs/reconnect.md)). [`docs/design.md`](docs/design.md)
 §4-§5 says why the blocking ones are what they are.
 
+## `pg-export`: rows out as JSON lines
+
+`tools/pgexport.cho` runs one read-only statement and writes each row as a JSON object, the format `cancho-table` reads with `--input-format jsonl` ([`docs/design.md`](docs/design.md) §10):
+
+```console
+$ cancho build --std tools/pgexport.cho src/pg.cho -o pg-export
+$ pg-export 127.0.0.1 5432 postgres shop - "select id, customer, amount from orders order by id" | head -n 2
+{"id":1,"customer":"Doe, Jane","amount":19.90}
+{"id":2,"customer":"Acme","amount":null}
+```
+
+The statement runs in `BEGIN READ ONLY` (a write is the server's `25006`), numbers keep the server's text, `NULL` is `null`, and a refusal (`NaN`, a value that is not UTF-8, a bound passed) writes nothing to standard output. For the same rows the bytes are the ones the server's `row_to_json` writes. It is **not faster than `psql`**: about 16 percent slower than `psql` with `row_to_json` at 1,000,000 rows and about twice the memory ([§10.7](docs/design.md#107-as-built-and-what-was-measured) has the numbers and the conditions). `cancho authority` on it names the network (any host: not narrowed to one), the connection, the console, the heap and `/dev/urandom` for the login.
+
 ## Requirements
 
 - The **cancho** compiler at the revision this repository's CI builds with (below; `a4572ea`, which has `packages/tls` and the
