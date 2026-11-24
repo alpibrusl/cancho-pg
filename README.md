@@ -52,24 +52,20 @@ The script derives the row with `cancho authority` and refuses to build if it is
 
 ## Requirements
 
-- The **cancho** compiler at the revision this repository's CI builds with (below; `a4572ea`, which has `packages/tls` and the
-  crypto it needs, and `tcp_connect_start`, the dial that does not wait). It is also `[package] cancho` in `cancho.toml`, and CI checks that
-  the two agree. A package store records no hash of the `std` it was published against, so the compiler revision is part of the contract.
+- The **cancho** compiler release this repository's CI installs (`0.1.1`, below). It is also `[package] cancho` in `cancho.toml`, and CI checks that the two agree. A package store records no hash of the `std` it was published against, so the compiler version is part of the contract.
 - For `pg.pool` and `pg.ssl`: cancho's TLS package, which `cancho install` fetches at the commit `cancho.toml` pins into `build/deps`
   (`pg` alone needs nothing from it).
-- Rust, to build that compiler (its `rust-toolchain.toml` pins the toolchain).
 - A **PostgreSQL** to talk to (any version; the tests use 16), and for the tests `docker`, `openssl` and the stock `psql` client.
 
 ## Quick start
 
-Get the compiler at the revision CI builds and tests with (read from `ci.yml`, so this text cannot drift from it), and a PostgreSQL:
+Install the compiler release CI tests with (read from `ci.yml`, so this text cannot drift from it), and get a PostgreSQL:
 
 ```
-git clone https://github.com/alpibrusl/cancho
 git clone https://github.com/alpibrusl/cancho-pg && cd cancho-pg
 REV=$(sed -n 's/^ *CANCHO_REV: *//p' .github/workflows/ci.yml)
-(cd ../cancho && git checkout "$REV" && cargo build --release -p cancho)
-export PATH=$PWD/../cancho/target/release:$PATH
+curl -fsSL https://raw.githubusercontent.com/alpibrusl/cancho/main/scripts/install.sh | sh -s "$REV"   # into ~/.local/bin
+export PATH=$HOME/.local/bin:$PATH
 
 docker run --rm -d -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16     # or any server; trust is simplest
 

@@ -6,10 +6,8 @@ on:
   pull_request:
 
 env:
-  # The compiler these sources are built and tested with. A package store records no hash
-  # of the `std` it was published against, so the revision is part of the contract. It is
-  # also `[package] cancho` in cancho.toml (checked below), and it has packages/tls (docs/tls.md).
-  CANCHO_REV: f4ead824f33b291a0ad7620a34a0c1346a7abe4f
+  # The compiler release these sources are built and tested with, installed prebuilt (scripts/install.sh of alpibrusl/cancho). It is also `[package] cancho` in cancho.toml (checked below). The tls package of cancho.toml is fetched by `cancho install` at its own rev.
+  CANCHO_REV: 0.1.1
 
 jobs:
   test:
@@ -19,29 +17,17 @@ jobs:
         with:
           path: pg
 
-      - uses: actions/checkout@v4
-        with:
-          repository: alpibrusl/cancho
-          ref: ${{ env.CANCHO_REV }}
-          path: cancho
-
-      - name: Cache the compiler
-        id: compiler
-        uses: actions/cache@v4
-        with:
-          path: cancho/target/release/cancho
-          key: cancho-${{ env.CANCHO_REV }}
-
-      - name: Build cancho
-        if: steps.compiler.outputs.cache-hit != 'true'
-        working-directory: cancho
-        run: cargo build --release -p cancho
+      - name: Install the pinned compiler
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/alpibrusl/cancho/main/scripts/install.sh | sh -s "$CANCHO_REV"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "CANCHO=$HOME/.local/bin/cancho" >> "$GITHUB_ENV"
 
       - name: The reference client
         run: which psql || (sudo apt-get update -q && sudo apt-get install -y -q postgresql-client)
 
-      # One compiler revision: the one CI builds is the one the project file names.
-      - name: cancho.toml names the compiler CI builds
+      # One compiler release: the one CI installs is the one the project file names.
+      - name: cancho.toml names the compiler CI installs
         working-directory: pg
         run: grep -qx "cancho = \"$CANCHO_REV\"" cancho.toml
 
@@ -49,7 +35,7 @@ jobs:
       # what pg.pool and pg.ssl are built with (docs/tls.md section 9). pg itself needs none of it.
       - name: Dependencies (cancho install)
         working-directory: pg
-        run: ../cancho/target/release/cancho install
+        run: cancho install
 
       # postgres:16 with a role for each way a server asks for a password, TLS on with a test CA made in the
       # job, a hostssl and a hostnossl role, and a second server without TLS (tests/postgres.sh)
@@ -59,17 +45,17 @@ jobs:
 
       - name: Unit tests (no server)
         working-directory: pg
-        run: ../cancho/target/release/cancho test tests/pg_test.cho src/pg.cho --std
+        run: cancho test tests/pg_test.cho src/pg.cho --std
 
       # What the pool decides with no server (the arguments of `reconnect`, what is due when, the waits), and that the script
       # `pgen` writes is a Parse and a Sync for each statement.
       - name: Pool unit tests (no server)
         working-directory: pg
-        run: ../cancho/target/release/cancho test tests/pool_test.cho src/pool.cho src/pg.cho tests/generated/queries.cho build/deps/*.cho --std
+        run: cancho test tests/pool_test.cho src/pool.cho src/pg.cho tests/generated/queries.cho build/deps/*.cho --std
 
       - name: Formatting
         working-directory: pg
-        run: ../cancho/target/release/cancho fmt --check src tests tools examples pooler
+        run: cancho fmt --check src tests tools examples pooler
 
       # The real server and the stock psql client as the reference: every query must print
       # the same rows, errors and tags must be the server's, parameters must stay data; and
@@ -77,8 +63,6 @@ jobs:
       # that is not the real one.
       - name: End-to-end tests against PostgreSQL 16
         working-directory: pg
-        env:
-          CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
         run: |
           eval "$(cat /tmp/pg.env.sh)"
           python3 tests/e2e.py
@@ -87,8 +71,6 @@ jobs:
       # G-P1 to G-P3, G-S: the SCRAM and cleartext roles of tests/postgres.sh), and the mutants, each of which must make a gate fail.
       - name: pg-export gates and mutants
         working-directory: pg
-        env:
-          CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
         run: |
           eval "$(cat /tmp/pg.env.sh)"
           python3 tests/export_test.py
@@ -101,8 +83,6 @@ jobs:
       # was kept from waiting.
       - name: Reconnecting pool tests (kill, cut, restore)
         working-directory: pg
-        env:
-          CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
         run: |
           eval "$(cat /tmp/pg.env.sh)"
           python3 tests/reconnect_test.py
@@ -111,11 +91,9 @@ jobs:
       # again, with every client and every test going through it to the same PostgreSQL.
       - name: End-to-end tests through the proxy (pooler P0)
         working-directory: pg
-        env:
-          CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
         run: |
           mkdir -p build
-          ../cancho/target/release/cancho build --std pooler/proxy.cho -o build/proxy
+          cancho build --std pooler/proxy.cho -o build/proxy
           build/proxy 6433 127.0.0.1 5432 &
           sleep 1
           eval "$(cat /tmp/pg.env.sh)"
@@ -126,17 +104,17 @@ jobs:
       # raw protocol: transaction boundaries, queueing, pipelining, refusals, server failures, volume, hostile bytes.
       - name: Pooler framing tests (every cut of every message)
         working-directory: pg
-        run: ../cancho/target/release/cancho test tests/frame_test.cho pooler/frame.cho --std
+        run: cancho test tests/frame_test.cho pooler/frame.cho --std
 
       - name: Pooler SCRAM tests (RFC 7677, against the driver's HMAC and base64 at every length)
         working-directory: pg
-        run: ../cancho/target/release/cancho test tests/scram_test.cho pooler/scram.cho src/pg.cho --std
+        run: cancho test tests/scram_test.cho pooler/scram.cho src/pg.cho --std
 
       - name: Pooler end-to-end tests (P1)
         working-directory: pg
         run: |
           mkdir -p build
-          ../cancho/target/release/cancho build --std pooler/pooler.cho pooler/frame.cho pooler/scram.cho src/pg.cho -o build/pooler
+          cancho build --std pooler/pooler.cho pooler/frame.cho pooler/scram.cho src/pg.cho -o build/pooler
           eval "$(cat /tmp/pg.env.sh)"
           PGDATABASE=postgres python3 pooler/tests/pooler_e2e.py build/pooler
 
@@ -144,8 +122,6 @@ jobs:
       # (src/pool.cho, requiring the names it calls of pg and of cancho's tls), pg.ssl (src/ssl.cho, the same).
       - name: The published stores are the stores of src/pg.cho, src/pool.cho and src/ssl.cho
         working-directory: pg
-        env:
-          CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
         run: sh tests/stores.sh
 
       # TLS (docs/tls.md section 10): the blocking client and the pool against the TLS server with verify-full; a wrong name, an
@@ -154,8 +130,6 @@ jobs:
       # of this job's server); the authority of two programs.
       - name: TLS tests
         working-directory: pg
-        env:
-          CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
         run: |
           eval "$(cat /tmp/pg.env.sh)"
           python3 tests/tls_test.py
