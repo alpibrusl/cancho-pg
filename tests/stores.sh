@@ -9,12 +9,13 @@
 #   sh tests/stores.sh write    publish, and make the committed stores those (after a change to a source, or of the compiler)
 #
 # A store records the stores it requires: pg's by its path relative to itself (so all three are published side by side, as
-# they are committed), cancho's by origin (the repository and the commit cancho.toml pins). CANCHO names the compiler.
+# they are committed), cancho's by origin (the repository and the commit of cancho.toml's tls dependency). CANCHO names the compiler.
 set -eu
 cd "$(dirname "$0")/.."
 LEX=${CANCHO:-cancho}
-REV=$(sed -n 's/^cancho = "\([0-9a-f]*\)"$/\1/p' cancho.toml)
-[ -n "$REV" ] || { echo "no cancho revision in cancho.toml" >&2; exit 1; }
+# the commit of cancho the stores require: the rev of the tls dependency (the compiler pin is a release now, and is not a commit)
+REV=$(sed -n '/^\[dependencies\.tls\]/,/^\[/{s/^rev = "\([0-9a-f]\{40\}\)"$/\1/p;}' cancho.toml)
+[ -n "$REV" ] || { echo "no tls rev in cancho.toml" >&2; exit 1; }
 CANCHO=https://github.com/alpibrusl/cancho
 OUT=$(mktemp -d)
 # keep the published stores for a look when a check fails
